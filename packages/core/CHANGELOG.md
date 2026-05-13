@@ -1,5 +1,42 @@
 # Change Log
 
+## 1.40.0
+
+### Minor Changes
+
+- cc0d703356: add `enableCap=true` query parameter to `GET /logs` and `GET /hooks/:id/recent-logs` to reduce the chance of `statement_timeout` on tenants with very large log volumes.
+
+  When the param is passed:
+
+  - The count query short-circuits at ~10,000 rows, returning `10001` as a saturation sentinel.
+  - The response includes a `Total-Number-Is-Capped: true` header when the cap is hit.
+  - In capped responses, both `Link: rel="last"` and `Link: rel="next"` are omitted because the saturated count makes the derived page count unreliable. Clients should construct page URLs themselves and stop on an empty response.
+
+  Default request behavior (without `enableCap`) is unchanged.
+
+### Patch Changes
+
+- a27d813097: allow users who have no password, no primary email, and no primary phone to set their initial password without a verification record through Account API
+- 16553c027a: expose `isCurrent` on the Account API sessions response
+
+  `GET /api/my-account/sessions` now returns `isCurrent: boolean` on every entry. The session whose OIDC uid backs the calling access token is `true`; the others are `false`. Use this to mark the "This device" entry in session-management UIs and to avoid revoking the caller's own session.
+
+  The admin user-sessions endpoints (`GET /users/:userId/sessions` and `GET /users/:userId/sessions/:sessionId`) are unchanged — they have no caller-session concept and continue to use the original response shape.
+
+  Closes [#8681](https://github.com/logto-io/logto/issues/8681).
+
+- Updated dependencies [32c40b1adf]
+- Updated dependencies [2ae0a420f7]
+- Updated dependencies [16553c027a]
+  - @logto/account@0.4.1
+  - @logto/phrases-experience@1.13.2
+  - @logto/schemas@1.40.0
+  - @logto/console@1.36.0
+  - @logto/experience@1.19.1
+  - @logto/cli@1.40.0
+  - @logto/demo-app@1.5.0
+  - @logto/device-demo-app@0.1.0
+
 ## 1.39.0
 
 ### Minor Changes

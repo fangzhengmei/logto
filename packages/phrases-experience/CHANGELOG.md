@@ -1,5 +1,11 @@
 # Change Log
 
+## 1.13.2
+
+### Patch Changes
+
+- 32c40b1adf: clarify Account Center 2-step verification toggle label
+
 ## 1.13.1
 
 ### Patch Changes

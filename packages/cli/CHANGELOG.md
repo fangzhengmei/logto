@@ -1,5 +1,12 @@
 # Change Log
 
+## 1.40.0
+
+### Patch Changes
+
+- Updated dependencies [16553c027a]
+  - @logto/schemas@1.40.0
+
 ## 1.39.0
 
 ### Minor Changes
