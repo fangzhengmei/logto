@@ -21,7 +21,10 @@ type AllowedKeyPrefix = AuditLogPrefix | WebhookLogPrefix;
 type LogCondition = {
   logKey?: string;
   payload?: { applicationId?: string; userId?: string; hookId?: string };
-  startTimeExclusive?: number;
+  /** Exclusive lower bound on `createdAt`, in unix milliseconds. */
+  startTime?: number;
+  /** Exclusive upper bound on `createdAt`, in unix milliseconds. */
+  endTime?: number;
   includeKeyPrefix?: AllowedKeyPrefix[];
 };
 
@@ -39,7 +42,7 @@ type CountLogsResult = {
 };
 
 const buildLogConditionSql = (logCondition: LogCondition) =>
-  conditionalSql(logCondition, ({ logKey, payload, startTimeExclusive, includeKeyPrefix = [] }) => {
+  conditionalSql(logCondition, ({ logKey, payload, startTime, endTime, includeKeyPrefix = [] }) => {
     const keyPrefixFilter = conditional(
       includeKeyPrefix.length > 0 &&
         includeKeyPrefix.map((prefix) => sql`${fields.key} like ${`${prefix}%`}`)
@@ -57,9 +60,13 @@ const buildLogConditionSql = (logCondition: LogCondition) =>
       ),
       conditionalSql(logKey, (logKey) => sql`${fields.key}=${logKey}`),
       conditionalSql(
-        startTimeExclusive,
-        (startTimeExclusive) =>
-          sql`${fields.createdAt} > to_timestamp(${startTimeExclusive}::double precision / 1000)`
+        startTime,
+        (startTime) =>
+          sql`${fields.createdAt} > to_timestamp(${startTime}::double precision / 1000)`
+      ),
+      conditionalSql(
+        endTime,
+        (endTime) => sql`${fields.createdAt} < to_timestamp(${endTime}::double precision / 1000)`
       ),
     ].filter(({ sql }) => sql);
 
