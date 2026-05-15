@@ -296,15 +296,85 @@ Client Credentials 流程用于 M2M（机器到机器）应用直接获取访问
 9. 颁发访问令牌（含 scope）
 ```
 
-### 6.3 关键判断点与失败返回
+### 6.3 Scope 判定口径：直接拒绝 vs 交集过滤
 
-| 步骤 | 判断条件 | 错误类型 | HTTP状态码 |
-|------|---------|----------|-----------|
-| 客户端认证 | 客户端 ID/密钥无效 | `InvalidClient` | 401 |
-| 组织关联验证 | 应用未关联到请求的组织 | `AccessDenied` | 403 |
-| 资源验证 | 资源标识符无效 | `InvalidTarget` | 400 |
-| Scope 允许性 | 请求的 scope 不在客户端允许范围内 | `InvalidScope` | 400 |
-| 多资源 | 同时请求多个资源 | `InvalidTarget` | 400 |
+#### 6.3.1 直接拒绝的 Scope（硬校验）
+
+**校验位置**: `packages/core/src/oidc/grants/client-credentials.ts:99-107`
+
+```typescript
+if (client.scope) {
+  const allowList = new Set(client.scope.split(' '));
+
+  for (const scope of scopes.filter(Set.prototype.has.bind(statics))) {
+    if (!allowList.has(scope)) {
+      throw new InvalidScope('requested scope is not allowed', scope);
+    }
+  }
+}
+```
+
+**判定逻辑**:
+- 仅针对 **OIDC 静态 scope**（`statics` 集合中的 scope，如 `openid`, `profile`, `email`, `offline_access` 等）
+- 请求的静态 scope **必须** 在应用的 `client.scope` 允许列表中
+- **不满足直接抛出 `InvalidScope` 错误，终止流程**
+
+---
+
+#### 6.3.2 交集过滤的 Scope（软过滤）
+
+以下场景下，Scope 只做交集过滤，不满足不会直接报错，而是从最终令牌中移除：
+
+| 场景 | 校验位置 | 交集逻辑 |
+|------|---------|----------|
+| 有 resource 参数（资源服务器模式） | `client-credentials.ts:121-123` | `请求 scope ∩ 资源服务器可用 scope` |
+| 有 `organization_id` 且无 `resource`（组织令牌模式） | `grants/utils.ts:176` | `请求 scope ∩ 组织角色可用 scope` |
+| 第三方应用授权 | `oidc/resource.ts:139-203` | `可用 scope ∩ 用户已同意的 scope` |
+
+**代码示例（资源服务器模式）**:
+```typescript
+if (resourceServer) {
+  token.scope =
+    scopes.filter(Set.prototype.has.bind(new Set(resourceServer.scope.split(' ')))).join(' ') ||
+    undefined;
+}
+```
+
+---
+
+#### 6.3.3 resource 与 organization_id 都缺失时的失败返回
+
+**校验位置**: `packages/core/src/oidc/grants/client-credentials.ts:91-93`
+
+```typescript
+if (!organizationId && length === 0) {
+  throw new InvalidTarget('both `resource` and `organization_id` are not provided');
+}
+```
+
+**判定条件**:
+- `!organizationId`: 请求中未提供 `organization_id` 参数
+- `length === 0`: `ctx.oidc.resourceServers` 为空（未找到有效的 resource）
+
+**失败返回**:
+- 错误类型: `InvalidTarget`
+- HTTP 状态码: 400
+- 错误消息: `both 'resource' and 'organization_id' are not provided`
+
+---
+
+### 6.4 关键判断点与失败返回（完整版）
+
+| 步骤 | 判断条件 | 错误类型 | HTTP状态码 | 校验类型 |
+|------|---------|----------|-----------|---------|
+| 客户端认证 | 客户端 ID/密钥无效 | `InvalidClient` | 401 | 硬拒绝 |
+| 组织关联验证 | 应用未关联到请求的组织 | `AccessDenied` | 403 | 硬拒绝 |
+| resource/organization_id 验证 | 两者都未提供 | `InvalidTarget` | 400 | 硬拒绝 |
+| 资源验证 | 资源标识符无效 | `InvalidTarget` | 400 | 硬拒绝 |
+| 静态 Scope 允许性 | 请求的静态 scope 不在客户端允许范围内 | `InvalidScope` | 400 | 硬拒绝 |
+| 多资源 | 同时请求多个资源 | `InvalidTarget` | 400 | 硬拒绝 |
+| 资源 Scope 过滤 | 请求的 scope 不在资源可用范围内 | - | - | 交集过滤 |
+| 组织 Scope 过滤 | 请求的 scope 不在组织角色可用范围内 | - | - | 交集过滤 |
 
 ### 6.4 组织令牌特殊处理
 
