@@ -154,30 +154,66 @@ grant.rejectResourceScope(resourceIndicator, rejectedScopes.join(' '));
 
 | 维度 | First-Party 应用（内置应用） | Third-Party 应用（第三方应用） |
 |------|-----------------------------|-------------------------------|
-| **Consent 触发时机** | 不触发 Consent 页面，直接自动同意 | 触发 Consent 页面，需要用户手动确认 |
-| **Scope 验证** | 无需为应用预先分配 Scope，用户拥有的所有 Scope 都可使用 | 必须在管理后台为应用预先分配 User Scopes、Resource Scopes、Organization Scopes |
+| **Consent 触发方式** | 自动执行（`koa-auto-consent.ts` 中间件），无用户交互页面 | 触发 Consent 页面，需要用户手动提交确认 |
+| **Scope 处理** | 自动授予所有请求的 Scope，无拒绝机制 | 用户可看到 Scope 列表，可选择授予或拒绝 |
 | **组织选择** | 无组织选择流程 | 当请求 `urn:logto:scope:organizations` Scope 时，显示组织选择界面 |
-| **交互路径** | 登录 → 直接授权成功 → 返回应用 | 登录 → Consent 页面（选择组织 + 确认 Scope）→ 授权成功 → 返回应用 |
-| **Grant 创建时机** | 登录后自动创建 | 用户提交 Consent 后创建 |
-| **持久化记录** | 仅创建 Grant 和 Session Authorization | 完整记录：Grant + Session Authorization + 组织授权 + 首次应用标记 |
+| **交互路径** | 登录 → `koa-auto-consent` 中间件自动执行 consent() → 授权成功 | 登录 → Consent 页面（选择组织 + 确认 Scope）→ 调用 POST /interaction/consent |
+| **持久化副作用** | **完整执行所有 Consent 持久化副作用**，包括：<br>• Grant 创建/更新<br>• 保存首次同意应用ID（如用户字段为空）<br>• 持久化 Interaction lastSubmission 到 Session Extensions<br>• 更新 Session.authorizations | 完整执行所有 Consent 持久化副作用 + 组织授权记录 |
 
-#### 2.3.1 First-Party 自动同意流程
+#### 2.3.1 First-Party 自动同意流程（代码对齐）
 
+**触发位置**：`middleware/koa-auto-consent.ts:39-55`
+
+```typescript
+const shouldAutoConsent = !application.isThirdParty;
+
+if (shouldAutoConsent) {
+  const { missingOIDCScope: missingOIDCScopes, missingResourceScopes: resourceScopesToGrant } =
+    getMissingScopes(prompt);
+
+  // 完整调用 consent()，执行所有持久化副作用
+  const redirectTo = await consent({
+    ctx,
+    provider,
+    queries: query,
+    interactionDetails,
+    missingOIDCScopes,
+    resourceScopesToGrant,
+    // resourceScopesToReject 为空，first-party 不拒绝任何 Scope
+  });
+
+  ctx.redirect(redirectTo);
+  return;
+}
+```
+
+**执行流程**：
 ```
 用户访问 /authorize 端点
       ↓
+OIDC Provider 检测到需要 Consent（prompt.name = 'consent'）
+      ↓
+进入 koa-auto-consent 中间件
+      ↓
 检测到是 First-Party 应用（isThirdParty = false）
       ↓
-跳过 Consent 交互流程
+调用 getMissingScopes() 获取缺失的 Scope
       ↓
-自动创建 Grant，包含所有请求的 Scope
+完整调用 consent() 函数（与 Third-Party 用户提交时调用的是同一个函数）
+      ├─ 复用或创建 Grant
+      ├─ 保存用户首次同意应用ID（如为空）
+      ├─ 持久化 Interaction lastSubmission 到 Session Extensions
+      ├─ 更新 Grant 中的 Scope
+      └─ 保存 Grant 并更新 Interaction Result
       ↓
-更新 Session.authorizations，关联 grantId
+重定向继续授权流程
       ↓
-直接发放 Authorization Code
+OIDC Provider 更新 Session.authorizations，关联 grantId
+      ↓
+发放 Authorization Code
 ```
 
-#### 2.3.2 Third-Party 手动同意流程
+#### 2.3.2 Third-Party 手动同意流程（代码对齐）
 
 ```
 用户访问 /authorize 端点
@@ -186,26 +222,26 @@ grant.rejectResourceScope(resourceIndicator, rejectedScopes.join(' '));
       ↓
 创建 Consent Interaction（prompt = consent）
       ↓
-前端调用 GET /interaction/consent 获取授权信息
-      ├─ 显示应用信息（名称、Logo、隐私政策等）
-      ├─ 显示请求的 OIDC Scope（profile, email 等）
-      ├─ 显示请求的 Resource Scope
-      └─ 如果请求了 organizations Scope，显示组织列表供选择
+前端调用 GET /interaction/consent 获取授权信息（routes/interaction/consent/index.ts:199-302）
+      ├─ 查询应用详情（名称、Logo、隐私政策等）
+      ├─ 查询用户信息
+      ├─ 获取 missingOIDCScope（排除 openid、offline_access）
+      ├─ 获取 missingResourceScopes
+      └─ 如果请求了 organizations Scope，查询用户所属组织列表
       ↓
-用户选择组织（如有），点击"同意"按钮
+前端显示 Consent 页面，用户选择组织（如有），点击"同意"按钮
       ↓
-前端调用 POST /interaction/consent 提交
-      ├─ 验证用户组织成员身份
-      ├─ 持久化组织授权关系
+前端调用 POST /interaction/consent 提交（routes/interaction/consent/index.ts:40-190）
+      ├─ 验证用户组织成员身份（validateUserConsentOrganizationMembership）
+      ├─ 持久化组织授权关系（userConsentOrganizations.insert）
+      ├─ 重新计算组织资源 Scope
       ├─ 计算需要授予和拒绝的 Scope
-      ├─ 创建/更新 Grant
-      ├─ 记录首次同意应用ID（如果是第一次）
-      ├─ 持久化 Interaction lastSubmission 到 Session Extensions
-      └─ 更新 Interaction Result，标记 consent 完成
+      ├─ 调用 consent() 核心函数创建/更新 Grant
+      └─ 返回重定向地址
       ↓
-OIDC Provider 检测到 consent 完成
+OIDC Provider 检测到 Interaction Result 中包含 consent: { grantId }
       ↓
-更新 Session.authorizations，关联 grantId
+OIDC Provider 内部更新 Session.authorizations，关联 grantId
       ↓
 发放 Authorization Code
 ```
@@ -317,7 +353,7 @@ POST /interaction/consent 被调用
 8. 保存 Grant（grant.save()）→ 返回 finalGrantId
       ↓
 9. 副作用处理（并行）
-   ├─ 保存用户首次同意的应用ID（如果是首次）
+   ├─ 保存用户首次同意的应用ID（如用户字段为空）
    └─ 持久化 Interaction lastSubmission 到 Session Extensions
       ↓
 10. 更新 Interaction Result
