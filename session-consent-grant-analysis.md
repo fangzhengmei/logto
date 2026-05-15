@@ -126,7 +126,23 @@ grant.rejectResourceScope(resourceIndicator, rejectedScopes.join(' '));
 #### 2.2.3 用户首次同意的应用ID
 
 - 存储位置：`users` 表的 `applicationId` 字段
-- 触发时机：用户第一次对任意第三方应用授权时
+- 触发时机：**当用户的 `applicationId` 字段为空时**，在第一次执行 consent 流程时写入（不限定 First-Party 或 Third-Party 应用）
+- **代码对齐**：`libraries/session/consent.ts:12-24`
+  ```typescript
+  const saveUserFirstConsentedAppId = async (
+    queries: Queries,
+    userId: string,
+    applicationId: string
+  ) => {
+    const { findUserById, updateUserById } = queries.users;
+    const { applicationId: firstConsentedAppId } = await findUserById(userId);
+
+    if (!firstConsentedAppId) {
+      // Save application id that the user first consented
+      await updateUserById(userId, { applicationId });
+    }
+  };
+  ```
 - 用途：记录用户第一次使用的应用，用于后续分析
 
 #### 2.2.4 交互提交数据持久化到 Session Extensions
@@ -465,9 +481,9 @@ const result = await queries.oidcModelInstances
         ↓
 [3] Consent 流程
     ├─ 获取缺失的 Scope (OIDC Scope + Resource Scope)
-    ├─ 用户同意/拒绝 Scope
+    ├─ 用户同意/拒绝 Scope（仅 Third-Party）/ 自动同意（仅 First-Party）
     ├─ 创建/更新 Grant（保存同意的 Scope）
-    ├─ 保存用户首次同意的应用ID
+    ├─ 保存用户首次同意的应用ID（如用户字段为空）
     ├─ 将 Interaction lastSubmission 持久化到 Session 扩展
     └─ 返回 grantId
         ↓
