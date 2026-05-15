@@ -396,13 +396,37 @@ token.scope = issuedScopes;
 
 ---
 
-## 7. 分支二：用户授权（Authorization Code）流程
+## 7. 用户授权相关流程：Authorization Code + Refresh Token + Token Exchange
 
-### 7.1 流程概述
+### 7.1 流程边界与调用链说明
 
-Authorization Code 流程用于用户授权应用访问其资源，需要用户通过浏览器交互完成授权。
+**重要修正**：`checkOrganizationAccess`（组织成员、组织MFA、第三方同意检查）**不**在 Authorization Code 主流程中被调用，仅在以下两个 grant type 的 token 颁发阶段执行：
 
-### 7.2 完整流程
+| Grant Type | 调用 `checkOrganizationAccess` 位置 | 调用时机 |
+|-----------|------------------------------------|---------|
+| **refresh_token** | `packages/core/src/oidc/grants/refresh-token.ts:162` | 用 Refresh Token 换新 Access Token 时 |
+| **urn:ietf:params:oauth:grant-type:token-exchange** | `packages/core/src/oidc/grants/token-exchange/index.ts:106` | Token 交换时 |
+| **authorization_code** | ❌ 不调用 | Code 换 Token 时不做组织访问检查 |
+
+**Scope 确定的统一入口**：`packages/core/src/oidc/init.ts:202-209`
+
+```typescript
+getResourceServerInfo: async (ctx, indicator) => {
+  const { client, params, session, entities } = ctx.oidc;
+  const userId = session?.accountId ?? entities.Account?.accountId;
+  const organizationId =
+    typeof params?.organization_id === 'string' ? params.organization_id : undefined;
+
+  // 所有 Grant Type 都通过此入口获取资源 Scope
+  return getResourceServerInfoCore(indicator, client?.clientId, userId, organizationId);
+};
+```
+
+---
+
+### 7.2 流程一：Authorization Code 主流程
+
+**适用场景**：用户通过浏览器授权，用 Code 换 Token
 
 ```
 1. 用户访问 /authorize 端点
@@ -421,40 +445,82 @@ Authorization Code 流程用于用户授权应用访问其资源，需要用户�
      ↓
 8. 验证 Code 有效性
      ↓
-9. 通过 getResourceServerInfoCore 获取资源Scope
+9. ⚠️ 注意：此处不调用 checkOrganizationAccess
      ↓
-10. 颁发访问令牌（含 scope）
+10. 通过 getResourceServerInfoCore 获取资源 Scope
+     ↓
+11. 颁发访问令牌（含 scope）
 ```
 
-### 7.3 Scope 确定时机
-
-**文件位置**: `packages/core/src/oidc/init.ts:202-209`
-
-```typescript
-getResourceServerInfo: async (ctx, indicator) => {
-  const { client, params, session, entities } = ctx.oidc;
-  const userId = session?.accountId ?? entities.Account?.accountId;
-  const organizationId =
-    typeof params?.organization_id === 'string' ? params.organization_id : undefined;
-
-  // 关键：根据用户ID、应用ID、组织ID确定Scope
-  return getResourceServerInfoCore(indicator, client?.clientId, userId, organizationId);
-};
-```
-
-### 7.4 关键判断点与失败返回
-
+**关键判断点**：
 | 步骤 | 判断条件 | 错误类型 | HTTP状态码 |
 |------|---------|----------|-----------|
+| Code 验证 | Authorization Code 无效或已使用 | `InvalidGrant` | 400 |
 | 会话验证 | 会话不存在或已过期 | `InvalidGrant` | 400 |
 | 用户存在 | 用户已被删除 | `InvalidGrant` | 400 |
-| Code 验证 | Authorization Code 无效或已使用 | `InvalidGrant` | 400 |
 | 重定向URI | 不匹配注册的 redirect_uri | `InvalidGrant` | 400 |
-| 组织成员 | 用户不是组织成员 | `AccessDenied` | 403 |
-| 组织MFA | 组织要求MFA但用户未配置 | `AccessDenied` | 403 |
-| 第三方同意 | 用户未同意组织访问（第三方应用） | `AccessDenied` | 403 |
 
-### 7.5 组织访问检查
+---
+
+### 7.3 流程二：Refresh Token 流程
+
+**适用场景**：用过期的 Refresh Token 换新的 Access Token
+
+**文件位置**: `packages/core/src/oidc/grants/refresh-token.ts`
+
+```
+1. 客户端发送 refresh_token 请求
+     ↓
+2. 验证 Refresh Token 有效性、未过期、未被使用
+     ↓
+3. 验证 Grant 有效性
+     ↓
+4. ✅ 调用 checkOrganizationAccess（组织成员、MFA、第三方同意检查）
+     ↓
+5. 验证 Refresh Token 有 Organizations scope（请求组织令牌时）
+     ↓
+6. （可选）旋转 Refresh Token
+     ↓
+7. 通过 getResourceServerInfoCore 获取资源 Scope
+     ↓
+8. 颁发新的访问令牌（含 scope）
+```
+
+**新增错误类型**：
+| 判断条件 | 错误类型 | HTTP状态码 |
+|---------|----------|-----------|
+| Refresh Token 缺少 Organizations scope | `InsufficientScope` | 400 |
+| 用户不是组织成员 | `AccessDenied` | 403 |
+| 组织要求MFA但用户未配置 | `AccessDenied` | 403 |
+| 用户未同意第三方应用访问组织 | `AccessDenied` | 403 |
+
+---
+
+### 7.4 流程三：Token Exchange 流程
+
+**适用场景**：Token 交换（如用户模拟、服务账号委托等）
+
+**文件位置**: `packages/core/src/oidc/grants/token-exchange/index.ts`
+
+```
+1. 客户端发送 token_exchange 请求
+     ↓
+2. 验证 Subject Token 有效性
+     ↓
+3. ✅ 调用 checkOrganizationAccess（组织成员、MFA、第三方同意检查）
+     ↓
+4. （可选）验证 Actor Token
+     ↓
+5. 通过 getResourceServerInfoCore 获取资源 Scope
+     ↓
+6. 颁发新的访问令牌（含 scope 和 act 声明）
+```
+
+---
+
+### 7.5 组织访问检查（checkOrganizationAccess）
+
+**调用位置**：仅在 Refresh Token 和 Token Exchange 流程中
 
 **文件位置**: `packages/core/src/oidc/grants/utils.ts:97-154`
 
@@ -474,31 +540,52 @@ export const checkOrganizationAccess = async (
       organizationId,
       userId: account.accountId,
     }))) {
-      const error = new AccessDenied('user is not a member of the organization');
-      error.statusCode = 403;
-      throw error;
+      throw new AccessDenied('user is not a member of the organization');
     }
 
     // 2. 检查第三方应用是否已获得用户对该组织的授权
     if ((isThirdParty ?? (await isThirdPartyApplication(queries, client.clientId))) &&
       !(await isOrganizationConsentedToApplication(queries, client.clientId, account.accountId, organizationId))) {
-      const error = new AccessDenied('organization access is not granted to the application');
-      error.statusCode = 403;
-      throw error;
+      throw new AccessDenied('organization access is not granted to the application');
     }
 
     // 3. 检查组织MFA要求
     const { isMfaRequired, hasMfaConfigured } = await queries.organizations.getMfaStatus(organizationId, account.accountId);
     if (isMfaRequired && !hasMfaConfigured) {
-      const error = new AccessDenied('organization requires MFA but user has no MFA configured');
-      error.statusCode = 403;
-      throw error;
+      throw new AccessDenied('organization requires MFA but user has no MFA configured');
     }
   }
 
   return { organizationId };
 };
 ```
+
+---
+
+### 7.6 按 Grant Type 区分的失败返回对照表
+
+| 失败场景 | authorization_code | refresh_token | token_exchange | client_credentials | 错误类型 | HTTP状态码 |
+|---------|-------------------|---------------|---------------|--------------------|---------|-----------|
+| Code/Token 无效或已过期 | ✅ | ✅ (Refresh Token) | ✅ (Subject Token) | ❌ | `InvalidGrant` | 400 |
+| 会话不存在或已过期 | ✅ | ❌ | ❌ | ❌ | `InvalidGrant` | 400 |
+| 用户已被删除 | ✅ | ✅ | ✅ | ❌ | `InvalidGrant` | 400 |
+| 重定向URI不匹配 | ✅ | ❌ | ❌ | ❌ | `InvalidGrant` | 400 |
+| 客户端认证失败 | ✅ | ✅ | ✅ | ✅ | `InvalidClient` | 401 |
+| 应用未关联到组织 | ❌ | ❌ | ❌ | ✅ | `AccessDenied` | 403 |
+| **用户不是组织成员** | ❌ | ✅ | ✅ | ❌ | `AccessDenied` | 403 |
+| **组织要求MFA但用户未配置** | ❌ | ✅ | ✅ | ❌ | `AccessDenied` | 403 |
+| **用户未同意第三方应用访问组织** | ❌ | ✅ | ✅ | ❌ | `AccessDenied` | 403 |
+| Refresh Token 缺少 Organizations scope | ❌ | ✅ | ❌ | ❌ | `InsufficientScope` | 400 |
+| 请求的静态 scope 不在客户端允许范围内 | ✅ | ✅ | ❌ | ✅ | `InvalidScope` | 400 |
+| resource 和 organization_id 都未提供 | ❌ | ❌ | ❌ | ✅ | `InvalidTarget` | 400 |
+| 同时请求多个资源 | ❌ | ❌ | ❌ | ✅ | `InvalidTarget` | 400 |
+| 资源标识符无效 | ❌ | ❌ | ❌ | ✅ | `InvalidTarget` | 400 |
+| DPoP proof 未提供或验证失败 | ❌ | ✅ | ✅ | ✅ | `InvalidGrant` | 400 |
+| mTLS 客户端证书未提供 | ❌ | ✅ | ✅ | ✅ | `InvalidGrant` | 400 |
+
+> **图例**：✅ = 该 Grant Type 会触发此错误；❌ = 不触发
+>
+> **关键发现**：组织相关的三个检查（成员、MFA、第三方同意）**仅**在 `refresh_token` 和 `token_exchange` 中执行，`authorization_code` 主流程**不**做这些检查。
 
 ---
 
@@ -565,7 +652,9 @@ const authMiddleware = async (ctx, next) => {
 };
 ```
 
-### 8.3 资源服务器端 Scope 校验流程
+---
+
+### 8.6 资源服务器端 Scope 校验流程
 
 ```
 1. 从请求头提取 Bearer Token
@@ -585,7 +674,9 @@ const authMiddleware = async (ctx, next) => {
 8. 通过则允许访问，否则返回 403 Forbidden
 ```
 
-### 8.4 常见校验失败场景
+---
+
+### 8.7 常见校验失败场景
 
 | 失败场景 | 错误代码 | HTTP状态码 | 说明 |
 |---------|---------|-----------|------|
