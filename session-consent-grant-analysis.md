@@ -69,15 +69,129 @@ Consent 不是一个独立的数据库实体，而是**交互流程中的一个�
 4. **用户拒绝的 Scope**
    - `grant.rejectResourceScope(indicator, scopes)` - 拒绝特定资源 Scope
 
-### 2.3 Consent 的副作用记录
+### 2.2 Consent 除了 Grant 之外的持久化记录
 
-1. **用户首次同意的应用ID**
-   - 存储在 `users` 表的 `applicationId` 字段
-   - 仅在用户首次同意时设置
+Consent 流程除了创建/更新 Grant 外，还会产生以下持久化记录：
 
-2. **交互提交数据持久化**
-   - 将 Interaction 的 `lastSubmission` 保存到 `oidc_session_extensions` 表
-   - 用于后续 JWT 自定义等场景
+#### 2.2.1 组织授权记录（`application_user_consent_organizations` 表）
+
+当用户在授权页面选择了组织并提交同意时，系统会记录用户对应用的组织授权关系：
+
+```typescript
+// 数据结构
+{
+  id: string;
+  tenantId: string;
+  applicationId: string;  // 应用ID
+  userId: string;         // 用户ID
+  organizationId: string; // 组织ID
+}
+```
+
+**记录时机**：用户在 Consent 页面选择组织并提交同意时
+**关键逻辑**：
+1. 验证用户是否为所选组织的成员
+2. 删除该用户对该应用的现有组织授权记录
+3. 插入新的授权记录（批量）
+
+#### 2.2.2 Scope 拒绝记录（存储在 Grant 中）
+
+当用户拒绝某些资源 Scope 时，这些拒绝信息会存储在 Grant 对象中：
+
+```typescript
+// 调用 grant.rejectResourceScope 方法
+grant.rejectResourceScope(resourceIndicator, rejectedScopes.join(' '));
+```
+
+**存储位置**：`oidc_model_instances` 表中 Grant 实例的 payload
+**作用**：确保后续授权流程不会再次请求已被拒绝的 Scope
+
+#### 2.2.3 用户首次同意的应用ID
+
+- 存储位置：`users` 表的 `applicationId` 字段
+- 触发时机：用户第一次对任意第三方应用授权时
+- 用途：记录用户第一次使用的应用，用于后续分析
+
+#### 2.2.4 交互提交数据持久化到 Session Extensions
+
+将 Interaction 的 `lastSubmission` 数据（包含登录上下文、MFA 验证信息等）持久化到 `oidc_session_extensions` 表：
+
+```typescript
+// 存储内容
+{
+  sessionUid: string;
+  accountId: string;
+  clientId?: string;
+  lastSubmission: object;  // 交互提交的完整数据
+  createdAt: Date;
+  updatedAt: Date;
+}
+```
+
+**用途**：
+1. 为后续 JWT 自定义提供上下文
+2. 审计和问题排查
+3. 支持登录后的个性化流程
+
+### 2.3 First-Party 自动同意 vs Third-Party 手动同意路径对比
+
+| 维度 | First-Party 应用（内置应用） | Third-Party 应用（第三方应用） |
+|------|-----------------------------|-------------------------------|
+| **Consent 触发时机** | 不触发 Consent 页面，直接自动同意 | 触发 Consent 页面，需要用户手动确认 |
+| **Scope 验证** | 无需为应用预先分配 Scope，用户拥有的所有 Scope 都可使用 | 必须在管理后台为应用预先分配 User Scopes、Resource Scopes、Organization Scopes |
+| **组织选择** | 无组织选择流程 | 当请求 `urn:logto:scope:organizations` Scope 时，显示组织选择界面 |
+| **交互路径** | 登录 → 直接授权成功 → 返回应用 | 登录 → Consent 页面（选择组织 + 确认 Scope）→ 授权成功 → 返回应用 |
+| **Grant 创建时机** | 登录后自动创建 | 用户提交 Consent 后创建 |
+| **持久化记录** | 仅创建 Grant 和 Session Authorization | 完整记录：Grant + Session Authorization + 组织授权 + 首次应用标记 |
+
+#### 2.3.1 First-Party 自动同意流程
+
+```
+用户访问 /authorize 端点
+      ↓
+检测到是 First-Party 应用（isThirdParty = false）
+      ↓
+跳过 Consent 交互流程
+      ↓
+自动创建 Grant，包含所有请求的 Scope
+      ↓
+更新 Session.authorizations，关联 grantId
+      ↓
+直接发放 Authorization Code
+```
+
+#### 2.3.2 Third-Party 手动同意流程
+
+```
+用户访问 /authorize 端点
+      ↓
+检测到是 Third-Party 应用（isThirdParty = true）
+      ↓
+创建 Consent Interaction（prompt = consent）
+      ↓
+前端调用 GET /interaction/consent 获取授权信息
+      ├─ 显示应用信息（名称、Logo、隐私政策等）
+      ├─ 显示请求的 OIDC Scope（profile, email 等）
+      ├─ 显示请求的 Resource Scope
+      └─ 如果请求了 organizations Scope，显示组织列表供选择
+      ↓
+用户选择组织（如有），点击"同意"按钮
+      ↓
+前端调用 POST /interaction/consent 提交
+      ├─ 验证用户组织成员身份
+      ├─ 持久化组织授权关系
+      ├─ 计算需要授予和拒绝的 Scope
+      ├─ 创建/更新 Grant
+      ├─ 记录首次同意应用ID（如果是第一次）
+      ├─ 持久化 Interaction lastSubmission 到 Session Extensions
+      └─ 更新 Interaction Result，标记 consent 完成
+      ↓
+OIDC Provider 检测到 consent 完成
+      ↓
+更新 Session.authorizations，关联 grantId
+      ↓
+发放 Authorization Code
+```
 
 ---
 
