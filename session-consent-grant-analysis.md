@@ -89,10 +89,27 @@ Consent 流程除了创建/更新 Grant 外，还会产生以下持久化记录�
 ```
 
 **记录时机**：用户在 Consent 页面选择组织并提交同意时
+**代码对齐**（`routes/interaction/consent/index.ts:71-82`）：
+```typescript
+if (organizationIds?.length) {
+  // 1. Assert that user is a member of all organizations
+  await validateUserConsentOrganizationMembership(userId, organizationIds);
+
+  // 2. Direct INSERT into relations table (NOT delete-then-insert)
+  await queries.applications.userConsentOrganizations.insert(
+    ...organizationIds.map((organizationId) => ({
+      applicationId,
+      userId,
+      organizationId,
+    }))
+  );
+}
+```
+
 **关键逻辑**：
-1. 验证用户是否为所选组织的成员
-2. 删除该用户对该应用的现有组织授权记录
-3. 插入新的授权记录（批量）
+1. 成员校验：先调用 `validateUserConsentOrganizationMembership()` 验证用户是所有所选组织的成员
+2. 直接插入：批量 INSERT 授权关系记录（非先删后插）
+   - 先删后插的 `replace()` 方法仅在管理 API 中使用，Consent 流程中使用的是直接 `insert()`
 
 #### 2.2.2 Scope 拒绝记录（存储在 Grant 中）
 
@@ -241,6 +258,153 @@ Consent 是 Grant 创建的**前置流程**：
 1. **Scope 授予**：Consent 过程中用户同意的 Scope 会被添加到 Grant 中
 2. **Scope 拒绝**：用户拒绝的 Scope 会被标记在 Grant 中
 3. **Grant ID 返回**：Consent 完成后返回 `grantId` 给交互结果
+
+### 3.4 Grant 复用/新建及回写会话授权的完整链路
+
+#### 3.4.1 Grant 复用判定逻辑
+
+当用户再次授权时，OIDC Provider 会优先尝试复用现有 Grant：
+
+```typescript
+// 位于 libraries/session/consent.ts 中
+const grant =
+  conditional(grantId && (await provider.Grant.find(grantId))) ??
+  new provider.Grant({ accountId, clientId: String(client_id) });
+```
+
+**复用条件**：
+1. Interaction Details 中存在 `grantId` 参数（表示之前已有授权记录）
+2. 通过 `provider.Grant.find(grantId)` 能够找到该 Grant
+3. Grant 尚未过期
+
+**复用场景**：
+- 用户对同一应用的第二次及以后授权
+- 应用请求增量 Scope（在已有授权基础上请求新的 Scope）
+
+**新建场景**：
+- 用户第一次对该应用授权
+- 之前的 Grant 已过期或被撤销
+- Interaction Details 中没有 `grantId`
+
+#### 3.4.2 Grant 创建/更新的完整流程
+
+```
+POST /interaction/consent 被调用
+      ↓
+1. 验证 Session 存在，获取 accountId
+      ↓
+2. 处理组织授权（如果有 organizationIds）
+   ├─ 验证用户是所有组织的成员
+   └─ 持久化到 application_user_consent_organizations 表
+      ↓
+3. 从 prompt.details 获取 missingOIDCScope 和 missingResourceScopes
+      ↓
+4. 重新计算需要授予的 Resource Scope（考虑组织权限）
+   ├─ 应用级别 Resource Scope
+   └─ 组织级别 Resource Scope（基于用户在组织中的角色）
+      ↓
+5. 计算需要拒绝的 Scope（用户未勾选或无权限的 Scope）
+      ↓
+6. Grant 复用或新建
+   ├─ 如果存在 grantId 且可找到 → 复用现有 Grant
+   └─ 否则 → 创建新 Grant
+      ↓
+7. 更新 Grant 中的 Scope
+   ├─ grant.addOIDCScope(missingOIDCScopes)
+   ├─ grant.addResourceScope(indicator, scopesToGrant)
+   └─ grant.rejectResourceScope(indicator, scopesToReject)
+      ↓
+8. 保存 Grant（grant.save()）→ 返回 finalGrantId
+      ↓
+9. 副作用处理（并行）
+   ├─ 保存用户首次同意的应用ID（如果是首次）
+   └─ 持久化 Interaction lastSubmission 到 Session Extensions
+      ↓
+10. 更新 Interaction Result
+    └─ provider.interactionResult(ctx.req, ctx.res, { consent: { grantId: finalGrantId } })
+        ↓
+    重定向到 /auth/:user_id/consent?uid=...
+```
+
+#### 3.4.3 Session Authorization 回写机制
+
+**关键节点**：在 `authorization.success` 事件触发时完成
+
+```
+Interaction Consent 完成
+      ↓
+OIDC Provider 继续授权流程
+      ↓
+创建 Authorization Code
+      ↓
+触发 authorization.success 事件
+      ↓
+（可选）执行 maxAllowedGrants 限制检查
+   ├─ 查询用户对该应用的所有活跃 Grant
+   ├─ 如果超过限制，按创建时间排序，撤销最旧的 Grant
+   │   ├─ revokeGrantChain（撤销 AccessToken、RefreshToken 等）
+   │   └─ 从 Session.authorizations 中移除被撤销的 grantId
+   └─ 继续当前授权流程
+      ↓
+OIDC Provider 自动更新 Session.authorizations
+   └─ 写入：
+      {
+        [clientId]: {
+          sid: string,           // Session ID
+          grantId: finalGrantId, // 关联刚才创建/更新的 Grant
+          persistsLogout: boolean
+        }
+      }
+```
+
+#### 3.4.4 会话授权的数据结构
+
+存储在 `oidc_model_instances` 表的 Session 实例 payload 中：
+
+```typescript
+// OidcSessionInstancePayload.authorizations
+{
+  "client-123": {
+    "sid": "session-abc",           // 会话标识符
+    "grantId": "grant-xyz",         // 关联的 Grant ID（外键）
+    "persistsLogout": false,        // 登出后是否保留授权
+    // 其他 OIDC 标准字段
+  },
+  "client-456": {
+    "sid": "session-abc",
+    "grantId": "grant-123",
+    "persistsLogout": true
+  }
+}
+```
+
+**特点**：
+- 一个 Session 可以关联多个 Client 的 Grant（一对多）
+- 每个 Client 在 Session 中只有一条授权记录
+- `sid` 字段用于标识该客户端在当前会话中的会话 ID
+- `persistsLogout` 控制用户登出时是否保留该 Grant
+
+#### 3.4.5 Grant 与 Session 的双向关联查询
+
+**正向查询（Session → Grant）**：
+```typescript
+// 从 Session.authorizations 中获取所有 grantId
+const grantIds = Object.values(session.authorizations)
+  .map(auth => auth.grantId)
+  .filter(Boolean);
+```
+
+**反向查询（Grant → Session）**：
+```typescript
+// 通过 oidcModelInstances.findUserActiveSessionUidByGrantId 查询
+const result = await queries.oidcModelInstances
+  .findUserActiveSessionUidByGrantId(userId, grantId);
+// 返回 { sessionUid: string }
+```
+
+**用途**：
+- 撤销 Grant 时，需要找到关联的 Session 并清理 `session.authorizations` 中的对应条目
+- Session 注销时，根据 `persistsLogout` 决定是否保留 Grant
 
 ---
 
