@@ -1,6 +1,8 @@
 # Logto MFA 策略与登录体验联动机制分析报告
 
 > **交付物类型**: 代码级可复核分析报告 | **版本**: v1.36.0 | **日期**: 2026-05-16
+> 
+> **修正记录**: 2026-05-16 - 修正 MfaFactor 枚举顺序与显示优先级的区分，统一 Phone/Email 优先级描述
 
 ---
 
@@ -335,37 +337,46 @@ private async assertUserMandatoryMfaFulfilled(
 
 ### 3.1 MFA 因子类型定义
 
+> ⚠️ **重要区分**: 枚举定义顺序 ≠ 显示优先级顺序
+
 **代码位置**: `packages/schemas/src/foundations/jsonb-types/sign-in-experience.ts:176-182`
 
 ```typescript
 export enum MfaFactor {
-  WebAuthn = 'WebAuthn',                          // Web认证(显式)
-  TOTP = 'Totp',                                  // 时间型一次性密码(显式)
-  PhoneVerificationCode = 'PhoneVerificationCode', // 手机验证码(隐式/显式)
-  EmailVerificationCode = 'EmailVerificationCode', // 邮箱验证码(隐式/显式)
-  BackupCode = 'BackupCode',                      // 备用码(显式)
+  TOTP = 'Totp',                                  // 枚举定义顺序 #1
+  WebAuthn = 'WebAuthn',                          // 枚举定义顺序 #2
+  BackupCode = 'BackupCode',                      // 枚举定义顺序 #3
+  EmailVerificationCode = 'EmailVerificationCode', // 枚举定义顺序 #4
+  PhoneVerificationCode = 'PhoneVerificationCode', // 枚举定义顺序 #5
 }
 ```
 
 **复核要点**:
 - ✅ 5 种 MFA 因子类型
+- ✅ 枚举定义顺序只是代码声明顺序，**不代表**显示优先级
 - ✅ 邮箱和手机支持"隐式可用"——不需要用户显式绑定
 
 ---
 
-### 3.2 因子显示优先级排序
+### 3.2 因子显示优先级排序 (sortMfaFactors)
 
-**代码位置**: `packages/core/src/routes/experience/classes/helpers.ts:70-90`
+> ✅ **这才是真正的前端显示优先级**，由 `order` 数组硬编码定义
+
+**代码位置**: `packages/core/src/routes/experience/classes/helpers.ts:70-91`
 
 ```typescript
 const order: MfaFactor[] = [
   MfaFactor.WebAuthn,              // 1. 最高优先级
   MfaFactor.TOTP,                  // 2. 
-  MfaFactor.PhoneVerificationCode, // 3.
-  MfaFactor.EmailVerificationCode, // 4.
+  MfaFactor.PhoneVerificationCode, // 3. ✅ Phone > Email
+  MfaFactor.EmailVerificationCode, // 4. ✅
   MfaFactor.BackupCode,            // 5. 最低优先级（总是排在最后）
 ];
 
+/**
+ * Sort MFA factors by display priority to keep client experience consistent.
+ * Order: WebAuthn -> TOTP -> Phone -> Email -> Backup code -> others.
+ */
 export const sortMfaFactors = (factors: MfaFactor[]): MfaFactor[] => {
   return factors.slice().sort((factorA, factorB) => {
     const indexA = order.indexOf(factorA);
@@ -379,7 +390,9 @@ export const sortMfaFactors = (factors: MfaFactor[]): MfaFactor[] => {
 ```
 
 **复核要点**:
+- ✅ 代码注释明确写了显示顺序: `WebAuthn -> TOTP -> Phone -> Email -> Backup code`
 - ✅ WebAuthn 总是排在最前
+- ✅ **PhoneVerificationCode 优先级高于 EmailVerificationCode**
 - ✅ BackupCode 总是排在最后
 - ✅ 未知因子排在 BackupCode 之后
 
@@ -420,7 +433,8 @@ export const getProfileMfaFactors = (
 **复核要点**:
 - ✅ **重要修正**: 隐式因子**不存储在数据库中**，每次动态计算
 - ✅ 两个必要条件：SIE 启用该因子 + 用户有对应联系方式
-- ✅ 手机和邮箱各自独立判断
+- ✅ Phone 和 Email 各自独立判断
+- ✅ 注意：此函数返回顺序 Phone → Email，但最终会再经过排序确保优先级正确
 
 ---
 
@@ -438,7 +452,7 @@ export const getAllUserEnabledMfaVerifications = (
   const storedVerifications = filterOutEmptyBackupCodes(user.mfaVerifications)
     // 过滤掉未在 SIE 中启用的因子
     .filter((verification) => mfaSettings.factors.includes(verification.type))
-    // 排序 (内部逻辑见下)
+    // 排序 (内部排序逻辑见下)
     .sort((verificationA, verificationB) => {
       // WebAuthn 到最前
       if (verificationA.type === MfaFactor.WebAuthn && verificationB.type !== MfaFactor.WebAuthn) {
@@ -454,7 +468,7 @@ export const getAllUserEnabledMfaVerifications = (
       if (verificationB.type === MfaFactor.BackupCode) {
         return -1;
       }
-      // 其他因子按 lastUsedAt 降序（最近使用的在前）
+      // 其他因子(TOTP/Phone/Email)按 lastUsedAt 降序排列，最近使用的在前
       return new Date(verificationB.lastUsedAt ?? 0).getTime() -
              new Date(verificationA.lastUsedAt ?? 0).getTime();
     })
@@ -482,21 +496,22 @@ export const getAllUserEnabledMfaVerifications = (
 
 **复核要点**:
 - ✅ Step 1 只处理显式绑定的因子（存储在 `users.mfaVerifications` JSON 列中）
-- ✅ Step 2 动态加入隐式因子（邮箱/手机）
-- ✅ Step 3 最终排序确保备用码在最后
+- ✅ Step 1 排序规则: WebAuthn 优先 → BackupCode 放最后 → 其余按 `lastUsedAt` 降序
+- ✅ Step 2 动态加入隐式因子（Phone → Email 顺序）
+- ✅ Step 3 最终排序确保 BackupCode 在最后
 - ✅ **重要**: 隐式因子不需要用户绑定，只要满足条件就自动可用
 
 ---
 
-### 3.5 隐式 vs 显式因子对比表
+### 3.5 显式 vs 隐式因子对比表
 
-| 因子类型 | 存储位置 | 绑定要求 | 动态加入 | 用户操作 |
-|---------|---------|---------|---------|---------|
-| WebAuthn | `users.mfaVerifications` | 必须显式绑定 | ❌ 否 | 需要用户通过浏览器API完成绑定 |
-| TOTP | `users.mfaVerifications` | 必须显式绑定 | ❌ 否 | 需要扫码输入验证码 |
-| PhoneVerificationCode | 隐式: `users.primaryPhone` | 绑定手机号即可自动可用 | ✅ 是 | 只需验证手机号所有权 |
-| EmailVerificationCode | 隐式: `users.primaryEmail` | 绑定邮箱即可自动可用 | ✅ 是 | 只需验证邮箱所有权 |
-| BackupCode | `users.mfaVerifications` | 必须显式绑定 | ❌ 否 | 需要生成并保存备用码 |
+| 因子类型 | 存储位置 | 绑定要求 | 动态加入 | 显示优先级 |
+|---------|---------|---------|---------|-----------|
+| WebAuthn | `users.mfaVerifications` | 必须显式绑定 | ❌ 否 | 1 (最高) |
+| TOTP | `users.mfaVerifications` | 必须显式绑定 | ❌ 否 | 2 |
+| PhoneVerificationCode | 隐式: `users.primaryPhone` | 绑定手机号即可自动可用 | ✅ 是 | 3 |
+| EmailVerificationCode | 隐式: `users.primaryEmail` | 绑定邮箱即可自动可用 | ✅ 是 | 4 |
+| BackupCode | `users.mfaVerifications` | 必须显式绑定 | ❌ 否 | 5 (最低) |
 
 ---
 
@@ -681,11 +696,14 @@ const MfaBinding = () => {
 
 | 序号 | 复核项 | 文件路径 | 行号 | 状态 |
 |-----|-------|---------|-----|-----|
-| 5.2.1 | 显示优先级顺序: WebAuthn > TOTP > Phone > Email > BackupCode | `core/src/routes/experience/classes/helpers.ts` | 70-90 | ⬜ |
-| 5.2.2 | 隐式因子动态加入: SIE启用 + 用户有primaryPhone/Email | `core/src/routes/experience/classes/helpers.ts` | 222-240 | ⬜ |
-| 5.2.3 | 显式因子按 lastUsedAt 降序排列，最近使用在前 | `core/src/routes/experience/classes/helpers.ts` | 268-289 | ⬜ |
-| 5.2.4 | BackupCode 在所有排序阶段都被强制放到最后 | `core/src/routes/experience/classes/helpers.ts` | 277-282, 298-305 | ⬜ |
-| 5.2.5 | getAllUserEnabledMfaVerifications 合并显式+隐式因子 | `core/src/routes/experience/classes/helpers.ts` | 249-308 | ⬜ |
+| 5.2.1 | 枚举定义顺序: TOTP → WebAuthn → BackupCode → Email → Phone | `schemas/src/foundations/jsonb-types/sign-in-experience.ts` | 176-182 | ⬜ |
+| 5.2.2 | 显示优先级: WebAuthn > TOTP > Phone > Email > BackupCode | `core/src/routes/experience/classes/helpers.ts` | 70-90 | ⬜ |
+| 5.2.3 | 代码注释明确标注显示顺序 | `core/src/routes/experience/classes/helpers.ts` | 78-80 | ⬜ |
+| 5.2.4 | 隐式因子动态加入: SIE启用 + 用户有primaryPhone/Email | `core/src/routes/experience/classes/helpers.ts` | 222-240 | ⬜ |
+| 5.2.5 | 显式因子按 lastUsedAt 降序排列，最近使用在前 | `core/src/routes/experience/classes/helpers.ts` | 268-289 | ⬜ |
+| 5.2.6 | BackupCode 在所有排序阶段都被强制放到最后 | `core/src/routes/experience/classes/helpers.ts` | 277-282, 298-305 | ⬜ |
+| 5.2.7 | PhoneVerificationCode 优先级高于 EmailVerificationCode | `core/src/routes/experience/classes/helpers.ts` | 73-74 | ⬜ |
+| 5.2.8 | getAllUserEnabledMfaVerifications 合并显式+隐式因子 | `core/src/routes/experience/classes/helpers.ts` | 249-308 | ⬜ |
 
 ### 5.3 前端错误码页面跳转
 
@@ -696,6 +714,19 @@ const MfaBinding = () => {
 | 5.3.3 | 验证流程总是直接进入第一个(最近使用的)因子 | `experience/src/hooks/use-mfa-error-handler.ts` | 60-65 | ⬜ |
 | 5.3.4 | TOTP/WebAuthn/邮箱/手机有特殊直接启动逻辑 | `experience/src/hooks/use-mfa-error-handler.ts` | 75-95 | ⬜ |
 | 5.3.5 | MfaBinding 页面根据 skippable 显示/隐藏跳过按钮 | `experience/src/pages/MfaBinding/index.tsx` | 27-29 | ⬜ |
+
+---
+
+## 修正汇总
+
+本次修正涉及以下关键内容一致性问题：
+
+| 修正项 | 原描述 | 修正后描述 |
+|-------|-------|-----------|
+| MfaFactor 枚举顺序 | 与显示顺序混淆 | 明确区分"枚举定义顺序"和"显示优先级顺序"两个概念 |
+| Phone/Email 优先级 | 部分表格 Phone/Email 顺序不一致 | 统一为 Phone > Email，与 order 数组及注释一致 |
+| 排序依据说明 | 只提到硬编码排序 | 补充说明 Step 1 中显式因子还会按 lastUsedAt 排序 |
+| 3.5 表格显示优先级列 | Phone/Email 顺序颠倒 | 修正为 Phone 3，Email 4 |
 
 ---
 
