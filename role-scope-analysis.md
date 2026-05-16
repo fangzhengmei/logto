@@ -298,14 +298,20 @@ Client Credentials 流程用于 M2M（机器到机器）应用直接获取访问
 
 ### 6.3 Scope 判定口径：直接拒绝 vs 交集过滤
 
-#### 6.3.1 直接拒绝的 Scope（硬校验）
+#### 6.3.1 硬拒绝校验一：静态 Scope Allowlist 校验
 
-**校验位置**: `packages/core/src/oidc/grants/client-credentials.ts:99-107`
+**适用 Grant Type**: `client_credentials`, `authorization_code`, `refresh_token`
+
+**校验位置**:
+- client_credentials: `packages/core/src/oidc/grants/client-credentials.ts:99-107`
+- authorization_code/refresh_token: 由 oidc-provider 内部实现
 
 ```typescript
+// client_credentials 中的实现
 if (client.scope) {
   const allowList = new Set(client.scope.split(' '));
 
+  // 关键：只过滤出静态 scope 进行检查
   for (const scope of scopes.filter(Set.prototype.has.bind(statics))) {
     if (!allowList.has(scope)) {
       throw new InvalidScope('requested scope is not allowed', scope);
@@ -315,15 +321,50 @@ if (client.scope) {
 ```
 
 **判定逻辑**:
-- 仅针对 **OIDC 静态 scope**（`statics` 集合中的 scope，如 `openid`, `profile`, `email`, `offline_access` 等）
-- 请求的静态 scope **必须** 在应用的 `client.scope` 允许列表中
-- **不满足直接抛出 `InvalidScope` 错误，终止流程**
+- **校验范围**: 仅针对 **OIDC 静态 scope**（`statics` 集合中的 scope，如 `openid`, `profile`, `email`, `offline_access`, `address`, `phone` 等）
+- **资源 Scope 例外**: 资源 Scope（API 权限）**不**走此校验，走资源服务器的交集过滤
+- **校验规则**: 请求的静态 scope **必须** 在应用的 `client.scope` 允许列表中
+- **失败行为**: 不满足直接抛出 `InvalidScope` 错误，终止流程
+- **错误格式**: 第二个参数携带不允许的 scope 名称
 
 ---
 
-#### 6.3.2 交集过滤的 Scope（软过滤）
+#### 6.3.2 硬拒绝校验二：Refresh Token Scope 子集校验
 
-以下场景下，Scope 只做交集过滤，不满足不会直接报错，而是从最终令牌中移除：
+**适用 Grant Type**: `refresh_token` **only**
+
+**校验位置**: `packages/core/src/oidc/grants/refresh-token.ts:129-138`
+
+```typescript
+// 仅当请求中显式指定了 scope 参数时才执行此校验
+if (params.scope) {
+  // 计算：请求的 scope - Refresh Token 已有的 scope
+  const missing = difference([...requestParamScopes], [...refreshToken.scopes]);
+
+  if (missing.length > 0) {
+    throw new InvalidScope(
+      // 根据缺失数量动态调整错误消息
+      `refresh token missing requested ${missing.length > 1 ? 'scopes' : 'scope'}`,
+      // 第二个参数携带缺失的 scope
+      missing.join(' ')
+    );
+  }
+}
+```
+
+**判定逻辑**:
+- **触发条件**: 仅当请求中 **显式指定** `scope` 参数时才执行
+- **校验规则**: 请求的 scope **必须是** Refresh Token 已有 scope 的 **子集**
+- **失败行为**: 不满足抛出 `InvalidScope` 错误，终止流程
+- **与静态 scope allowlist 的区别**:
+  - Allowlist 校验：检查静态 scope 是否在客户端允许列表中
+  - 子集校验：检查所有请求 scope（包括资源 scope）是否在 Refresh Token 已有 scope 范围内
+
+---
+
+#### 6.3.3 交集过滤的 Scope（软过滤）
+
+以下场景下，Scope 只做交集过滤，不满足不会直接报错，而是从最终令牌中静默移除：
 
 | 场景 | 校验位置 | 交集逻辑 |
 |------|---------|----------|
