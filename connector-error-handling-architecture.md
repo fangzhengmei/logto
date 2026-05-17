@@ -1,21 +1,23 @@
-# 外部身份连接器错误处理拦截链架构调研（修订版）
+# 外部身份连接器错误处理拦截链架构调研（最终修订版）
 
 ## 概述
 
 本文档**准确梳理** Logto 系统中外部身份连接器（社交连接器 / 企业 SSO 连接器）在握手（handshake）和回调（callback）阶段的**实际错误分流路径**，明确哪些错误会走连接器翻译层、哪些会在业务层直接转成通用错误，并说明这对状态码与用户可见信息的影响。
 
+**特别复核**：企业 SSO 的 SAML ACS 回调链路的真实回调地址、进入点和错误传播路径。
+
 ---
 
 ## 核心结论速览
 
-| 连接器类型 | 阶段 | 错误处理路径 | 经过连接器翻译层 | 状态码 |
-|-----------|------|-------------|----------------|--------|
-| **社交连接器** | 握手（getAuthorizationUrl） | 冒泡至中间件 | ✅ 是 | 由 `koa-connector-error-handler` 精细映射 |
-| **社交连接器** | 回调（verify） | 冒泡至中间件 | ✅ 是 | 由 `koa-connector-error-handler` 精细映射 |
-| **社交连接器** | SAML ACS 回调 | 冒泡至中间件 | ✅ 是 | 由 `koa-connector-error-handler` 精细映射 |
-| **企业 SSO 连接器** | 握手（getAuthorizationUrl） | 业务层捕获转换 | ❌ 否 | 硬编码 **500** |
-| **企业 SSO 连接器** | 回调（verify） | 业务层捕获转换 | ❌ 否 | 硬编码 **500** |
-| **企业 SSO 连接器** | SAML ACS 回调 | 冒泡至中间件 | ✅ 是 | 由 `koa-connector-error-handler` 精细映射 |
+| 连接器类型 | 阶段 | 回调地址 | 经过连接器翻译层 | 状态码 |
+|-----------|------|---------|----------------|--------|
+| **社交连接器** | 握手（getAuthorizationUrl） | N/A | ✅ 是 | 精细映射（400/401/429 等） |
+| **社交连接器** | 回调（verify） | N/A | ✅ 是 | 精细映射 |
+| **社交 SAML 连接器** | ACS 回调 | `/authn/saml/:connectorId` | ✅ 是 | 精细映射 |
+| **企业 SSO 连接器** | 握手（getAuthorizationUrl） | N/A | ❌ 否 | 硬编码 **500** |
+| **企业 SSO 连接器** | 回调（verify） | N/A | ❌ 否 | 硬编码 **500** |
+| **企业 SSO SAML 连接器** | ACS 回调 | `/authn/single-sign-on/saml/:connectorId` | ✅ 是 | 精细映射 |
 
 ---
 
@@ -78,6 +80,7 @@
 **关键代码**：
 - `SamlConnector.ts` 中 `getIdentityProvider()` 遇到无效 XML metadata 时抛出 `SsoConnectorError`
 - `OidcConnector.ts` 中 `getUserInfo()` 遇到缺失 access token 时抛出 `SsoConnectorError`
+- `SamlConnector/utils.ts` 中 `handleSamlAssertion()` 解析 SAML 断言失败时抛出 `SsoConnectorError(AuthorizationFailed)`
 - 错误数据包含详细调试信息：`metadata`、`config`、原始 `error` 对象等
 
 **错误码定义**（`SsoConnectorErrorCodes`）：
@@ -132,7 +135,7 @@ switch (code) {
 **位置**：
 - `packages/core/src/routes/interaction/utils/single-sign-on.ts`（企业 SSO 专用）
 - `packages/core/src/routes/interaction/utils/social-verification.ts`（社交连接器用）
-- `packages/core/src/routes/experience/classes/verifications/`
+- `packages/core/src/routes/authn.ts`（SAML ACS 回调端点）
 
 **核心职责**：
 - 调用连接器 API 执行实际的握手和回调逻辑
@@ -152,7 +155,7 @@ export const createSocialAuthorizationUrl = async (...) => {
 };
 ```
 
-#### 企业 SSO 连接器路径（有 try-catch）：
+#### 企业 SSO 连接器握手/回调路径（有 try-catch）：
 `getSsoAuthorizationUrl()` 和 `verifySsoIdentity()` 中**有** try-catch 捕获 `ConnectorError`，**直接转换为 RequestError**，状态码硬编码为 500。
 
 ```typescript
@@ -222,7 +225,7 @@ if (error instanceof RequestError) {
 
 ---
 
-## 详细错误分流路径
+## 详细错误分流路径（含真实回调地址）
 
 ### 路径 A：社交连接器 - 握手阶段（获取授权 URL）
 
@@ -270,12 +273,19 @@ koa-error-handler.ts
 
 ### 路径 C：社交 SAML 连接器 - ACS 回调
 
+**真实回调地址**：`POST /authn/saml/:connectorId`
+
+**进入点**：`authn.ts:107-159`
+
 ```
 POST /authn/saml/:connectorId
     ↓
-直接调用 connector.validateSamlAssertion()
+authn.ts 路由处理器（第 107 行）
     ↓  无 try-catch
-抛出 ConnectorError
+1. 校验 connector 类型为 Social
+2. 校验 SAMLResponse 和 RelayState 存在
+3. 调用 connector.validateSamlAssertion({ body }, getSession, setSession)
+    ↓  抛出 ConnectorError（如断言无效、签名错误等）
     ↓
 koa-connector-error-handler.ts  ✅ 经过连接器翻译层
     ↓
@@ -322,14 +332,37 @@ koa-error-handler.ts
 返回前端（状态码始终 500，即使是授权失败）
 ```
 
-### 路径 F：企业 SSO SAML 连接器 - ACS 回调
+### 路径 F：企业 SSO SAML 连接器 - ACS 回调（经过复核）
+
+**真实回调地址**：`POST /authn/single-sign-on/saml/:connectorId`
+
+**来源**：`ssoPath = 'single-sign-on'`（定义于 `interaction/const.ts:3`）
+
+**进入点**：`authn.ts:177-315`
 
 ```
-POST /authn/sso/saml/:connectorId
+POST /authn/single-sign-on/saml/:connectorId
     ↓
-直接调用 connectorInstance.parseSamlAssertionContent()
+authn.ts 路由处理器（第 177 行）
     ↓  无 try-catch
-抛出 ConnectorError
+1. ssoConnectorsLibrary.getSsoConnectorById(connectorId)
+   → 抛出 RequestError(404) 如果连接器不存在
+    ↓
+2. new ssoConnectorFactories[providerName].constructor(connectorData, envSet.endpoint)
+   → SamlSsoConnector 构造函数不抛出错误（config 解析失败会 fallback 到 undefined）
+    ↓
+3. 检查是否为 IdP 发起的 SSO（无 RelayState 且 isDevFeaturesEnabled）
+   → 如有：parseSamlAssertionContent(body)
+      → 抛出 SsoConnectorError 如果断言无效
+    ↓
+4. SP 发起的 SSO 流程（有 RelayState）
+   → parseSamlAssertionContent(body)  [authn.ts:298]
+     → 调用 SamlConnector.parseSamlAssertionContent()
+       → 调用 handleSamlAssertion()
+         → 抛出 SsoConnectorError(AuthorizationFailed) 如果断言无效
+   → getUserInfoFromSamlAssertion(assertionContent)  [authn.ts:299]
+     → 抛出 SsoConnectorError(AuthorizationFailed) 如果用户信息字段缺失
+    ↓  抛出 ConnectorError / SsoConnectorError
     ↓
 koa-connector-error-handler.ts  ✅ 经过连接器翻译层
     ↓
@@ -339,6 +372,29 @@ koa-error-handler.ts
     ↓
 返回前端（状态码正确）
 ```
+
+**路径 F 关键点**：
+- ✅ **路由处理器中没有 try-catch**，所有连接器错误直接冒泡
+- ✅ `parseSamlAssertionContent()` 和 `getUserInfoFromSamlAssertion()` 抛出的 `SsoConnectorError` 会被中间件层捕获
+- ✅ 状态码由 `koa-connector-error-handler` 精细映射
+- ⚠️  只有 `getSsoConnectorById()` 可能抛出 `RequestError(404)`，这是业务逻辑错误而非连接器错误
+
+---
+
+## 社交 SAML ACS 回调 vs 企业 SSO SAML ACS 回调对比
+
+| 维度 | 社交 SAML ACS 回调 | 企业 SSO SAML ACS 回调 |
+|------|-------------------|----------------------|
+| **回调地址** | `/authn/saml/:connectorId` | `/authn/single-sign-on/saml/:connectorId` |
+| **进入点文件** | `authn.ts:107` | `authn.ts:177` |
+| **连接器获取方式** | `libraries.socials.getConnector()` | `libraries.ssoConnectors.getSsoConnectorById()` |
+| **调用方法** | `connector.validateSamlAssertion()` | `connectorInstance.parseSamlAssertionContent()` + `getUserInfoFromSamlAssertion()` |
+| **是否经过连接器翻译层** | ✅ 是 | ✅ 是 |
+| **状态码映射** | 精细映射 | 精细映射 |
+| **路由内 try-catch** | 无 | 无 |
+| **连接器错误传播路径** | 直接冒泡至中间件 | 直接冒泡至中间件 |
+
+**✅ 结论修正**：上一轮结论中关于企业 SSO SAML ACS 回调路径的描述是正确的，两条 SAML ACS 路径都经过连接器翻译层，状态码都能精细映射。
 
 ---
 
@@ -379,8 +435,8 @@ koa-error-handler.ts
 | 层级 | 模块 | 翻译错误 | 决定状态码 | 决定用户可见信息 | 包含调试数据 |
 |------|------|----------|------------|-----------------|-------------|
 | 1. 连接器实现层 | SamlConnector / OidcConnector | ❌ 抛出原始错误 | ❌ | ❌ | ✅ 完整调试信息 |
-| 2. 连接器错误翻译层 | koa-connector-error-handler | ✅ ConnectorError → RequestError（仅社交连接器 + SSO ACS 路径） | ✅ 精细映射（仅经过的路径） | ❌ | ✅ 透传 |
-| 3. 业务逻辑层 | single-sign-on.ts（SSO） | ⚠️  仅 SSO 握手/回调直接转换 | ⚠️  SSO 硬编码 500 | ❌ | ✅ 透传 |
+| 2. 连接器错误翻译层 | koa-connector-error-handler | ✅ ConnectorError → RequestError（社交连接器 + 所有 SAML ACS 路径） | ✅ 精细映射（仅经过的路径） | ❌ | ✅ 透传 |
+| 3. 业务逻辑层 | single-sign-on.ts（SSO 握手/回调） | ⚠️  仅 SSO 握手/回调直接转换 | ⚠️  SSO 硬编码 500 | ❌ | ✅ 透传 |
 | 4. 通用错误处理层 | koa-error-handler | ✅ i18n 翻译 | ✅ 最终状态码 | ✅ 决定暴露内容 | ⚠️  可能暴露 data |
 | 5. 前端体验层 | experience/apis | ❌ | ❌ | ✅ UI 展示逻辑 | ❌ |
 
@@ -390,7 +446,7 @@ koa-error-handler.ts
 
 ### 1. 错误处理存在**三条**实际路径
 
-**路径 1（社交连接器 + SSO ACS）**：
+**路径 1（社交连接器 + 所有 SAML ACS 回调）**：
 ```
 连接器抛出 ConnectorError → koa-connector-error-handler → koa-error-handler
 ```
