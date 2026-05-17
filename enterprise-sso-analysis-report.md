@@ -56,7 +56,7 @@
 | `active` | boolean | 是否活跃 |
 
 **密钥管理规则**：
-- 每个应用只能有一个活跃密钥（通过唯一索引`sam_application_secrets__unique_active_secret`保证）
+- 每个应用只能有一个活跃密钥（通过唯一索引`saml_application_secrets__unique_active_secret`保证）
 - 支持密钥轮换
 
 **注册入口**：`packages/core/src/saml-application/SamlApplication/index.ts`
