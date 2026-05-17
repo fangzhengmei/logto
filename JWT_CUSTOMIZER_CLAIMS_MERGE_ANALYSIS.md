@@ -1,4 +1,4 @@
-# JWT 自定义脚本声明合并行为分析（Cloud/OSS 双链路对照版）
+# JWT 自定义脚本声明合并行为分析（最终版）
 
 > **证据分层原则**：每条结论标注为「已证实」或「推断」。
 > - **✅ 已证实**：有仓库内可直接核对的代码或测试证据
@@ -111,11 +111,23 @@ export const isAccessDeniedError = (
 | **证据位置** | `local-vm.ts:60` | `extra-token-claims.ts:323-363` |
 | **状态** | ✅ 已证实（OSS 超时值） | ⚠️ 推断（Cloud 超时值） |
 
-**缺失证据（Cloud 超时）**：
-- 仓库内未发现 Azure Function 调用的超时配置
-- 未发现 Cloud Connection 客户端的超时配置
-- **最小验证步骤**：在 Cloud 环境中配置一个执行 10 秒的脚本，观察实际超时时间
-- **预期观测结果**：HTTP 客户端应有默认超时（如 10-30 秒），或远程服务有执行时间限制
+#### 📋 推断条目补全（Cloud 超时）
+
+- **缺失证据**：
+  1. 仓库内未发现 Azure Function 调用（got 客户端）的超时配置
+  2. 未发现 Cloud Connection（withtyped 客户端）的超时配置
+  3. 未发现远程服务（Azure Function / Cloudflare Workers）的执行时间限制配置
+
+- **最小验证步骤**：
+  1. 准备一个包含 `await new Promise(resolve => setTimeout(resolve, 10000))` 的脚本，配置到 Cloud 环境
+  2. 调用令牌签发接口，记录从请求发起到收到响应的时间
+  3. 检查响应中是否包含自定义声明
+  4. 检查日志中是否有超时相关的错误信息
+
+- **预期观测结果**：
+  - 可能结果 A（HTTP 客户端超时）：请求在 10-30 秒内返回，令牌不包含自定义声明，日志记录超时错误
+  - 可能结果 B（远程服务超时）：远程服务在执行时间限制（如 5 秒）后返回错误响应
+  - 可能结果 C（无超时）：请求在 10 秒后成功返回，令牌包含自定义声明
 
 ---
 
@@ -132,14 +144,25 @@ export const isAccessDeniedError = (
 | **证据位置** | `extra-token-claims.ts:323-363` | `jwt-customizer.ts:302-320` + `custom-jwt/index.ts:82-107` |
 | **状态** | ✅ 已证实 | ⚠️ 推断（远端检测语法错误的具体方式） |
 
-**关键代码（Cloud 错误转换）**：`packages/core/src/utils/custom-jwt/index.ts:82-107`
+#### 📋 推断条目补全（Cloud 语法错误检测）
 
-```javascript
-export const parseAzureFunctionsResponseError = (error: HTTPError): ResponseError => {
-  // 解析 Azure Function 的 HTTP 错误响应
-  // 转换为统一的 ResponseError 格式
-};
-```
+- **缺失证据**：
+  1. 未发现远程服务（Azure Function / Cloudflare Workers）如何检测和处理语法错误
+  2. 未发现远程服务返回的语法错误响应格式的明确定义
+  3. 未发现远程服务是否会在语法错误时返回 stack trace
+
+- **最小验证步骤**：
+  1. 配置包含语法错误的脚本（如 `const x = ;`）到 Cloud 环境
+  2. 调用令牌签发接口
+  3. 捕获并检查 HTTP 响应的状态码和响应体
+  4. 检查最终令牌是否签发成功
+
+- **预期观测结果**：
+  - HTTP 响应状态码应为 400 或 500
+  - 响应体应为 JSON 格式，包含 `message` 字段描述语法错误
+  - 可能包含 `error.code` 字段，值为 `general` 或 `syntax_error`
+  - 默认模式下令牌应签发成功（fail-open），不包含自定义声明
+  - dev 模式下应返回 `invalid_request` 错误
 
 ---
 
@@ -147,13 +170,34 @@ export const parseAzureFunctionsResponseError = (error: HTTPError): ResponseErro
 
 | 维度 | OSS 本地 VM | Cloud 远程执行 |
 |------|------------|---------------|
-| **触发条件** | 脚本执行中抛出 Error（如 `throw new Error("oops")`） | 远程服务执行脚本时抛出异常 |
+| **触发条件** | 脚本执行中抛出 Error（如 `throw new Error("oops")` | 远程服务执行脚本时抛出异常 |
 | **错误传播** | 异常直接从 `runInNewContext` 抛出 ✅ | 远程服务捕获异常并返回错误响应 ⚠️ |
 | **错误信息** | 原始 Error 对象，包含 stack trace | 经过序列化的错误消息，可能丢失 stack trace |
 | **默认行为** | fail-open，忽略错误，继续签发 ✅ | fail-open，忽略错误，继续签发 ✅ |
 | **dev 模式行为** | 抛出 `invalid_request`，阻止签发 ✅ | 抛出 `invalid_request`，阻止签发 ✅ |
 | **证据位置** | `extra-token-claims.ts:323-363` | `extra-token-claims.ts:323-363` |
 | **状态** | ✅ 已证实 | ⚠️ 推断（远端异常捕获与序列化方式） |
+
+#### 📋 推断条目补全（Cloud 运行时异常处理）
+
+- **缺失证据**：
+  1. 未发现远程服务如何捕获脚本执行中的异常
+  2. 未发现远程服务是否会保留原始异常的 stack trace
+  3. 未发现远程服务是否会对异常信息进行脱敏处理
+
+- **最小验证步骤**：
+  1. 配置脚本 `throw new Error("test-runtime-error")` 到 Cloud 环境
+  2. 调用令牌签发接口
+  3. 捕获并检查 HTTP 响应体
+  4. 检查日志中的错误记录
+
+- **预期观测结果**：
+  - HTTP 响应状态码应为 500
+  - 响应体包含 `message` 字段，值为 `"test-runtime-error"`
+  - 可能包含 `error` 字段，包含异常详情
+  - stack trace 可能被截断或省略
+  - 默认模式下令牌应签发成功（fail-open）
+  - dev 模式下应返回 `invalid_request` 错误
 
 ---
 
@@ -170,20 +214,24 @@ export const parseAzureFunctionsResponseError = (error: HTTPError): ResponseErro
 | **证据位置** | `jwt-customizer.ts:74-77` | `jwt-customizer.ts:311` |
 | **状态** | ✅ 已证实 | ✅ 已证实（区域 Azure Function）/ ⚠️ 推断（Cloud Connection） |
 
-**关键代码（OSS 校验）**：`packages/core/src/libraries/jwt-customizer.ts:74-77`
+#### 📋 推断条目补全（Cloud Connection 返回值校验）
 
-```javascript
-const result = await runScriptFunctionInLocalVm(data.script, 'getCustomJwtClaims', payload);
-return z.record(z.unknown()).parse(result);
-```
+- **缺失证据**：
+  1. 未发现 Cloud Connection（withtyped 客户端）对返回值的类型校验逻辑
+  2. 未发现 withtyped 客户端在类型不匹配时的错误处理方式
+  3. 未发现 Cloud Connection 路径的实际使用场景（何时使用区域 Azure Function，何时使用 Cloud Connection）
 
-**关键代码（Cloud 校验）**：`packages/core/src/libraries/jwt-customizer.ts:309-312`
+- **最小验证步骤**：
+  1. 配置脚本返回字符串 `"not-an-object"` 到 Cloud 环境（确保走 Cloud Connection 路径）
+  2. 调用令牌签发接口
+  3. 检查响应状态码和响应体
+  4. 检查最终令牌是否签发成功
 
-```javascript
-const result = await got.post(/* ... */).json<unknown>();
-const parsedResult = jsonObjectGuard.parse(result);
-return parsedResult;
-```
+- **预期观测结果**：
+  - withtyped 客户端应抛出类型错误
+  - 错误被 `ResponseError` 捕获
+  - 默认模式下令牌应签发成功（fail-open）
+  - dev 模式下应返回 `invalid_request` 错误
 
 ---
 
@@ -199,13 +247,43 @@ return parsedResult;
 | **证据位置** | 无直接代码证据 | `jwt-customizer.ts:302-309` |
 | **状态** | ⚠️ 推断 | ⚠️ 部分证实（HTTP 解析失败）/ ⚠️ 推断（远程序列化失败） |
 
-**缺失证据说明**：
-- 仓库内无测试用例覆盖返回不可序列化值的场景
-- 无法确认 oidc-provider 在序列化失败时的具体行为
-- **最小验证步骤（OSS）**：配置脚本返回 `{ func: () => {} }`，观察令牌是否签发成功
-- **预期观测结果（OSS）**：可能抛出 JSON 序列化错误导致签发失败，也可能静默忽略函数字段
-- **最小验证步骤（Cloud）**：配置脚本返回含循环引用的对象，观察 HTTP 响应
-- **预期观测结果（Cloud）**：远程服务可能返回 500 错误，或 got 解析失败
+#### 📋 推断条目补全（OSS 序列化失败行为）
+
+- **缺失证据**：
+  1. 仓库内无测试用例覆盖返回不可序列化值的场景
+  2. 无法确认 oidc-provider 在序列化失败时的具体行为
+  3. 未发现 oidc-provider 对 extraTokenClaims 返回值进行 JSON 序列化的代码
+
+- **最小验证步骤**：
+  1. 配置脚本返回 `{ func: () => {}, regularField: "value" }`
+  2. 调用令牌签发接口
+  3. 检查令牌是否签发成功
+  4. 若签发成功，解码令牌检查 payload 内容
+
+- **预期观测结果**：
+  - 可能结果 A（静默忽略）：令牌签发成功，payload 中 `func` 字段被忽略，`regularField` 存在
+  - 可能结果 B（抛出错误）：令牌签发失败，返回 JSON 序列化错误
+  - 可能结果 C（部分成功）：令牌签发成功，但 `func` 字段被序列化为 `undefined` 或空对象
+
+#### 📋 推断条目补全（Cloud 序列化失败行为）
+
+- **缺失证据**：
+  1. 未发现远程服务如何处理序列化失败
+  2. 未发现 `got.json<unknown>()` 解析失败后的错误类型
+  3. 未发现 got 解析失败是否会被 `ResponseError` 捕获
+
+- **最小验证步骤**：
+  1. 配置脚本返回含循环引用的对象：`const obj = {}; obj.self = obj; return obj;`
+  2. 调用令牌签发接口
+  3. 检查 HTTP 响应状态码和响应体
+  4. 检查最终令牌是否签发成功
+
+- **预期观测结果**：
+  - 可能结果 A（远程序列化失败）：远程服务返回 500 错误，错误信息包含 "Converting circular structure to JSON"
+  - 可能结果 B（got 解析失败）：远程服务返回非 JSON 响应，got 抛出 ParseError
+  - 可能结果 C（静默忽略）：远程服务静默忽略循环引用，返回截断的 JSON
+  - 默认模式下，若错误被捕获，令牌应签发成功（fail-open）
+  - dev 模式下应返回 `invalid_request` 错误
 
 ---
 
@@ -267,7 +345,7 @@ const shouldBlockIssuanceOnError =
 
 ---
 
-## 4. 声明可覆盖性（保留自 v3.0）
+## 4. 声明可覆盖性
 
 ### 4.1 合并优先级
 
@@ -298,34 +376,55 @@ const shouldBlockIssuanceOnError =
 | `iss` | ❌ 不在 IN_PAYLOAD | ❌ 脚本无法读取原值 | ⚠️ 推断不允许（内部计算） |
 | `nbf` | ❌ 不在 IN_PAYLOAD | ❌ 脚本无法读取原值 | ⚠️ 推断不允许（内部计算） |
 
----
+#### 📋 推断条目补全（oidc-provider 字段覆盖性）
 
-## 5. 证据缺口汇总与验证建议
+- **缺失证据**：
+  1. 仓库内未包含 oidc-provider 的 JWT 生成源码
+  2. 无集成测试验证脚本返回 `exp`/`iat`/`iss` 后的实际行为
+  3. 无法在仓库内直接核对 oidc-provider 的内部合并逻辑
 
-### 5.1 已识别的证据缺口
+- **最小验证步骤**：
+  1. 配置脚本返回 `{ exp: 9999999999, iat: 0, iss: "https://fake-issuer.com" }`
+  2. 调用令牌签发接口
+  3. 解码返回的令牌，检查 payload 中的 `exp`/`iat`/`iss` 字段值
 
-| 待确认项 | 缺失证据说明 | 最小验证步骤 | 预期观测结果 |
-|---------|-------------|-------------|-------------|
-| Cloud 远程执行超时时间 | 未发现 Azure Function / Cloud Connection 的超时配置 | 在 Cloud 环境中配置一个执行 10 秒的脚本，观察实际超时时间 | HTTP 客户端应有默认超时（如 10-30 秒），或远程服务有执行时间限制 |
-| Cloud 语法错误检测方式 | 未发现远程服务如何检测语法错误 | 配置语法错误的脚本，观察 Cloud 环境返回的错误响应格式 | 应返回包含错误信息的 JSON 响应，错误码为 `general` 或类似 |
-| OSS 序列化失败行为 | 无测试验证返回不可序列化值后的具体行为 | 配置脚本返回 `{ func: () => {} }`，观察令牌是否签发成功 | 可能抛出 JSON 序列化错误，也可能静默忽略函数字段 |
-| Cloud 序列化失败行为 | 未发现远程服务如何处理序列化失败 | 配置脚本返回含循环引用的对象，观察 HTTP 响应 | 远程服务可能返回 500 错误，或 got 解析失败 |
-| 覆盖 `exp`/`iat`/`iss` 的实际效果 | 无测试验证脚本返回这些字段后的最终令牌内容 | 配置脚本返回 `{ exp: 9999999999 }`，解码验证最终令牌 | 这些字段可能被 oidc-provider 内部计算的值覆盖 |
-| Cloud 网络错误处理 | 无测试验证网络不可用时的行为 | 模拟网络中断，观察令牌签发是否继续 | 默认 fail-open，dev 模式下阻止签发 |
-
-### 5.2 审慎使用建议
-
-对于标记为「推断」的结论，在生产环境使用前建议：
-1. 通过实际测试验证行为（参考上表的最小验证步骤）
-2. 避免依赖未证实的行为（如尝试覆盖 `exp`/`iat`/`iss`）
-3. 确保返回值可 JSON 序列化，避免依赖隐式容错行为
-4. Cloud 环境中增加对远程服务可用性的监控
+- **预期观测结果**：
+  - 可能结果 A（被覆盖）：`exp`/`iat`/`iss` 字段值与脚本返回值一致
+  - 可能结果 B（被忽略）：`exp`/`iat`/`iss` 字段值为 oidc-provider 内部计算值，脚本返回值被忽略
+  - 可能结果 C（部分覆盖）：部分字段被覆盖，部分字段被忽略
 
 ---
 
-## 6. 多模块协作关系
+## 5. 所有推断条目汇总表
 
-### 6.1 模块职责与证据矩阵
+| 推断条目 | 所属章节 | 缺失证据 | 最小验证步骤 | 预期观测结果 |
+|---------|---------|-----------|-------------|-------------|
+| Cloud 远程执行超时时间 | 2.2 | Azure Function / Cloud Connection 超时配置未发现 | 配置执行 10 秒的脚本，观察实际超时时间 | HTTP 客户端默认超时 10-30 秒，或远程服务有执行时间限制 |
+| Cloud 语法错误检测方式 | 2.3 | 远程服务语法错误检测和响应格式未发现 | 配置语法错误的脚本，观察 Cloud 环境错误响应格式 | 返回包含错误信息的 JSON 响应，错误码为 `general` 或类似 |
+| Cloud 运行时异常处理 | 2.4 | 远程服务异常捕获与序列化方式未发现 | 配置 `throw new Error("test")` 的脚本，观察响应格式 | 返回包含错误消息的 JSON 响应，可能丢失 stack trace |
+| Cloud Connection 返回值校验 | 2.5 | withtyped 客户端类型校验逻辑未发现 | 配置返回字符串的脚本，观察 Cloud Connection 路径的错误处理 | withtyped 客户端抛出类型错误，被 ResponseError 捕获 |
+| OSS 序列化失败行为 | 2.6 | oidc-provider 序列化失败行为未发现 | 配置返回 `{ func: () => {} }` 的脚本，观察令牌是否签发成功 | 可能抛出 JSON 序列化错误，也可能静默忽略函数字段 |
+| Cloud 序列化失败行为 | 2.6 | 远程服务序列化失败处理未发现 | 配置返回含循环引用对象的脚本，观察 HTTP 响应 | 远程服务可能返回 500 错误，或 got 解析失败 |
+| oidc-provider 字段覆盖性 | 4.2 | oidc-provider JWT 生成源码未包含 | 配置返回 `{ exp: 9999999999 }` 的脚本，解码验证最终令牌 | 这些字段可能被 oidc-provider 内部计算的值覆盖 |
+
+---
+
+## 6. 审慎使用建议
+
+对于标记为「推断」的结论，在生产环境使用前强烈建议：
+
+1. **通过实际测试验证行为**（参考上表的最小验证步骤）
+2. **避免依赖未证实的行为**（如尝试覆盖 `exp`/`iat`/`iss`）
+3. **确保返回值可 JSON 序列化**，避免依赖隐式容错行为
+4. **Cloud 环境中增加对远程服务可用性的监控**
+5. **不要假设错误处理行为**：在脚本内部做好异常捕获，避免依赖系统级别的错误处理
+6. **关键业务逻辑不要放在自定义脚本中**：自定义脚本失败可能因为各种原因被静默忽略
+
+---
+
+## 7. 多模块协作关系
+
+### 7.1 模块职责与证据矩阵
 
 | 模块 | 文件路径 | 核心职责 | 可证实的关键行为 |
 |------|---------|---------|----------------|
@@ -341,7 +440,8 @@ const shouldBlockIssuanceOnError =
 
 ## 修订记录
 
-- **v4.0（当前版本）**：Cloud/OSS 双链路对照版，新增 7 类错误的双链路行为对照矩阵，标注每格的证实状态和证据位置
+- **v5.0（最终版）**：系统整理所有推断条目，为每条补全缺失证据、最小验证步骤、预期观测结果，新增「所有推断条目汇总表」
+- **v4.0**：Cloud/OSS 双链路对照版，新增 7 类错误的双链路行为对照矩阵
 - **v3.0**：证据分层收敛版，每条结论标注「已证实」或「推断」
 - **v2.0**：证据化复核版，明确了可覆盖/不可覆盖字段清单和返回值约束
 - **v1.0**：初始分析版本，提供整体框架
