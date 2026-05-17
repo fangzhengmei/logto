@@ -1,10 +1,8 @@
-# 外部身份连接器错误处理拦截链架构调研（最终修订版）
+# 外部身份连接器错误处理拦截链架构调研
 
 ## 概述
 
-本文档**准确梳理** Logto 系统中外部身份连接器（社交连接器 / 企业 SSO 连接器）在握手（handshake）和回调（callback）阶段的**实际错误分流路径**，明确哪些错误会走连接器翻译层、哪些会在业务层直接转成通用错误，并说明这对状态码与用户可见信息的影响。
-
-**特别复核**：企业 SSO 的 SAML ACS 回调链路的真实回调地址、进入点和错误传播路径。
+本文档梳理 Logto 系统中外部身份连接器（社交连接器 / 企业 SSO 连接器）在握手（handshake）和回调（callback）阶段的实际错误分流路径，明确哪些错误会走连接器翻译层、哪些会在业务层直接转成通用错误，并说明这对状态码与用户可见信息的影响。
 
 ---
 
@@ -17,7 +15,7 @@
 | **社交 SAML 连接器** | ACS 回调 | `/authn/saml/:connectorId` | ✅ 是 | 精细映射 |
 | **企业 SSO 连接器** | 握手（getAuthorizationUrl） | N/A | ❌ 否 | 硬编码 **500** |
 | **企业 SSO 连接器** | 回调（verify） | N/A | ❌ 否 | 硬编码 **500** |
-| **企业 SSO SAML 连接器** | ACS 回调 | `/authn/single-sign-on/saml/:connectorId` | ✅ 是 | 精细映射 |
+| **企业 SSO SAML 连接器** | ACS 回调 | `/authn/single-sign-on/saml/:connectorId` | ✅ 是 | 精细映射（连接器错误）+ 多个 404 分支（业务错误） |
 
 ---
 
@@ -332,7 +330,7 @@ koa-error-handler.ts
 返回前端（状态码始终 500，即使是授权失败）
 ```
 
-### 路径 F：企业 SSO SAML 连接器 - ACS 回调（经过复核）
+### 路径 F：企业 SSO SAML 连接器 - ACS 回调
 
 **真实回调地址**：`POST /authn/single-sign-on/saml/:connectorId`
 
@@ -340,44 +338,73 @@ koa-error-handler.ts
 
 **进入点**：`authn.ts:177-315`
 
+#### 错误分支全景图：
+
 ```
 POST /authn/single-sign-on/saml/:connectorId
     ↓
 authn.ts 路由处理器（第 177 行）
-    ↓  无 try-catch
-1. ssoConnectorsLibrary.getSsoConnectorById(connectorId)
-   → 抛出 RequestError(404) 如果连接器不存在
     ↓
-2. new ssoConnectorFactories[providerName].constructor(connectorData, envSet.endpoint)
-   → SamlSsoConnector 构造函数不抛出错误（config 解析失败会 fallback 到 undefined）
-    ↓
-3. 检查是否为 IdP 发起的 SSO（无 RelayState 且 isDevFeaturesEnabled）
-   → 如有：parseSamlAssertionContent(body)
-      → 抛出 SsoConnectorError 如果断言无效
-    ↓
-4. SP 发起的 SSO 流程（有 RelayState）
-   → parseSamlAssertionContent(body)  [authn.ts:298]
-     → 调用 SamlConnector.parseSamlAssertionContent()
-       → 调用 handleSamlAssertion()
-         → 抛出 SsoConnectorError(AuthorizationFailed) 如果断言无效
-   → getUserInfoFromSamlAssertion(assertionContent)  [authn.ts:299]
-     → 抛出 SsoConnectorError(AuthorizationFailed) 如果用户信息字段缺失
-    ↓  抛出 ConnectorError / SsoConnectorError
-    ↓
-koa-connector-error-handler.ts  ✅ 经过连接器翻译层
-    ↓
-转换为 RequestError（状态码精细映射）
-    ↓
-koa-error-handler.ts
-    ↓
-返回前端（状态码正确）
+├─ 分支 1：连接器不存在或不支持
+│   ssoConnectorsLibrary.getSsoConnectorById(connectorId)
+│   → 抛出 RequestError({ code: 'connector.not_found', status: 404 })
+│   来源：libraries/sso-connector.ts:67-72
+│
+├─ 分支 2：连接器类型不是 SAML
+│   assertThat(connectorInstance instanceof SamlConnector, 'connector.unexpected_type')
+│   → 抛出 RequestError({ code: 'connector.unexpected_type', status: 400 })
+│   来源：authn.ts:203
+│
+├─ 分支 3：IdP 发起的 SSO 流程（无 RelayState）
+│   ├─ 分支 3a：IdP 发起 SSO 未启用
+│   │   assertThat(idpInitiatedAuthConfig, ...)
+│   │   → 抛出 RequestError({ code: 'session.connector_validation_session_not_found', status: 404 })
+│   │   来源：authn.ts:215-221
+│   │
+│   ├─ 分支 3b：IdP 发起 SSO 已启用
+│   │   → parseSamlAssertionContent(body)
+│   │     → 抛出 SsoConnectorError（连接器错误，经过翻译层）
+│
+└─ 分支 4：SP 发起的 SSO 流程（有 RelayState）
+    ├─ 分支 4a：RelayState(jti) 为空（isDevFeaturesEnabled 为 false 时）
+    │   assertThat(jti, ...)
+    │   → 抛出 RequestError({ code: 'session.connector_validation_session_not_found', status: 404 })
+    │   来源：authn.ts:278-284
+    │
+    ├─ 分支 4b：通过 jti 查找 interaction session 失败
+    │   getSingleSignOnSessionResultByJti(jti, provider)
+    │   → getInteractionFromProviderByJti(jti, provider)
+    │     → provider.Interaction.find(jti) 返回 null
+    │       → 抛出 oidc-provider 内置 SessionNotFound 错误
+    │   来源：interaction.ts:150-156
+    │
+    ├─ 分支 4c：session 中没有 connectorSession 或格式错误
+    │   assertThat(singleSignOnSessionResult.success, 'session.connector_validation_session_not_found')
+    │   → 抛出 RequestError({ code: 'session.connector_validation_session_not_found', status: 404 })
+    │   来源：saml-assertion-handler.ts:95
+    │
+    ├─ 分支 4d：session 中的 connectorId 与路径参数不匹配
+    │   assertThat(connectorId === sessionConnectorId, ...)
+    │   → 抛出 RequestError({ code: 'session.connector_validation_session_not_found', status: 404 })
+    │   来源：authn.ts:290-296
+    │
+    ├─ 分支 4e：SAML 断言解析失败
+    │   parseSamlAssertionContent(body)
+    │   → handleSamlAssertion() 抛出 SsoConnectorError(AuthorizationFailed)
+    │   → 经过 koa-connector-error-handler 翻译为 RequestError（状态码 401）
+    │   来源：SamlConnector/utils.ts:197-201
+    │
+    └─ 分支 4f：用户信息字段缺失或格式错误
+        getUserInfoFromSamlAssertion(assertionContent)
+        → getExtendedUserInfoFromRawUserProfile() 抛出 SsoConnectorError(AuthorizationFailed)
+        → 经过 koa-connector-error-handler 翻译为 RequestError（状态码 401）
+        来源：SamlConnector/utils.ts:154-159
 ```
 
 **路径 F 关键点**：
-- ✅ **路由处理器中没有 try-catch**，所有连接器错误直接冒泡
-- ✅ `parseSamlAssertionContent()` 和 `getUserInfoFromSamlAssertion()` 抛出的 `SsoConnectorError` 会被中间件层捕获
-- ✅ 状态码由 `koa-connector-error-handler` 精细映射
-- ⚠️  只有 `getSsoConnectorById()` 可能抛出 `RequestError(404)`，这是业务逻辑错误而非连接器错误
+- ✅ **连接器错误（分支 3b、4e、4f）**：经过 `koa-connector-error-handler` 翻译层，状态码精细映射
+- ❌ **业务错误（分支 1、3a、4a、4b、4c、4d）**：直接抛出 `RequestError`，不经过连接器翻译层
+- ⚠️  分支 4b 抛出的是 oidc-provider 内置错误，会被 `koa-error-handler` 捕获并返回 500
 
 ---
 
@@ -389,18 +416,16 @@ koa-error-handler.ts
 | **进入点文件** | `authn.ts:107` | `authn.ts:177` |
 | **连接器获取方式** | `libraries.socials.getConnector()` | `libraries.ssoConnectors.getSsoConnectorById()` |
 | **调用方法** | `connector.validateSamlAssertion()` | `connectorInstance.parseSamlAssertionContent()` + `getUserInfoFromSamlAssertion()` |
-| **是否经过连接器翻译层** | ✅ 是 | ✅ 是 |
-| **状态码映射** | 精细映射 | 精细映射 |
+| **是否经过连接器翻译层** | ✅ 是 | ✅ 是（仅连接器错误） |
+| **状态码映射** | 精细映射 | 精细映射（连接器错误）+ 多个 404 分支（业务错误） |
 | **路由内 try-catch** | 无 | 无 |
 | **连接器错误传播路径** | 直接冒泡至中间件 | 直接冒泡至中间件 |
-
-**✅ 结论修正**：上一轮结论中关于企业 SSO SAML ACS 回调路径的描述是正确的，两条 SAML ACS 路径都经过连接器翻译层，状态码都能精细映射。
 
 ---
 
 ## 状态码映射对比表
 
-| 错误码 | 中间件层映射（路径 A/B/C/F） | 业务层硬编码（路径 D/E） | 差异 |
+| 错误码 | 中间件层映射（路径 A/B/C/F 连接器错误） | 业务层硬编码（路径 D/E） | 差异 |
 |--------|-----------------------------|-------------------------|------|
 | `InvalidMetadata` | 400 | 500 | ⚠️  配置错误被误报为服务器内部错误 |
 | `InvalidConfig` | 400 | 500 | ⚠️  配置错误被误报为服务器内部错误 |
@@ -416,9 +441,22 @@ koa-error-handler.ts
 
 ---
 
+## 企业 SSO SAML ACS 回调 404 分支汇总表
+
+| 分支 | 触发条件 | 错误码 | 来源文件 | 经过连接器翻译层 |
+|------|---------|--------|---------|----------------|
+| 1 | 连接器不存在或不支持 | `connector.not_found` | `libraries/sso-connector.ts:67` | ❌ |
+| 3a | IdP 发起 SSO 未配置 | `session.connector_validation_session_not_found` | `authn.ts:217` | ❌ |
+| 4a | RelayState(jti) 为空（非 dev 模式） | `session.connector_validation_session_not_found` | `authn.ts:280` | ❌ |
+| 4b | jti 对应的 interaction session 不存在 | oidc-provider 内置 `SessionNotFound` | `interaction.ts:156` | ❌（返回 500） |
+| 4c | session 中没有 connectorSession | `session.connector_validation_session_not_found` | `saml-assertion-handler.ts:95` | ❌ |
+| 4d | session 中的 connectorId 不匹配 | `session.connector_validation_session_not_found` | `authn.ts:292` | ❌ |
+
+---
+
 ## 对用户可见信息的影响
 
-### 经过中间件层的路径（A/B/C/F）：
+### 经过中间件层的路径（A/B/C + F 连接器错误）：
 - ✅ 状态码准确反映错误类型（400=配置错误，401=授权失败等）
 - ✅ 前端可以根据状态码和错误码做差异化处理
 - ✅ 用户能看到准确的错误类型（如"授权失败"而非"服务器内部错误"）
@@ -428,6 +466,10 @@ koa-error-handler.ts
 - ❌ 用户看到"服务器内部错误"，无法知道是配置问题还是授权失败
 - ❌ 前端无法根据错误类型提供合适的用户引导
 
+### 企业 SSO SAML ACS 业务错误（F 分支 1/3a/4a/4c/4d）：
+- ⚠️  状态码为 404，错误码为 `session.connector_validation_session_not_found` 或 `connector.not_found`
+- 用户看到"会话不存在"或"连接器不存在"等提示
+
 ---
 
 ## 职责边界总结表
@@ -435,7 +477,7 @@ koa-error-handler.ts
 | 层级 | 模块 | 翻译错误 | 决定状态码 | 决定用户可见信息 | 包含调试数据 |
 |------|------|----------|------------|-----------------|-------------|
 | 1. 连接器实现层 | SamlConnector / OidcConnector | ❌ 抛出原始错误 | ❌ | ❌ | ✅ 完整调试信息 |
-| 2. 连接器错误翻译层 | koa-connector-error-handler | ✅ ConnectorError → RequestError（社交连接器 + 所有 SAML ACS 路径） | ✅ 精细映射（仅经过的路径） | ❌ | ✅ 透传 |
+| 2. 连接器错误翻译层 | koa-connector-error-handler | ✅ ConnectorError → RequestError（社交连接器 + 所有 SAML ACS 路径的连接器错误） | ✅ 精细映射（仅经过的路径） | ❌ | ✅ 透传 |
 | 3. 业务逻辑层 | single-sign-on.ts（SSO 握手/回调） | ⚠️  仅 SSO 握手/回调直接转换 | ⚠️  SSO 硬编码 500 | ❌ | ✅ 透传 |
 | 4. 通用错误处理层 | koa-error-handler | ✅ i18n 翻译 | ✅ 最终状态码 | ✅ 决定暴露内容 | ⚠️  可能暴露 data |
 | 5. 前端体验层 | experience/apis | ❌ | ❌ | ✅ UI 展示逻辑 | ❌ |
@@ -444,9 +486,9 @@ koa-error-handler.ts
 
 ## 关键发现
 
-### 1. 错误处理存在**三条**实际路径
+### 1. 错误处理存在三条实际路径
 
-**路径 1（社交连接器 + 所有 SAML ACS 回调）**：
+**路径 1（社交连接器 + 所有 SAML ACS 路径的连接器错误）**：
 ```
 连接器抛出 ConnectorError → koa-connector-error-handler → koa-error-handler
 ```
@@ -458,7 +500,7 @@ koa-error-handler.ts
 ```
 ❌ 状态码硬编码 500
 
-**路径 3（其他非连接器错误）**：
+**路径 3（所有其他非连接器错误）**：
 ```
 抛出 RequestError / 其他错误 → koa-error-handler
 ```
