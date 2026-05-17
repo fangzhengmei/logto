@@ -504,7 +504,160 @@ saml_application_ │              │
 
 **衔接说明**：IdP发起场景通过数据库临时存储 + Cookie的方式，将无状态的SAML断言转换为有状态的OIDC会话，实现两种协议的桥接。
 
-## 9. 关键技术要点总结
+## 9. 责任边界与会话消费语义说明
+
+### 9.1 `state` 参数的责任边界
+
+**核心结论**：`state` 参数由前端（Logto Experience 客户端）生成、存储并校验，后端（Core 服务）不参与 `state` 的校验。
+
+#### 9.1.1 `state` 的生成与存储
+
+| 角色 | 操作 | 代码位置 | 说明 |
+|------|------|----------|------|
+| 前端 Experience | 生成 `state` | `packages/experience/src/hooks/use-single-sign-on.ts:50` | `const state = generateState();` |
+| 前端 Experience | 存储 `state` | `packages/experience/src/hooks/use-single-sign-on.ts:51` | `storeState(state, connectorId);` 存储在 `sessionStorage`，key 为 `social_auth_state:${connectorId}` |
+| 前端 Experience | 传递 `state` 到后端 | `packages/experience/src/hooks/use-single-sign-on.ts:53-56` | 在调用 `getSsoAuthorizationUrl` API 时传递 `state` 参数 |
+| 后端 Core | 接收并存储 `state` | `packages/core/src/routes/interaction/utils/single-sign-on-session.ts:52-62` | `assignSingleSignOnSessionResult` 将 `state` 存入 OIDC Provider 会话的 `connectorSession` 中 |
+
+**存储结构**：
+```typescript
+// OIDC Provider interaction.result
+{
+  connectorSession: {
+    state: string,           // 前端生成的随机字符串
+    redirectUri: string,     // 回调URI
+    connectorId: string,     // SSO连接器ID
+    nonce?: string,          // OIDC nonce（仅OIDC协议）
+    userInfo?: ...           // SAML断言解析结果（仅SAML协议）
+  }
+}
+```
+
+#### 9.1.2 `state` 的校验时机与位置
+
+| 角色 | 操作 | 代码位置 | 说明 |
+|------|------|----------|------|
+| 后端 Core | 透传 `state` | `packages/core/src/sso/OidcConnector/index.ts:113` | 生成授权URL时将 `state` 作为参数传递给IdP |
+| 前端 Experience | 读取回调URL中的 `state` | `packages/experience/src/hooks/use-redirect-callback-validation.ts` | 从URL参数中提取 `state` |
+| 前端 Experience | 校验 `state` | `packages/experience/src/utils/social-connectors.ts:43-53` | `validateState` 函数：<br>1. 从 `sessionStorage` 读取存储的 `state`<br>2. 与URL中的 `state` 比较<br>3. 删除 `sessionStorage` 中的 `state`<br>4. 返回 `'match'` / `'missing'` / `'mismatch'` |
+
+**后端明确不校验 `state`**（代码注释）：
+- `packages/core/src/routes/authn.ts:249`: "Client side will generate and verify the state to prevent CSRF attack."
+- `packages/core/src/routes/authn.ts:307`: "Client side will verify the state to prevent CSRF attack."
+
+#### 9.1.3 设计意图
+
+这种前后端分离的 `state` 校验设计有以下考虑：
+1. **CSRF防护**：`state` 的主要目的是防止跨站请求伪造，前端存储和校验可以确保请求确实来自用户的浏览器会话
+2. **会话恢复**：前端通过 `sessionStorage` 存储 `state`，即使后端会话丢失，前端仍能检测到异常
+3. **错误边界**：将 `state` 校验放在前端可以更早地发现问题，避免不必要的后端调用
+4. **协议一致性**：OAuth 2.0 规范中 `state` 的校验责任通常由客户端承担
+
+### 9.2 `connectorSession` 的一次性消费语义
+
+**核心结论**：`connectorSession` 采用"读取即删除"的一次性消费模式，确保同一断言结果只能被使用一次。
+
+#### 9.2.1 消费实现细节
+
+**消费代码位置**：`packages/core/src/routes/interaction/utils/single-sign-on-session.ts:19-43`
+
+```typescript
+export const getSingleSignOnSessionResult = async (
+  ctx: Context,
+  provider: Provider
+): Promise<SingleSignOnConnectorSession> => {
+  const { result } = await provider.interactionDetails(ctx.req, ctx.res);
+
+  // 1. 读取并验证 connectorSession 存在
+  const singleSignOnSessionResult = z
+    .object({
+      connectorSession: singleSignOnConnectorSessionGuard,
+    })
+    .safeParse(result);
+
+  assertThat(
+    result && singleSignOnSessionResult.success,
+    'session.connector_validation_session_not_found'
+  );
+
+  // 2. 一次性消费：读取后立即删除 connectorSession
+  const { connectorSession, ...rest } = result;
+  await provider.interactionResult(ctx.req, ctx.res, {
+    ...rest,
+  });
+
+  // 3. 返回读取到的 connectorSession
+  return singleSignOnSessionResult.data.connectorSession;
+};
+```
+
+#### 9.2.2 消费时机与调用链路
+
+`getSingleSignOnSessionResult` 在以下场景被调用：
+
+| 调用场景 | 调用位置 | 消费时机 |
+|----------|----------|----------|
+| 验证SSO身份 | `packages/core/src/routes/interaction/utils/single-sign-on.ts:166` | `verifySsoIdentity` 函数开头 |
+| （旧版交互）获取SSO认证结果 | `packages/core/src/routes/interaction/utils/single-sign-on.ts:83-106` | `getSingleSignOnAuthenticationResult` 函数 |
+
+**典型调用时序**：
+```
+T1: assignSingleSignOnSessionResult → 写入 connectorSession
+    ↓
+T2: 用户在IdP完成认证，IdP回调Logto
+    ↓
+T3: 解析断言，写入 connectorSession.userInfo
+    ↓
+T4: 前端调用 verifySsoIdentity API
+    ↓
+T5: getSingleSignOnSessionResult → 读取并立即删除 connectorSession
+    ↓
+T6: connectorSession 已不存在，无法再次读取
+```
+
+#### 9.2.3 对会话衔接的影响
+
+一次性消费设计对后续会话衔接产生以下影响：
+
+**正面影响**：
+1. **防止重放攻击**：同一断言结果只能被使用一次，即使攻击者截获了回调请求，也无法重复使用
+2. **状态机清晰**：`connectorSession` 从"存在"到"不存在"的状态转换明确，便于调试和问题排查
+3. **内存/存储优化**：及时清理不再需要的会话数据，避免会话存储膨胀
+
+**负面影响与限制**：
+1. **重试失效**：如果 `verifySsoIdentity` 调用失败（如网络中断），用户刷新页面后将无法重试，因为 `connectorSession` 已被删除
+2. **调试困难**：问题发生时，`connectorSession` 已被清理，难以复现和定位问题
+3. **并发风险**：如果同一 `jti` 被并发调用，只有第一个请求能成功，后续请求将失败
+
+#### 9.2.4 风险判断与边界条件
+
+**会话丢失场景**：
+- **场景1**：用户在IdP认证后，浏览器长时间停留在回调页面，OIDC会话过期
+- **场景2**：用户多标签页操作，一个标签页消费了 `connectorSession`，另一个标签页继续操作
+- **场景3**：网络波动导致前端未收到 `verifySsoIdentity` 响应，重试时失败
+
+**错误处理**：
+- 当 `getSingleSignOnSessionResult` 无法找到 `connectorSession` 时，抛出错误：`session.connector_validation_session_not_found`
+- 前端收到该错误后，应引导用户重新开始SSO流程
+
+**与 `jti` 的关系**：
+- `jti` 是 OIDC interaction 的会话标识，生命周期长于 `connectorSession`
+- `connectorSession` 被删除后，`jti` 对应的 interaction 仍然存在，只是其中的 `connectorSession` 字段被清空
+- 后续操作（如用户注册、绑定）仍可通过 `jti` 继续进行，只是无法再获取SSO断言结果
+
+### 9.3 关键标识的责任边界总结
+
+| 标识 | 生成方 | 存储方 | 校验方 | 消费特性 | 生命周期 |
+|------|--------|--------|--------|----------|----------|
+| `connectorId` | 后端 Core（注册时） | 数据库 `sso_connectors` | 后端 Core（URL路径与会话一致性校验） | 持久存在 | 连接器生命周期 |
+| `jti` | OIDC Provider | OIDC 会话存储 | OIDC Provider | 多步骤流程共享 | 完整交互流程 |
+| `RelayState` | 后端 Core（生成授权URL时） | 作为SAML请求参数传递，不单独存储 | 后端 Core（回调时解析为 `jti`） | 透传 | IdP往返期间 |
+| `state` | 前端 Experience | 前端 `sessionStorage` + 后端 `connectorSession` | 前端 Experience | 一次性校验，校验后删除 | 前端会话期间 |
+| `connectorSession` | 后端 Core | OIDC 会话存储 | 后端 Core（schema校验） | 读取即删除，一次性消费 | 断言验证前 |
+
+---
+
+## 10. 关键技术要点总结
 
 ### 9.1 配置存储分层
 1. **连接器配置**：`sso_connectors.config`（jsonb，schema验证）
