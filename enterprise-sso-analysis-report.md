@@ -553,13 +553,48 @@ saml_application_ │              │
 3. **错误边界**：将 `state` 校验放在前端可以更早地发现问题，避免不必要的后端调用
 4. **协议一致性**：OAuth 2.0 规范中 `state` 的校验责任通常由客户端承担
 
-### 9.2 `connectorSession` 的一次性消费语义
+### 9.2 `connectorSession` 的写入与消费路径
 
-**核心结论**：`connectorSession` 采用"读取即删除"的一次性消费模式，确保同一断言结果只能被使用一次。
+`connectorSession` 的生命周期分为两个核心分支：**旧版交互分支**（Legacy Interaction）和 **IdP 发起分支**（IdP-Initiated SSO）。两个分支共享同一套读写函数，但触发时机和使用场景完全不同。
 
-#### 9.2.1 消费实现细节
+#### 9.2.1 写入路径：`assignSingleSignOnSessionResult`
 
-**消费代码位置**：`packages/core/src/routes/interaction/utils/single-sign-on-session.ts:19-43`
+**函数定义**：`packages/core/src/routes/interaction/utils/single-sign-on-session.ts:52-62`
+
+```typescript
+export const assignSingleSignOnSessionResult = async (
+  ctx: Context,
+  provider: Provider,
+  connectorSession: SingleSignOnConnectorSession
+) => {
+  const details = await provider.interactionDetails(ctx.req, ctx.res);
+  await provider.interactionResult(ctx.req, ctx.res, {
+    ...details.result,
+    connectorSession,
+  });
+};
+```
+
+**写入触发点（共3处）**：
+
+| 触发场景 | 代码位置 | 调用时机 | 写入内容 |
+|----------|----------|----------|----------|
+| **场景1：旧版交互-SP发起** | `packages/core/src/routes/interaction/utils/single-sign-on.ts:122` | `getSsoAuthorizationUrl` 调用 `connectorInstance.getAuthorizationUrl` 时，作为回调函数传入 | `{ state, redirectUri, connectorId, nonce? }` |
+| **场景2：旧版交互-IdP发起** | `packages/core/src/routes/interaction/utils/single-sign-on.ts:105` | `getSsoAuthorizationUrl` 检测到 `idpInitiatedSamlSsoSession` Cookie 且会话有效时 | `{ redirectUri, state, connectorId, userInfo }`（直接包含断言结果） |
+| **场景3：新版验证记录** | `packages/core/src/routes/experience/classes/verifications/enterprise-sso-verification.ts:112` | `EnterpriseSsoVerification.createAuthorizationUrl` 调用旧版 `getSsoAuthorizationUrl` 时，间接触发场景1或场景2 | 同场景1或场景2 |
+
+**代码注释说明**（`enterprise-sso-verification.ts:97-104`）：
+> "For compatibility reasons, we keep using the old `getSsoAuthorizationUrl` method here as a single source of truth. Especially for the SAML connectors, SAML ACS endpoint will find the connector session result by the jti and assign it to the interaction storage."
+
+---
+
+#### 9.2.2 消费路径：两个读取函数的差异
+
+系统提供两个读取 `connectorSession` 的函数，**只有一个执行一次性消费**：
+
+##### 函数A：`getSingleSignOnSessionResult`（带一次性消费）
+
+**定义**：`packages/core/src/routes/interaction/utils/single-sign-on-session.ts:19-43`
 
 ```typescript
 export const getSingleSignOnSessionResult = async (
@@ -568,82 +603,136 @@ export const getSingleSignOnSessionResult = async (
 ): Promise<SingleSignOnConnectorSession> => {
   const { result } = await provider.interactionDetails(ctx.req, ctx.res);
 
-  // 1. 读取并验证 connectorSession 存在
+  // 1. 读取并验证
   const singleSignOnSessionResult = z
-    .object({
-      connectorSession: singleSignOnConnectorSessionGuard,
-    })
+    .object({ connectorSession: singleSignOnConnectorSessionGuard })
     .safeParse(result);
 
-  assertThat(
-    result && singleSignOnSessionResult.success,
-    'session.connector_validation_session_not_found'
-  );
+  assertThat(result && singleSignOnSessionResult.success, 
+    'session.connector_validation_session_not_found');
 
-  // 2. 一次性消费：读取后立即删除 connectorSession
+  // 2. 一次性消费：读取后立即删除
   const { connectorSession, ...rest } = result;
-  await provider.interactionResult(ctx.req, ctx.res, {
-    ...rest,
-  });
+  await provider.interactionResult(ctx.req, ctx.res, { ...rest });
 
-  // 3. 返回读取到的 connectorSession
+  // 3. 返回
   return singleSignOnSessionResult.data.connectorSession;
 };
 ```
 
-#### 9.2.2 消费时机与调用链路
+**调用触发点（共2处，均属于旧版交互分支）**：
 
-`getSingleSignOnSessionResult` 在以下场景被调用：
+| 调用场景 | 代码位置 | 调用时机 | 分支归属 |
+|----------|----------|----------|----------|
+| **触发点1：验证SSO身份** | `packages/core/src/routes/interaction/utils/single-sign-on.ts:166` | `verifySsoIdentity` 函数开头第一行 | 旧版交互分支（SP发起 + IdP发起共用） |
+| **触发点2：旧版注册接口** | `packages/core/src/routes/interaction/utils/single-sign-on-session.ts:83-106` | `getSingleSignOnAuthenticationResult` 函数（被 `POST /interaction/single-sign-on/:connectorId/registration` 调用） | 旧版交互分支（仅注册流程） |
 
-| 调用场景 | 调用位置 | 消费时机 |
-|----------|----------|----------|
-| 验证SSO身份 | `packages/core/src/routes/interaction/utils/single-sign-on.ts:166` | `verifySsoIdentity` 函数开头 |
-| （旧版交互）获取SSO认证结果 | `packages/core/src/routes/interaction/utils/single-sign-on.ts:83-106` | `getSingleSignOnAuthenticationResult` 函数 |
+**路由入口**：
+- 触发点1 → `POST /interaction/single-sign-on/:connectorId/authentication`（`packages/core/src/routes/interaction/single-sign-on.ts:75-118`）
+- 触发点2 → `POST /interaction/single-sign-on/:connectorId/registration`（`packages/core/src/routes/interaction/single-sign-on.ts:122-168`）
 
-**典型调用时序**：
+---
+
+##### 函数B：`getSingleSignOnSessionResultByJti`（**不执行**一次性消费）
+
+**定义**：`packages/core/src/utils/saml-assertion-handler.ts:83-98`
+
+```typescript
+export const getSingleSignOnSessionResultByJti = async (
+  jti: string,
+  provider: Provider
+): Promise<SingleSignOnConnectorSession> => {
+  // 直接通过 jti 查询，不依赖 ctx（SAML ACS endpoint 可能无 ctx）
+  const { result } = await getInteractionFromProviderByJti(jti, provider);
+
+  const singleSignOnSessionResult = z
+    .object({ connectorSession: singleSignOnConnectorSessionGuard })
+    .safeParse(result);
+
+  assertThat(singleSignOnSessionResult.success, 
+    'session.connector_validation_session_not_found');
+
+  // 注意：此处只读取，不删除！
+  return singleSignOnSessionResult.data.connectorSession;
+};
 ```
-T1: assignSingleSignOnSessionResult → 写入 connectorSession
+
+**调用触发点（仅1处，SAML断言解析分支）**：
+
+| 调用场景 | 代码位置 | 调用时机 | 分支归属 |
+|----------|----------|----------|----------|
+| **SAML ACS端点解析断言** | `packages/core/src/routes/authn.ts:287` | `POST /authn/single-sign-on/saml/:connectorId` 端点接收IdP返回的SAML Response时 | SAML断言解析分支（SP发起场景的中间步骤） |
+
+**关键差异**：
+- 该函数仅读取 `connectorSession` 用于获取 `redirectUri`、`state`、`connectorId` 等元数据
+- 读取后**不删除**，因为后续还需要向其中写入 `userInfo`
+- 写入操作通过 `assignSamlAssertionResultViaJti`（`saml-assertion-handler.ts:105-120`）完成，采用整体覆写策略
+
+---
+
+#### 9.2.3 完整时序链路（SP发起场景）
+
+```
+T0: 前端点击SSO登录
     ↓
-T2: 用户在IdP完成认证，IdP回调Logto
+T1: POST /experience/verifications/enterprise-sso/:verificationId/authorization-url
+    ↓ 调用 EnterpriseSsoVerification.createAuthorizationUrl
+    ↓   ↳ 间接调用 getSsoAuthorizationUrl（旧版兼容）
+    ↓       ↳ connectorInstance.getAuthorizationUrl(..., assignSingleSignOnSessionResult)
+    ↓           ↳ 写入 connectorSession = { state, redirectUri, connectorId, nonce }
     ↓
-T3: 解析断言，写入 connectorSession.userInfo
+T2: 重定向到IdP登录页
     ↓
-T4: 前端调用 verifySsoIdentity API
+T3: 用户在IdP完成认证，IdP POST SAML Response到
+    POST /authn/single-sign-on/saml/:connectorId
+    ↓ 从 RelayState 提取 jti
+    ↓ 调用 getSingleSignOnSessionResultByJti(jti, provider)
+    ↓   ↳ 读取 connectorSession（不删除）
+    ↓ 解析SAML断言 → userInfo
+    ↓ 调用 assignSamlAssertionResultViaJti(jti, provider, { ...session, userInfo })
+    ↓   ↳ 覆写 connectorSession（现在包含 userInfo）
+    ↓ 重定向到前端回调URL（携带 state 参数）
     ↓
-T5: getSingleSignOnSessionResult → 读取并立即删除 connectorSession
+T4: 前端回调页面校验 state 后调用
+    POST /experience/verifications/enterprise-sso/:verificationId/submit
+    ↓ 调用 EnterpriseSsoVerification.verify
+    ↓   ↳ 调用 verifySsoIdentity（旧版兼容）
+    ↓       ↳ 调用 getSingleSignOnSessionResult(ctx, provider)
+    ↓           ↳ 读取 connectorSession 并立即删除（一次性消费）
+    ↓       ↳ 使用 connectorSession.userInfo 完成身份验证
     ↓
-T6: connectorSession 已不存在，无法再次读取
+T5: connectorSession 已被删除，无法再次读取
 ```
 
-#### 9.2.3 对会话衔接的影响
+#### 9.2.4 会话消费语义与风险判断
 
-一次性消费设计对后续会话衔接产生以下影响：
+**核心语义**：`connectorSession` 的一次性消费**仅发生在身份验证环节**（T4），断言解析环节（T3）只读取不删除。
 
-**正面影响**：
-1. **防止重放攻击**：同一断言结果只能被使用一次，即使攻击者截获了回调请求，也无法重复使用
-2. **状态机清晰**：`connectorSession` 从"存在"到"不存在"的状态转换明确，便于调试和问题排查
-3. **内存/存储优化**：及时清理不再需要的会话数据，避免会话存储膨胀
+**设计意图（基于代码实现推断）**：
+1. **断言解析环节不删除**：SAML ACS端点可能需要多次重试（如签名验证失败），保留会话便于重试
+2. **身份验证环节必删除**：防止同一断言结果被多次用于登录，避免重放攻击
+3. **通过jti间接访问**：SAML ACS端点无HTTP上下文（`ctx`），只能通过`jti`直接查询，不适合执行删除操作
 
-**负面影响与限制**：
-1. **重试失效**：如果 `verifySsoIdentity` 调用失败（如网络中断），用户刷新页面后将无法重试，因为 `connectorSession` 已被删除
-2. **调试困难**：问题发生时，`connectorSession` 已被清理，难以复现和定位问题
-3. **并发风险**：如果同一 `jti` 被并发调用，只有第一个请求能成功，后续请求将失败
+**风险场景与边界**：
 
-#### 9.2.4 风险判断与边界条件
+| 风险场景 | 触发条件 | 代码位置 | 结果 |
+|----------|----------|----------|------|
+| **重放攻击防护** | 攻击者截获SAML Response后重放 | `authn.ts:287` → `single-sign-on-session.ts:37-40` | 首次消费后`connectorSession`被删除，重放请求在T4阶段失败 |
+| **重试失效** | T4阶段`verifySsoIdentity`调用失败（如DB超时），前端重试 | `single-sign-on-session.ts:31-34` | 第二次调用时`connectorSession`已被删除，抛出`session.connector_validation_session_not_found` |
+| **并发调用冲突** | 同一`jti`的T4阶段被并发调用 | `single-sign-on-session.ts:37-40` | 只有第一个请求成功，后续请求失败 |
+| **会话过期** | T3与T4间隔超过OIDC会话有效期 | `getInteractionFromProviderByJti` → `interaction.ts:156` | 抛出`SessionNotFound`错误，无法恢复 |
+| **多标签页冲突** | 用户在多个标签页同时完成同一SSO流程 | `single-sign-on-session.ts:37-40` | 第一个完成的标签页消费会话，其他标签页失败 |
 
-**会话丢失场景**：
-- **场景1**：用户在IdP认证后，浏览器长时间停留在回调页面，OIDC会话过期
-- **场景2**：用户多标签页操作，一个标签页消费了 `connectorSession`，另一个标签页继续操作
-- **场景3**：网络波动导致前端未收到 `verifySsoIdentity` 响应，重试时失败
+**错误码与恢复路径**：
+- 错误码：`session.connector_validation_session_not_found`（`single-sign-on-session.ts:33`）
+- 前端处理：引导用户重新发起SSO流程（清空本地状态，重新调用授权URL接口）
+- 后端无恢复机制：`connectorSession`一旦删除，无法从任何地方恢复
 
-**错误处理**：
-- 当 `getSingleSignOnSessionResult` 无法找到 `connectorSession` 时，抛出错误：`session.connector_validation_session_not_found`
-- 前端收到该错误后，应引导用户重新开始SSO流程
-
-**与 `jti` 的关系**：
-- `jti` 是 OIDC interaction 的会话标识，生命周期长于 `connectorSession`
-- `connectorSession` 被删除后，`jti` 对应的 interaction 仍然存在，只是其中的 `connectorSession` 字段被清空
-- 后续操作（如用户注册、绑定）仍可通过 `jti` 继续进行，只是无法再获取SSO断言结果
+**与`jti`的生命周期关系**：
+- `jti`（OIDC interaction ID）生命周期 ≈ 5分钟（默认配置）
+- `connectorSession` 生命周期 ≈ T1写入 → T4消费（通常几秒到几分钟）
+- `connectorSession` 删除后，`jti` 仍然有效，可继续用于后续交互步骤（如MFA、注册补充信息等）
+- 但后续步骤无法再获取 SSO 断言结果（`userInfo`、`issuer` 等已被清除）
 
 ### 9.3 关键标识的责任边界总结
 
@@ -659,29 +748,29 @@ T6: connectorSession 已不存在，无法再次读取
 
 ## 10. 关键技术要点总结
 
-### 9.1 配置存储分层
+### 10.1 配置存储分层
 1. **连接器配置**：`sso_connectors.config`（jsonb，schema验证）
 2. **应用配置**：`saml_application_configs`（结构化表）
 3. **密钥材料**：分层存储（OIDC在logto_config，SAML在专用表，联邦令牌加密存储）
 4. **会话状态**：OIDC Provider会话 + 数据库持久化
 
-### 9.2 安全设计
+### 10.2 安全设计
 1. **联邦令牌加密**：双层AES-256-GCM加密，DEK/KEK分离
 2. **密钥轮换**：OIDC支持Current/Next/Previous三状态，SAML支持多密钥历史
 3. **签名验证**：SAML使用x509证书，OIDC使用JWKS
 4. **会话安全**：HttpOnly Cookie，jti会话标识，state/nonce防CSRF
 
-### 9.3 扩展性设计
+### 10.3 扩展性设计
 1. **连接器工厂模式**：`ssoConnectorFactories`注册表，支持动态添加新提供商
 2. **属性映射**：可配置的SAML/OIDC属性到Logto用户属性映射
 3. **令牌存储**：可选的联邦令牌持久化，支持令牌刷新
 
-### 9.4 流程完整性
+### 10.4 流程完整性
 1. **SP发起**：完整的OAuth2/OIDC授权码流程 + SAML Web SSO Profile
 2. **IdP发起**：支持SAML IdP-Initiated SSO，通过会话cookie衔接
 3. **用户关联**：支持自动关联（邮箱匹配）、手动关联、新用户注册
 
-## 10. 结论
+## 11. 结论
 
 Logto的企业级SSO实现采用了分层架构设计，在配置存储、密钥管理和会话衔接方面表现出以下特点：
 
