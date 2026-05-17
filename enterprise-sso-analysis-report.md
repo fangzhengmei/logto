@@ -319,31 +319,216 @@ type SingleSignOnConnectorSession = {
 3. 用户登录后，根据会话记录生成SAML响应
 4. 发送响应到SP的ACS URL
 
-## 8. 关键技术要点总结
+## 8. 端到端时序链路
 
-### 8.1 配置存储分层
+本章节按时间顺序串联SSO的完整流程，覆盖注册写入、登录读取、断言生成、断言验证四个阶段，明确每一步的存储操作、关键标识流转及衔接关系。
+
+### 8.1 时序总览
+
+```
+T0 注册阶段    T1 登录发起    T2 断言生成    T3 断言验证    T4 登录完成
+    ↓             ↓             ↓             ↓             ↓
+  创建SSO     用户选择     IdP生成     Logto验证     发放OIDC
+  连接器      SSO登录      SAML断言     SAML断言      令牌
+    ↓             ↓             ↓             ↓             ↓
+  写入配置     生成jti     签名断言     解析用户信息   关联用户
+             存储会话     携带RelayState  写入会话      完成登录
+```
+
+### 8.2 详细时序步骤（SAML SP发起场景）
+
+**步骤 T0：注册写入（管理员操作）**
+
+| 时序 | 操作 | 存储对象 | 读写 | 关键字段/标识 | 输出传递 |
+|------|------|-----------|------|---------------|----------|
+| T0.1 | 管理员创建SSO连接器 | `sso_connectors` | 写 | `id`=`connectorId`, `provider_name`, `config`（含IdP元数据）, `domains`, `sync_profile`, `enable_token_storage` | 生成`connectorId` |
+| T0.2 | （可选）配置IdP发起SSO | `sso_connector_idp_initiated_auth_configs` | 写 | `connector_id`=`connectorId`, `default_application_id`, `auto_send_authorization_request` | 关联`connectorId` |
+| T0.3 | （SAML应用场景）创建SAML应用 | `applications` | 写 | `id`=`applicationId`, `type='SAML'` | 生成`applicationId` |
+| T0.4 | 写入SAML应用配置 | `saml_application_configs` | 写 | `application_id`=`applicationId`, `attribute_mapping`, `entity_id`, `acs_url`, `encryption`, `name_id_format` | 关联`applicationId` |
+| T0.5 | 生成SAML签名密钥 | `saml_application_secrets` | 写 | `application_id`=`applicationId`, `private_key`, `certificate`, `active=true` | 关联`applicationId` |
+
+**衔接说明**：T0阶段生成的`connectorId`将贯穿整个SSO流程，作为连接器的唯一标识。
+
+---
+
+**步骤 T1：登录读取（用户发起认证）**
+
+| 时序 | 操作 | 存储对象 | 读写 | 关键字段/标识 | 输出传递 |
+|------|------|-----------|------|---------------|----------|
+| T1.1 | 用户访问业务应用 | - | - | - | 应用发起OIDC认证请求 |
+| T1.2 | 重定向到Logto授权端点 | OIDC Provider会话 | 写 | 创建interaction，生成`jti` | `jti`（会话标识） |
+| T1.3 | 显示SSO登录选项 | `sso_connectors` | 读 | 过滤`domains`匹配的连接器，读取`connector_name`, `branding` | 展示可用SSO选项 |
+| T1.4 | 用户选择企业SSO登录 | - | - | 用户选择`connectorId` | `connectorId`（用户选择） |
+| T1.5 | 调用`getSsoAuthorizationUrl` | `sso_connectors` | 读 | 用`connectorId`读取`config`, `provider_name` | 获取连接器配置 |
+| T1.6 | 创建连接器实例 | 内存 | - | `connectorId`, `config` | 实例化SAML/OIDC连接器 |
+| T1.7 | 存储连接器会话 | OIDC Provider会话（`interaction.result.connectorSession`） | 写 | `jti` → `{ state, redirectUri, connectorId, nonce? }` | `jti`关联会话数据 |
+| T1.8 | 生成SAML AuthnRequest | 内存 | - | 设置`RelayState=jti` | `RelayState`承载`jti` |
+| T1.9 | 重定向到IdP登录页 | HTTP 302 | - | URL携带`RelayState=jti` | `jti`传递到IdP |
+
+**衔接说明**：
+- T1.2生成的`jti`是整个登录流程的核心会话标识
+- T1.7将`connectorId`、`state`、`redirectUri`等信息与`jti`绑定存储
+- T1.8通过`RelayState`参数将`jti`传递给IdP，确保回调时能找回会话
+
+---
+
+**步骤 T2：断言生成（IdP侧）**
+
+| 时序 | 操作 | 存储对象 | 读写 | 关键字段/标识 | 输出传递 |
+|------|------|-----------|------|---------------|----------|
+| T2.1 | IdP展示登录页面 | IdP系统 | - | - | 用户输入凭证 |
+| T2.2 | 用户在IdP认证 | IdP系统 | - | - | IdP验证用户身份 |
+| T2.3 | IdP生成SAML断言 | IdP系统 | - | 填充用户属性（nameID, attributes） | 断言包含用户信息 |
+| T2.4 | IdP签名断言 | IdP系统 | - | 使用IdP私钥签名 | 断言可被验证完整性 |
+| T2.5 | IdP返回SAML Response | HTTP POST | - | 携带`SAMLResponse`和`RelayState=jti` | `jti`原样返回 |
+
+**衔接说明**：
+- IdP不理解`RelayState`的含义，仅原样返回
+- `RelayState=jti`确保Logto能将断言与之前的会话关联
+
+---
+
+**步骤 T3：断言验证（Logto作为SP）**
+
+| 时序 | 操作 | 存储对象 | 读写 | 关键字段/标识 | 输出传递 |
+|------|------|-----------|------|---------------|----------|
+| T3.1 | 接收SAML Response | `POST /api/authn/single-sign-on/saml/:connectorId` | 读 | `SAMLResponse`, `RelayState`, `connectorId`（URL路径） | 获取断言和标识 |
+| T3.2 | 从RelayState提取jti | 内存 | 解析 | `RelayState` → `jti` | 恢复`jti` |
+| T3.3 | 读取连接器会话 | OIDC Provider会话 | 读 | `jti` → `connectorSession`（含`state`, `redirectUri`, `connectorId`） | 获取会话上下文 |
+| T3.4 | 验证connectorId一致性 | 内存 | 校验 | URL路径的`connectorId` vs 会话的`sessionConnectorId` | 防止会话劫持 |
+| T3.5 | 验证SAML签名 | 内存 | - | 使用`config.x509Certificate`（从T0.1存储的配置读取） | 验证断言完整性 |
+| T3.6 | 解析断言内容 | 内存 | 解析 | 提取`nameID`, `attributes` | 获取原始用户数据 |
+| T3.7 | 应用属性映射 | 内存 | 读 | 使用`config.attributeMapping`（从T0.1存储） | 映射为Logto用户属性 |
+| T3.8 | 写入用户信息到会话 | OIDC Provider会话 | 写 | `jti` → `connectorSession.userInfo` | 用户信息与会话绑定 |
+| T3.9 | 重定向到应用回调 | HTTP 302 | - | URL携带`state`参数 | 返回应用侧 |
+
+**衔接说明**：
+- T3.2通过`RelayState`找回T1.7存储的会话
+- T3.4确保断言是针对当前连接器的，防止跨连接器攻击
+- T3.8将解析后的用户信息写回OIDC会话，供后续步骤使用
+
+---
+
+**步骤 T4：登录完成（应用侧回调）**
+
+| 时序 | 操作 | 存储对象 | 读写 | 关键字段/标识 | 输出传递 |
+|------|------|-----------|------|---------------|----------|
+| T4.1 | 应用回调Logto | OIDC回调端点 | 读 | `code`, `state` | 携带授权码和状态 |
+| T4.2 | 读取连接器会话 | OIDC Provider会话 | 读 | `jti` → `connectorSession.userInfo`, `connectorSession.state` | 获取用户信息和state |
+| T4.3 | 验证state一致性 | 内存 | 校验 | URL的`state` vs 会话的`sessionState` | 防止CSRF攻击 |
+| T4.4 | 查询用户SSO身份关联 | `user_sso_identities` | 读 | `issuer` + `userInfo.id` → `user_id` | 查找已有用户 |
+| T4.5a | 身份已关联 | `user_sso_identities` | 读/更新 | 读取`user_id`，更新`detail` | 获得`userId` |
+| T4.5b | 身份未关联但邮箱匹配 | `users`, `user_sso_identities` | 读/写 | 用`userInfo.email`查找用户，写入新关联 | 获得`userId` |
+| T4.5c | 身份未关联 | - | - | - | 抛出错误引导注册 |
+| T4.6 | （OIDC场景）存储联邦令牌 | `secrets` | 写 | `userId`, `connectorId`, `encrypted_dek`, `iv`, `auth_tag`, `ciphertext` | 持久化令牌 |
+| T4.7 | 完成OIDC认证流程 | OIDC Provider | 写 | 生成ID Token/Access Token | 登录完成 |
+| T4.8 | 重定向回业务应用 | HTTP 302 | - | 携带授权码 | 返回应用 |
+
+**衔接说明**：
+- T4.2通过`jti`从OIDC会话中读取T3.8写入的用户信息
+- T4.4使用`issuer`（IdP实体ID）和`userInfo.id`（IdP用户ID）查询关联关系
+- T4.6可选地将联邦令牌加密存储，供后续API调用使用
+
+### 8.3 关键标识流转全链路
+
+```
+T0 注册阶段
+  生成 connectorId → 写入 sso_connectors
+    ↓（持久化）
+T1 登录阶段
+  生成 jti → 写入 OIDC 会话（interaction）
+    ↓（绑定）
+  connectorId + state + redirectUri → 关联到 jti
+    ↓（传递）
+  RelayState = jti → 发送到 IdP
+    ↓（原样返回）
+T2 断言阶段
+  IdP 生成 SAML 断言
+    ↓（携带）
+  SAML Response + RelayState=jti → 返回 Logto
+    ↓（解析）
+T3 验证阶段
+  RelayState → 提取 jti
+    ↓（查找）
+  jti → 读取 OIDC 会话中的 connectorSession
+    ↓（验证）
+  connectorId（URL路径） == connectorId（会话）
+    ↓（解析）
+  SAML 断言 → userInfo → 写回 connectorSession
+    ↓（关联）
+T4 完成阶段
+  jti → 读取 userInfo
+    ↓（查询）
+  issuer + userInfo.id → 查找 user_sso_identities → userId
+    ↓（完成）
+  userId → 发放 OIDC 令牌
+```
+
+### 8.4 存储对象访问时序
+
+```
+注册阶段 (T0)                 登录阶段 (T1-T4)
+    ↓                            ↓
+sso_connectors ────────┐        ┌→ sso_connectors (读配置)
+sso_connector_idp_     │        │
+  initiated_auth_      │        │
+  configs              │        │
+applications ────┐     │        │
+saml_application_ │     │        │
+  configs         ├─────┘        │
+saml_application_ │              │
+  secrets         │              │
+                  │              │
+                  └──────────────┼→ OIDC Provider会话
+                                 │  (jti ↔ connectorSession)
+                                 │
+                                 ├→ user_sso_identities (查关联)
+                                 │
+                                 └→ secrets (存令牌, 可选)
+```
+
+### 8.5 IdP发起场景的时序差异
+
+| 时序 | 操作 | 关键标识 | 衔接说明 |
+|------|------|-----------|----------|
+| T0 | 同SP发起场景 | `connectorId` | 需额外配置`idp_initiated_auth_configs` |
+| T1 | IdP直接发送SAML断言 | 无`RelayState`，无`jti` | 用户未经过Logto授权端点 |
+| T2 | Logto验证断言 | `connectorId`（URL路径） | 直接从URL获取`connectorId` |
+| T3 | 创建IdP发起会话 | `sessionId`（新生成） | 写入`idp_initiated_saml_sso_sessions`表 |
+| T4 | 设置会话Cookie | `idp_initiated_saml_sso_session=sessionId` | 传递到浏览器 |
+| T5 | 重定向到登录页 | `direct_sign_in=sso:connectorId` | 触发直接登录流程 |
+| T6 | 检查Cookie | `sessionId` → 读取`assertion_content` | 找回断言内容 |
+| T7 | 写入OIDC会话 | `jti` → `connectorSession.userInfo` | 转换为标准会话格式 |
+| T8 | 删除临时会话 | `sessionId` | 清理`idp_initiated_saml_sso_sessions`记录 |
+| T9 | 后续流程同SP发起 | `jti` | 走标准OIDC认证流程 |
+
+**衔接说明**：IdP发起场景通过数据库临时存储 + Cookie的方式，将无状态的SAML断言转换为有状态的OIDC会话，实现两种协议的桥接。
+
+## 9. 关键技术要点总结
+
+### 9.1 配置存储分层
 1. **连接器配置**：`sso_connectors.config`（jsonb，schema验证）
 2. **应用配置**：`saml_application_configs`（结构化表）
 3. **密钥材料**：分层存储（OIDC在logto_config，SAML在专用表，联邦令牌加密存储）
 4. **会话状态**：OIDC Provider会话 + 数据库持久化
 
-### 8.2 安全设计
+### 9.2 安全设计
 1. **联邦令牌加密**：双层AES-256-GCM加密，DEK/KEK分离
 2. **密钥轮换**：OIDC支持Current/Next/Previous三状态，SAML支持多密钥历史
 3. **签名验证**：SAML使用x509证书，OIDC使用JWKS
 4. **会话安全**：HttpOnly Cookie，jti会话标识，state/nonce防CSRF
 
-### 8.3 扩展性设计
+### 9.3 扩展性设计
 1. **连接器工厂模式**：`ssoConnectorFactories`注册表，支持动态添加新提供商
 2. **属性映射**：可配置的SAML/OIDC属性到Logto用户属性映射
 3. **令牌存储**：可选的联邦令牌持久化，支持令牌刷新
 
-### 8.4 流程完整性
+### 9.4 流程完整性
 1. **SP发起**：完整的OAuth2/OIDC授权码流程 + SAML Web SSO Profile
 2. **IdP发起**：支持SAML IdP-Initiated SSO，通过会话cookie衔接
 3. **用户关联**：支持自动关联（邮箱匹配）、手动关联、新用户注册
 
-## 9. 结论
+## 10. 结论
 
 Logto的企业级SSO实现采用了分层架构设计，在配置存储、密钥管理和会话衔接方面表现出以下特点：
 
