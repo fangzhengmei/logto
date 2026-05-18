@@ -1,271 +1,131 @@
 # 受保护应用（Protected App）会话建立路径分析
 
-## 概述
+## 重要说明
 
-受保护应用是 Logto 提供的一种**无 SDK 集成方案**，基于 Cloudflare Workers 实现反向代理层，在不修改上游应用代码的前提下提供身份认证保护。
+本文档严格区分**代码可证据部分**与**架构推断部分**：
+
+- ✅ **可证据**：仓库内存在对应代码，可直接阅读验证
+- ❓ **推断**：仓库内无对应实现，基于配置结构、API 设计和架构文档推断
+
+---
+
+## 一、整体架构与边界
 
 ```
-用户浏览器 → Cloudflare Worker（反向代理） → Logto OIDC 服务
-                                      ↓
-                              上游应用（Origin）
+┌─────────────────────────────────────────────────────────────┐
+│                     控制面（Control Plane）                  │
+│  ✅ 仓库内有完整实现                                          │
+│  - 应用配置管理                                              │
+│  - 域名生命周期管理                                          │
+│  - 配置下发到 Cloudflare KV                                  │
+│  - 刷新令牌 Grant 实现                                       │
+└────────────────────────────────┬────────────────────────────┘
+                                 │
+                                 │ 配置同步（Cloudflare API）
+                                 ▼
+┌─────────────────────────────────────────────────────────────┐
+│                     数据面（Data Plane）                     │
+│  ❓ 仓库内无实现，独立部署的 Cloudflare Worker                │
+│  - 反向代理握手                                              │
+│  - Cookie 会话管理                                           │
+│  - 令牌自动刷新                                              │
+│  - 请求转发到上游应用                                        │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 一、三方职责拆解
+## 二、控制面（✅ 仓库内完整实现）
 
-### 1. 代理层（Cloudflare Worker）
+### 2.1 核心职责
 
-**核心职责**：作为反向代理，处理所有请求的认证检查、会话管理和令牌刷新。
+控制面负责受保护应用的**配置管理**和**生命周期管理**，所有代码均在仓库内可查。
 
-**关键代码**：
-- `packages/core/src/libraries/protected-app.ts` - 配置管理与同步
-- `packages/core/src/utils/cloudflare/kv.ts` - KV 存储配置读写
+### 2.2 配置下发（Configuration Sync）
 
-**具体工作**：
+**核心文件**：`packages/core/src/libraries/protected-app.ts`
 
-1. **请求拦截**：所有访问受保护应用域名的请求先经过 Worker
-2. **会话检查**：验证请求中是否携带有效会话 Cookie
-3. **未登录处理**：无有效会话时重定向到 Logto 登录页
-4. **登录回调**：处理 `/sign-in-callback` 路径的授权码回调
-5. **令牌交换**：使用授权码向 Logto 换取 access_token 和 refresh_token
-6. **Cookie 设置**：将会话信息写入安全 Cookie
-7. **令牌刷新**：access_token 过期时自动使用 refresh_token 续期
-8. **请求转发**：认证通过后将请求转发到上游应用
+**关键函数**：`syncAppConfigsToRemote()`
 
-**配置同步机制**：
 ```typescript
-// packages/core/src/libraries/protected-app.ts:154-196
+// packages/core/src/libraries/protected-app.ts:154-196 ✅ 可证据
 const syncAppConfigsToRemote = async (applicationId: string): Promise<void> => {
+  const { protectedAppMetadata, id, secret, tenantId } = await findApplicationById(applicationId);
+  
   const siteConfigs = {
     ...protectedAppMetadata,
     sdkConfig: {
-      appId: id,           // 应用ID
-      appSecret: secret,   // 应用密钥
-      endpoint: getTenantEndpoint(tenantId, EnvSet.values).origin,  // Logto端点
+      appId: id,           // 应用ID，作为 OIDC client_id
+      appSecret: secret,   // 应用密钥，用于 token endpoint 认证
+      endpoint: getTenantEndpoint(tenantId, EnvSet.values).origin,  // Logto 端点
     },
   };
   
-  // 将配置写入 Cloudflare KV
+  // 写入 Cloudflare KV
   await updateProtectedAppSiteConfigs(
     protectedAppConfigProviderConfig,
     protectedAppMetadata.host,
     siteConfigs
   );
+  
+  // 同步配置到所有自定义域名
+  if (customDomains && customDomains.length > 0) {
+    await Promise.all(
+      customDomains.map(async ({ domain }) => {
+        await updateProtectedAppSiteConfigs(protectedAppConfigProviderConfig, domain, {
+          ...siteConfigs,
+          host: domain,
+        });
+      })
+    );
+  }
 };
 ```
 
----
+**配置结构**（KV 中存储的数据）：
 
-### 2. 会话存储
-
-**核心职责**：安全存储用户会话状态和令牌信息。
-
-#### 2.1 服务器端配置存储（Cloudflare KV）
-
-**存储内容**：
 ```typescript
-// packages/core/src/utils/cloudflare/types.ts:21-31
+// packages/core/src/utils/cloudflare/types.ts:21-31 ✅ 可证据
 type SiteConfigs = ProtectedAppMetadata & {
   sdkConfig: {
-    appId: string;      // 应用客户端ID
-    appSecret: string;  // 应用客户端密钥
-    endpoint: string;   // Logto 服务端点
+    appId: string;      // OIDC client_id
+    appSecret: string;  // OIDC client_secret
+    endpoint: string;   // Logto OIDC 服务地址
   };
 };
 ```
 
-**存储位置**：Cloudflare KV Namespace，键格式为 `${keyName}:${host}`
-
 **元数据结构**：
+
 ```typescript
-// packages/schemas/src/foundations/jsonb-types/applications.ts:22-37
+// packages/schemas/src/foundations/jsonb-types/applications.ts:22-37 ✅ 可证据
 type ProtectedAppMetadata = {
-  host: string;                    // 应用域名
-  origin: string;                  // 上游应用源地址
+  host: string;                    // 应用域名（系统分配或自定义）
+  origin: string;                  // 上游应用源地址（代理目标）
   sessionDuration: number;         // 会话时长（秒），默认14天
-  pageRules: Array<{ path: string }>;  // 页面访问规则
-  customDomains?: CustomDomain[];  // 自定义域名
+  pageRules: Array<{ path: string }>;  // 页面访问规则（正则路径）
+  customDomains?: CustomDomain[];  // 自定义域名列表
 };
 ```
 
-#### 2.2 客户端会话存储（Browser Cookie）
+**KV 存储键格式**：`${keyName}:${host}`
 
-**Cookie 策略**：
-- **名称**：由 Cloudflare Worker 管理，使用安全 Cookie
-- **属性**：
-  - `Secure`：仅 HTTPS 传输
-  - `HttpOnly`：禁止 JavaScript 访问（防止 XSS）
-  - `SameSite`：Lax 或 Strict（防止 CSRF）
-  - `Max-Age`：与 `sessionDuration` 一致，默认 14 天
-- **作用域**：受保护应用的域名
+- `keyName`：系统配置的前缀（来自 `protectedAppConfigProviderConfig.keyName`）
+- `host`：应用域名
 
-**会话内容**（Worker 内部维护）：
-- access_token（短期，通常 1 小时）
-- refresh_token（长期，与会话时长一致）
-- id_token（用户身份信息）
-- 令牌过期时间戳
+### 2.3 域名管理（Domain Management）
 
----
+**核心文件**：`packages/core/src/utils/cloudflare/index.ts`
 
-### 3. 上游应用（Origin）
-
-**核心职责**：只处理业务逻辑，不感知认证流程。
-
-**特点**：
-- **零代码侵入**：无需修改上游应用代码
-- **透明代理**：Worker 转发请求时附带用户身份信息（可通过 HTTP Header 传递）
-- **无状态**：上游应用本身不维护会话状态
-
-**接收的请求**：
-```
-GET /api/resource HTTP/1.1
-Host: protected-app.example.com
-Authorization: Bearer <access_token>  // 可选，由 Worker 注入
-X-Logto-User-Sub: <user_id>           // 可选，用户ID
-X-Logto-User-Email: <email>           // 可选，用户邮箱
-```
-
----
-
-## 二、会话建立完整流程
-
-### 阶段 1：首次访问（无会话）
-
-```
-1. 用户 → https://app.example.com/protected
-   ↓
-2. Cloudflare Worker 检查 Cookie：无有效会话
-   ↓
-3. 重定向 → Logto 授权端点
-   https://logto.example.com/oidc/auth
-     ?client_id=<appId>
-     &redirect_uri=https://app.example.com/sign-in-callback
-     &response_type=code
-     &scope=openid profile offline_access
-   ↓
-4. 用户登录 Logto（输入账号密码 / 社交登录）
-   ↓
-5. Logto → 重定向回 https://app.example.com/sign-in-callback?code=<授权码>
-```
-
-### 阶段 2：登录回调（授权码换令牌）
-
-```
-6. Worker 接收 /sign-in-callback 请求，提取授权码
-   ↓
-7. Worker → Logto Token 端点（使用 appId + appSecret 认证）
-   POST /oidc/token
-   {
-     grant_type: "authorization_code",
-     code: "<授权码>",
-     redirect_uri: "https://app.example.com/sign-in-callback"
-   }
-   ↓
-8. Logto 返回令牌响应：
-   {
-     access_token: "<access_token>",
-     refresh_token: "<refresh_token>",
-     id_token: "<id_token>",
-     expires_in: 3600
-   }
-   ↓
-9. Worker 将会话信息写入安全 Cookie
-   ↓
-10. 重定向 → 用户原始请求的页面
-```
-
-### 阶段 3：已认证访问
-
-```
-11. 用户 → https://app.example.com/protected（携带会话 Cookie）
-    ↓
-12. Worker 验证 Cookie，检查 access_token 是否有效
-    ├─ 有效 → 转发请求到上游应用
-    └─ 过期 → 进入刷新流程（阶段4）
-    ↓
-13. 上游应用处理请求，返回响应
-    ↓
-14. Worker 将响应返回给用户
-```
-
-### 阶段 4：令牌刷新（access_token 过期）
-
-**刷新令牌核心逻辑**：`packages/core/src/oidc/grants/refresh-token.ts`
-
-```
-15. Worker 检测到 access_token 已过期
-    ↓
-16. Worker → Logto Token 端点
-    POST /oidc/token
-    {
-      grant_type: "refresh_token",
-      refresh_token: "<refresh_token>",
-      scope: "openid profile offline_access"
-    }
-    ↓
-17. Logto 验证 refresh_token：
-    - 检查令牌是否存在且未过期
-    - 检查 clientId 是否匹配
-    - 检查是否已被消费（防止重放攻击）
-    ↓
-18. Logto 返回新的令牌对（可选轮换 refresh_token）
-    ↓
-19. Worker 更新 Cookie 中的会话信息
-    ↓
-20. 继续转发原始请求到上游应用
-```
-
-**刷新令牌关键校验点**：
-```typescript
-// packages/core/src/oidc/grants/refresh-token.ts:90-127
-if (!refreshToken) throw new InvalidGrant('refresh token not found');
-if (refreshToken.clientId !== client.clientId) throw new InvalidGrant('client mismatch');
-if (refreshToken.isExpired) throw new InvalidGrant('refresh token is expired');
-if (refreshToken.consumed) {
-  // 已消费的 refresh_token，立即销毁并撤销整个 grant
-  await Promise.all([refreshToken.destroy(), revoke(ctx, refreshToken.grantId)]);
-  throw new InvalidGrant('refresh token already used');
-}
-```
-
----
-
-## 三、关键技术细节
-
-### 3.1 Cookie 安全策略
-
-**核心原则**：最小权限 + 深度防御
-
-1. **HttpOnly**：防止 XSS 攻击窃取令牌
-2. **Secure**：仅在 HTTPS 连接中传输
-3. **SameSite=Lax**：防止 CSRF 攻击，同时允许从外部链接跳转登录
-4. **Path=/`**：整个域名有效
-5. **独立作用域**：每个受保护应用的 Cookie 相互隔离
-
-### 3.2 令牌安全存储
-
-- **access_token**：内存中短期持有，过期即换
-- **refresh_token**：加密存储在 Cookie 中，仅用于令牌刷新
-- **id_token**：用于获取用户信息，不用于 API 认证
-
-### 3.3 会话过期机制
-
-1. **access_token 过期**：静默刷新，用户无感知
-2. **refresh_token 过期**：需要重新登录（会话时长控制）
-3. **主动登出**：清除 Cookie，撤销 refresh_token
-
-### 3.4 域名与 SSL 管理
-
-**自定义域名配置**：
-- 通过 Cloudflare Custom Hostnames API 配置
-- 自动申请和续期 SSL 证书
-- 支持 CNAME 指向 Cloudflare 回退源地址
+**功能**：
+1. 创建自定义域名（Cloudflare Custom Hostname）
+2. 查询域名状态（SSL 证书签发进度）
+3. 删除自定义域名
 
 ```typescript
-// packages/core/src/utils/cloudflare/index.ts:57-82
+// packages/core/src/utils/cloudflare/index.ts:57-82 ✅ 可证据
 const createCustomHostname = async (auth: HostnameProviderData, hostname: string) => {
-  return got.post('/zones/{zoneId}/custom_hostnames', {
+  return got.post(`/zones/${auth.zoneId}/custom_hostnames`, {
     json: {
       hostname,
       ssl: { method: 'http', type: 'dv', settings: { min_tls_version: '1.2' } },
@@ -274,41 +134,330 @@ const createCustomHostname = async (auth: HostnameProviderData, hostname: string
 };
 ```
 
+**路由 API**（管理后台使用）：`packages/core/src/routes/applications/application-protected-app-metadata.ts`
+
+| 方法 | 路径 | 功能 |
+|------|------|------|
+| GET | `/applications/:id/protected-app-metadata/custom-domains` | 查询自定义域名列表及状态 |
+| POST | `/applications/:id/protected-app-metadata/custom-domains` | 添加自定义域名 |
+| DELETE | `/applications/:id/protected-app-metadata/custom-domains/:domain` | 删除自定义域名 |
+
+### 2.4 OIDC 客户端配置
+
+**回调 URL**：`packages/core/src/constants/index.ts` ✅ 可证据
+
+```typescript
+export const protectedAppSignInCallbackUrl = 'sign-in-callback';
+```
+
+**自动生成的 redirectUris**：
+
+```
+https://<host>/sign-in-callback
+https://<custom-domain>/sign-in-callback
+```
+
+**自动生成的 postLogoutRedirectUris**：
+
+```
+https://<host>
+https://<custom-domain>
+```
+
+### 2.5 刷新令牌 Grant（Refresh Token Grant）
+
+**核心文件**：`packages/core/src/oidc/grants/refresh-token.ts` ✅ 可证据
+
+这是标准 OIDC 刷新令牌流程的实现，受保护应用的数据面会调用此接口。
+
+```typescript
+// packages/core/src/oidc/grants/refresh-token.ts:90-127 ✅ 可证据
+if (!refreshToken) throw new InvalidGrant('refresh token not found');
+if (refreshToken.clientId !== client.clientId) throw new InvalidGrant('client mismatch');
+if (refreshToken.isExpired) throw new InvalidGrant('refresh token is expired');
+if (refreshToken.consumed) {
+  // 安全机制：已消费的 refresh_token 立即销毁并撤销整个 grant
+  await Promise.all([refreshToken.destroy(), revoke(ctx, refreshToken.grantId)]);
+  throw new InvalidGrant('refresh token already used');
+}
+```
+
+**令牌轮换**（可选，由配置决定）：
+
+```typescript
+// packages/core/src/oidc/grants/refresh-token.ts:173-207 ✅ 可证据
+if (rotateRefreshToken === true || ...) {
+  await refreshToken.consume();  // 标记旧 token 为已消费
+  refreshToken = new RefreshToken({ ... });  // 生成新 token
+  refreshTokenValue = await refreshToken.save();
+}
+```
+
 ---
 
-## 四、代码位置索引
+## 三、数据面（❓ 仓库内无实现，架构推断）
+
+> **重要提示**：以下内容基于控制面下发的配置结构、OIDC 协议规范和架构文档推断，仓库内无对应实现代码。
+
+### 3.1 数据面的角色
+
+数据面是独立部署的 **Cloudflare Worker**，作为反向代理运行在用户请求与上游应用之间。
+
+**推断依据**：
+- 控制台文档链接描述：`/integrate-logto/protected-app`
+- 配置中包含完整的 OIDC client 凭据（appId + appSecret）
+- 预定义了 `/sign-in-callback` 路径
+- 配置了 sessionDuration（会话时长）
+- 控制台 UI 显示了认证路由列表：`/register`, `/sign-in`, `/sign-in-callback`, `/sign-out`
+
+### 3.2 反向代理握手流程推断
+
+```
+用户浏览器 → Cloudflare Worker（数据面） → Logto OIDC（控制面）
+                                      ↓
+                              上游应用（Origin）
+```
+
+**阶段 1：首次访问（无会话）❓ 推断**
+
+```
+1. 用户 → https://app.example.com/protected
+   ↓
+2. Worker 检查 Cookie（不存在或无效）
+   ↓
+3. 生成 OIDC 授权请求，重定向到 Logto
+   https://logto.example.com/oidc/auth
+     ?client_id=<appId>
+     &redirect_uri=https://app.example.com/sign-in-callback
+     &response_type=code
+     &scope=openid profile offline_access
+     &state=<随机值>
+     &nonce=<随机值>
+   ↓
+4. 用户完成登录
+   ↓
+5. Logto → 重定向回 https://app.example.com/sign-in-callback?code=<授权码>&state=<state>
+```
+
+**阶段 2：登录回调 ❓ 推断**
+
+```
+6. Worker 接收 /sign-in-callback 请求
+   - 验证 state 参数
+   - 提取授权码 code
+   ↓
+7. Worker 调用 Logto Token 端点（使用 appId + appSecret 进行 Basic Auth）
+   POST https://logto.example.com/oidc/token
+   Authorization: Basic <base64(appId:appSecret)>
+   Content-Type: application/x-www-form-urlencoded
+   
+   grant_type=authorization_code
+   &code=<授权码>
+   &redirect_uri=https://app.example.com/sign-in-callback
+   ↓
+8. Logto 返回令牌响应 ✅ 可证据（标准 OIDC 流程）
+   {
+     access_token: "<access_token>",
+     refresh_token: "<refresh_token>",
+     id_token: "<id_token>",
+     expires_in: 3600,
+     token_type: "Bearer"
+   }
+   ↓
+9. Worker 验证 id_token，提取用户信息
+   ↓
+10. Worker 将会话信息加密后写入 Cookie
+    ↓
+11. 重定向到用户原始请求的页面
+```
+
+### 3.3 Cookie 策略推断
+
+**推断依据**：
+- 控制面配置了 `sessionDuration`（默认 14 天）
+- 安全最佳实践
+- OIDC 安全规范
+
+**Cookie 属性推断**：
+
+| 属性 | 值 | 说明 |
+|------|----|------|
+| Secure | ✅ | 仅 HTTPS 传输 |
+| HttpOnly | ✅ | 禁止 JavaScript 访问，防止 XSS |
+| SameSite | Lax | 防止 CSRF，同时允许外部跳转 |
+| Path | / | 整个域名有效 |
+| Max-Age | sessionDuration | 与会话时长一致 |
+| Domain | 应用域名 | 作用域限制 |
+
+**Cookie 内容推断**（加密存储）：
+- access_token（短期，通常 1 小时）
+- refresh_token（长期，与会话时长一致）
+- id_token（用于获取用户信息）
+- 令牌过期时间戳
+- 用户标识（sub）
+
+### 3.4 刷新令牌续期机制推断
+
+**阶段 3：已认证访问 ❓ 推断**
+
+```
+1. 用户 → https://app.example.com/protected（携带会话 Cookie）
+   ↓
+2. Worker 解密 Cookie，检查 access_token 是否过期
+   ├─ 未过期 → 转发请求到上游应用
+   └─ 已过期 → 进入刷新流程
+   ↓
+3. 上游应用返回响应 → Worker 转发给用户
+```
+
+**阶段 4：令牌刷新 ❓ 推断**
+
+```
+4. Worker 检测到 access_token 已过期
+   ↓
+5. 调用 Logto Token 端点使用 refresh_token 续期
+   POST https://logto.example.com/oidc/token
+   Authorization: Basic <base64(appId:appSecret)>
+   
+   grant_type=refresh_token
+   &refresh_token=<refresh_token>
+   &scope=openid profile offline_access
+   ↓
+6. Logto 验证并返回新令牌对 ✅ 可证据（refresh-token.ts）
+   ↓
+7. Worker 更新 Cookie 中的会话信息
+   ↓
+8. 继续转发原始请求到上游应用
+```
+
+**刷新失败场景**：
+- refresh_token 已过期 → 清除 Cookie，重定向到登录页
+- refresh_token 已被消费 → 清除 Cookie，重定向到登录页（安全机制）
+- 用户被禁用 → 清除 Cookie，重定向到登录页
+
+### 3.5 请求转发推断
+
+**Worker 转发给上游应用的请求可能包含**：
+
+```http
+GET /protected HTTP/1.1
+Host: <上游应用域名>
+X-Forwarded-For: <用户真实IP>
+X-Forwarded-Proto: https
+Authorization: Bearer <access_token>  // 可选
+X-Logto-User-Sub: <user_id>           // 可选，从 id_token 提取
+X-Logto-User-Email: <email>           // 可选
+```
+
+---
+
+## 四、控制面与数据面交互时序
+
+```
+管理员操作（控制台）
+    │
+    ▼
+┌─────────────┐
+│  应用创建    │  ✅ 可证据：application.ts
+│  配置域名    │
+│  设置会话时长│
+└──────┬──────┘
+       │
+       ▼
+┌─────────────┐
+│ 配置持久化   │  ✅ 可证据：写入 applications 表
+└──────┬──────┘
+       │
+       ▼
+┌─────────────┐
+│ 同步到 KV   │  ✅ 可证据：syncAppConfigsToRemote()
+│ (Cloudflare │
+│  Workers &  │
+│  Pages KV)  │
+└──────┬──────┘
+       │
+       │ 配置数据
+       ▼
+┌─────────────────────────────────────┐
+│  Cloudflare Worker（数据面）         │  ❓ 推断
+│  - 读取 KV 配置                     │
+│  - 监听用户请求                     │
+│  - 执行 OAuth 流程                  │
+│  - 管理 Cookie 会话                 │
+│  - 自动刷新令牌                     │
+│  - 转发请求到上游应用               │
+└─────────────────────────────────────┘
+```
+
+---
+
+## 五、代码位置索引
+
+### 控制面（✅ 可证据）
 
 | 功能模块 | 文件路径 | 关键行号 |
 |---------|---------|---------|
-| 受保护应用核心逻辑 | `packages/core/src/libraries/protected-app.ts` | 149-279 |
+| 受保护应用核心库 | `packages/core/src/libraries/protected-app.ts` | 149-279 |
+| 受保护应用测试 | `packages/core/src/libraries/protected-app.test.ts` | 1-221 |
 | Cloudflare KV 配置读写 | `packages/core/src/utils/cloudflare/kv.ts` | 19-78 |
-| 刷新令牌 Grant | `packages/core/src/oidc/grants/refresh-token.ts` | 67-324 |
+| Cloudflare 域名 API | `packages/core/src/utils/cloudflare/index.ts` | 30-134 |
+| Cloudflare 类型定义 | `packages/core/src/utils/cloudflare/types.ts` | 1-31 |
+| 受保护应用元数据路由 | `packages/core/src/routes/applications/application-protected-app-metadata.ts` | 11-169 |
+| 受保护应用元数据路由测试 | `packages/core/src/routes/applications/application-protected-app-metadata.test.ts` | 1-181 |
 | 受保护应用元数据结构 | `packages/schemas/src/foundations/jsonb-types/applications.ts` | 22-37 |
 | Cloudflare 系统配置 | `packages/schemas/src/types/system.ts` | 152-213 |
-| 站点配置类型定义 | `packages/core/src/utils/cloudflare/types.ts` | 21-31 |
-| 自定义域名 API | `packages/core/src/utils/cloudflare/index.ts` | 30-134 |
+| 刷新令牌 Grant | `packages/core/src/oidc/grants/refresh-token.ts` | 67-324 |
 | 登录回调 URL 常量 | `packages/core/src/constants/index.ts` | 7 |
 | 默认会话时长 | `packages/core/src/routes/applications/constants.ts` | 3-4 |
-| 受保护应用元数据路由 | `packages/core/src/routes/applications/application-protected-app-metadata.ts` | 11-169 |
+| 应用类型校验 | `packages/core/src/libraries/application.ts` | 280-291 |
+| 控制台设置页面 | `packages/console/src/pages/ApplicationDetails/ApplicationDetailsContent/ProtectedAppSettings/index.tsx` | 1-300 |
+| 会话时长表单 | `packages/console/src/pages/ApplicationDetails/ApplicationDetailsContent/ProtectedAppSettings/components/SessionForm.tsx` | 1-78 |
+
+### 数据面（❓ 无实现）
+
+| 功能模块 | 状态 | 说明 |
+|---------|------|------|
+| Cloudflare Worker 入口 | 无 | 独立部署，不在此仓库 |
+| 反向代理逻辑 | 无 | 独立部署，不在此仓库 |
+| Cookie 会话管理 | 无 | 独立部署，不在此仓库 |
+| 令牌刷新逻辑 | 无 | 独立部署，不在此仓库 |
+| 登录回调处理 | 无 | 独立部署，不在此仓库 |
 
 ---
 
-## 五、架构优势与权衡
+## 六、可证据 vs 推断 对比表
 
-### 优势
-1. **零侵入**：上游应用无需任何修改
-2. **统一安全策略**：所有应用共享相同的认证安全标准
-3. **开发体验**：业务开发者无需关注认证细节
-4. **快速上线**：只需配置域名和上游源地址
+| 功能点 | 可证据（✅） | 推断（❓） | 依据 |
+|--------|-------------|-----------|------|
+| 应用配置存储 | ✅ | | protected-app.ts |
+| 配置下发到 KV | ✅ | | syncAppConfigsToRemote() |
+| 自定义域名管理 | ✅ | | cloudflare/index.ts |
+| 刷新令牌 Grant 实现 | ✅ | | refresh-token.ts |
+| 登录回调 URL 定义 | ✅ | | constants/index.ts |
+| 会话时长配置 | ✅ | | SessionForm.tsx |
+| Cloudflare Worker 代码 | | ❓ | 无对应文件 |
+| 反向代理握手逻辑 | | ❓ | 基于 OIDC 规范 |
+| Cookie 加密策略 | | ❓ | 基于安全最佳实践 |
+| 令牌自动刷新逻辑 | | ❓ | 基于 refresh_token 存在 |
+| 请求转发规则 | | ❓ | 基于 origin 配置 |
 
-### 权衡
-1. **额外延迟**：每个请求多一跳 Worker 处理
-2. **Cloudflare 绑定**：强依赖 Cloudflare 生态
-3. **调试难度**：问题排查需要理解多层架构
-4. **成本**：Cloudflare Worker 和 KV 可能产生额外费用
+---
+
+## 七、已知限制与架构权衡
+
+### 已知事实（✅ 可证据）
+1. **强依赖 Cloudflare**：必须使用 Cloudflare 生态（KV + Custom Hostnames）
+2. **单域名限制**：每个受保护应用仅支持一个自定义域名（代码校验）
+3. **配置同步延迟**：KV 写入后可能有秒级延迟
+4. **应用密钥暴露**：appSecret 存储在 Cloudflare KV 中
+
+### 推断限制（❓）
+1. **冷启动延迟**：Cloudflare Worker 冷启动可能增加首次请求延迟
+2. **调试困难**：数据面问题需要在 Cloudflare 侧排查
+3. **定制能力有限**：数据面逻辑不可在本仓库修改
 
 ### 适用场景
-- 遗留系统快速接入认证
-- 第三方静态网站保护
-- 多应用统一认证入口
-- 快速原型验证
+- ✅ 遗留系统快速接入认证
+- ✅ 静态网站保护
+- ✅ 第三方 SaaS 应用统一入口
+- ❌ 需要深度定制认证逻辑的场景
