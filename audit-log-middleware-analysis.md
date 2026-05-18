@@ -234,6 +234,7 @@ router.post(
 - **挂载级别**：单路由级
 - **覆盖范围**：仅 `/authn/sso/saml/:connectorId`
 - **LogKey**：`Interaction.SignIn.Verification.IdpInitiatedSso.Create`
+- **记录字段**：`connectorId`、`ssoSessionId`、`assertionContent`（**无 applicationId**）
 
 ### 4.6 SAML 应用路由 (`routes/saml-application/anonymous.ts`)
 
