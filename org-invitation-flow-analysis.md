@@ -172,7 +172,47 @@ const { invitationId = '' } = useParams();
 
 **文件位置**: `packages/console/src/pages/AcceptInvitation/index.tsx:19-74`
 
-#### 3.2.1 邀请信息查询与权限校验
+#### 3.2.1 注释与实际代码的差异：403 vs 404 真相
+
+**关键发现：源码注释已过时，实际行为与注释描述不符**
+
+**注释内容** (`packages/console/src/pages/AcceptInvitation/index.tsx:27-28,53`):
+```typescript
+// The request is only made when the user has signed-in and the invitation ID is available.
+// The response data is returned only when the current user matches the invitee email. Otherwise, it returns 404.
+
+// No invitation returned, indicating the current signed-in user is not the invitee.
+```
+
+**实际代码行为与场景对应**:
+
+| 场景 | 注释声称 | 实际行为 | 触发条件 |
+|------|---------|----------|---------|
+| 邮箱不匹配 | 返回 404 | 返回 **403 Forbidden** | 当前登录用户邮箱 ≠ 邀请的 `invitee` 邮箱 |
+| 邀请不存在 | - | 返回 **404 Not Found** | invitationId 无效，或邀请已被删除 |
+| 邀请状态非 Pending | - | 200 OK + 前端本地校验 | 邀请状态为 Accepted/Expired/Revoked |
+
+**对"可接受性判定在何处发生"的影响**:
+
+1. **判定位置**：云端 API 层（不在 Core 层，也不在前端）
+   - 前端仅根据 HTTP 状态码区分两种错误类型
+   - 云端在查询邀请时校验邮箱匹配，不匹配则返回 403
+   - Core 层 `findById` 仅在邀请 ID 不存在时返回 404
+
+2. **403 的语义**：身份认证通过（已登录），但**权限不足**（不是被邀请人）
+   - 这是一个业务逻辑层面的权限判定
+   - 触发 SwitchAccount 分支，引导用户切换到正确的账号
+
+3. **404 的语义**：资源不存在
+   - 邀请 ID 无效，或邀请已被删除
+   - 显示邀请不存在的友好提示
+
+**设计意图**：
+- 通过不同状态码精确区分错误类型
+- 403 提供了友好的用户体验（切换账号）
+- 404 提供了清晰的错误信息（邀请不存在）
+
+#### 3.2.2 邀请信息查询与权限校验
 
 页面加载后自动发起邀请查询请求，由 SWR 管理请求状态：
 
@@ -187,7 +227,7 @@ const { data: invitation, error } = useSWR<InvitationResponse, RequestError>(
 - 只有当前登录用户的邮箱与邀请的 `invitee` 邮箱匹配时，才返回邀请数据
 - 如果邮箱不匹配，返回 **403 Forbidden** 错误
 
-#### 3.2.2 403 错误处理与切换账号分支
+#### 3.2.3 403 错误处理与切换账号分支
 
 **文件位置**: `packages/console/src/pages/AcceptInvitation/index.tsx:54-63`
 
@@ -211,7 +251,7 @@ if (error?.status === 403) {
   1. `saveRedirect()` 保存当前页面 URL 以便登录后跳转回来
   2. 调用 `signIn(redirectUri.href)` 触发重新登录流程
 
-#### 3.2.3 其他错误处理
+#### 3.2.4 其他错误处理
 
 ```typescript
 // 邀请不存在
@@ -225,7 +265,7 @@ if (invitation && invitation.status !== OrganizationInvitationStatus.Pending) {
 }
 ```
 
-#### 3.2.4 自动接受邀请与租户切换
+#### 3.2.5 自动接受邀请与租户切换
 
 当邀请查询成功且状态有效时，`useEffect` 自动执行接受流程：
 
