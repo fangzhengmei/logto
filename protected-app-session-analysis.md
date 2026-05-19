@@ -43,12 +43,11 @@
 
 ### 2.2 受保护应用的 OIDC 配置约束
 
-**应用类型映射**（✅ 可证据）
+**应用类型映射**（✅ 可证据）：
 
 ```typescript
-// packages/core/src/oidc/utils.ts:33-97
+// packages/core/src/oidc/utils.ts:33-97 ✅ 可证据
 export const getConstantClientMetadata = (envSet, type, options) => {
-  // ...
   // Protected 类型属于 Interactive applications，走默认分支
   return {
     ...constantMetadata,
@@ -67,7 +66,7 @@ export const getConstantClientMetadata = (envSet, type, options) => {
 | `refreshTokenTtlInDays` | 14（默认） | 刷新令牌 TTL |
 | `rotateRefreshToken` | true（默认） | 启用令牌轮换 |
 
-### 2.3 刷新令牌颁发条件**（✅ 可证据）
+### 2.3 刷新令牌颁发条件（✅ 可证据）
 
 **核心逻辑**：`packages/core/src/oidc/init.ts:212-221`
 
@@ -94,9 +93,10 @@ issueRefreshToken: (_, client, code) => {
    - **选项 B**：应用是 web 类型且 `alwaysIssueRefreshToken = true`
 
 **受保护应用的实际情况**（✅ 可证据 + ❓ 推断结合）：
+
 - ✅ 代码中未看到 Protected 应用默认设置 `alwaysIssueRefreshToken: true`
-- ✅ 仅 `customClientMetadataDefault` 中无此配置（`packages/schemas/src/consts/oidc.ts:14-18`）
-- ❓ 因此**数据面必须在授权请求中包含 `offline_access` scope 才能获取 refresh_token
+- ✅ `customClientMetadataDefault` 中无此配置（`packages/schemas/src/consts/oidc.ts:14-18`）
+- ❓ 因此数据面必须在授权请求中包含 `offline_access` scope 才能获取 refresh_token
 
 ### 2.4 刷新令牌 TTL 与轮换策略
 
@@ -114,7 +114,7 @@ const refreshTokenTtl = (ctx, token, client) => {
     // 公共客户端非 sender-constrained 的 refresh token 不无限续期
     return ctx.oidc.entities.RotatedRefreshToken.remainingTTL;
   }
-  // 对于机密客户端（Protected 应用），返回 undefined 使用默认 TTL（由 `refreshTokenTtlInDays` 决定）
+  // 对于机密客户端（Protected 应用），返回 undefined 使用默认 TTL
 };
 ```
 
@@ -133,18 +133,19 @@ const rotateRefreshToken = (ctx) => {
   if (refreshToken.totalLifetime() >= 365.25 * 24 * 60 * 60) {
     return false;
   }
-  
+
   // 公共客户端非 sender-constrained 始终轮换
   if (client.clientAuthMethod === 'none' && !refreshToken.isSenderConstrained()) {
     return true;
   }
-  
+
   // 机密客户端（Protected 应用）：超过 70% TTL 时轮换
   return refreshToken.ttlPercentagePassed() >= 70;
 };
 ```
 
 **受保护应用的轮换行为**（✅ 可证据）：
+
 - ✅ Protected 应用是机密客户端（`client_secret_basic`）
 - ✅ 超过 70% TTL 时才轮换 refresh_token
 - ✅ 最长可轮换 1 年
@@ -159,34 +160,22 @@ const rotateRefreshToken = (ctx) => {
 // packages/core/src/libraries/protected-app.ts:154-196 ✅ 可证据
 const syncAppConfigsToRemote = async (applicationId: string): Promise<void> => {
   const { protectedAppMetadata, id, secret, tenantId } = await findApplicationById(applicationId);
-  
+
   const siteConfigs = {
     ...protectedAppMetadata,
     sdkConfig: {
-      appId: id,           // 应用 ID，作为 OIDC client_id
-      appSecret: secret,     // 应用密钥，用于 token endpoint 认证
-      endpoint: getTenantEndpoint(tenantId, EnvSet.values).origin,  // Logto 端点
+      appId: id,
+      appSecret: secret,
+      endpoint: getTenantEndpoint(tenantId, EnvSet.values).origin,
     },
   };
-  
+
   // 写入 Cloudflare KV
   await updateProtectedAppSiteConfigs(
     protectedAppConfigProviderConfig,
     protectedAppMetadata.host,
     siteConfigs
   );
-  
-  // 同步配置到所有自定义域名
-  if (customDomains && customDomains.length > 0) {
-    await Promise.all(
-      customDomains.map(async ({ domain }) => {
-        await updateProtectedAppSiteConfigs(protectedAppConfigProviderConfig, domain, {
-          ...siteConfigs,
-          host: domain,
-        });
-      })
-    );
-  }
 };
 ```
 
@@ -196,9 +185,9 @@ const syncAppConfigsToRemote = async (applicationId: string): Promise<void> => {
 // packages/core/src/utils/cloudflare/types.ts:21-31 ✅ 可证据
 type SiteConfigs = ProtectedAppMetadata & {
   sdkConfig: {
-    appId: string;      // OIDC client_id
-    appSecret: string;  // OIDC client_secret
-    endpoint: string;   // Logto OIDC 服务地址
+    appId: string;
+    appSecret: string;
+    endpoint: string;
   };
 };
 ```
@@ -208,11 +197,11 @@ type SiteConfigs = ProtectedAppMetadata & {
 ```typescript
 // packages/schemas/src/foundations/jsonb-types/applications.ts:22-37 ✅ 可证据
 type ProtectedAppMetadata = {
-  host: string;                    // 应用域名（系统分配或自定义）
-  origin: string;                  // 上游应用源地址（代理目标）
-  sessionDuration: number;         // 会话时长（秒），默认 14 天
-  pageRules: Array<{ path: string }>;  // 页面访问规则（正则路径）
-  customDomains?: CustomDomain[];  // 自定义域名列表
+  host: string;
+  origin: string;
+  sessionDuration: number;
+  pageRules: Array<{ path: string }>;
+  customDomains?: CustomDomain[];
 };
 ```
 
@@ -223,6 +212,7 @@ type ProtectedAppMetadata = {
 **核心文件**：`packages/core/src/utils/cloudflare/index.ts`
 
 **功能**：
+
 1. 创建自定义域名（Cloudflare Custom Hostnames）
 2. 查询域名状态（SSL 证书签发进度）
 3. 删除自定义域名
@@ -233,7 +223,7 @@ const createCustomHostname = async (auth: HostnameProviderData, hostname: string
   return got.post(`/zones/${auth.zoneId}/custom_hostnames`, {
     json: {
       hostname,
-      ssl: { method: 'http', type: 'dv', settings: { min_tls_version: '1.2' },
+      ssl: { method: 'http', type: 'dv', settings: { min_tls_version: '1.2' } },
     },
   });
 };
@@ -243,9 +233,9 @@ const createCustomHostname = async (auth: HostnameProviderData, hostname: string
 
 | 方法 | 路径 | 功能 |
 |------|------|------|
-| GET | `/applications/:id/protected-app-metadata/custom-domains | 查询自定义域名列表及状态 |
-| POST | `/applications/:id/protected-app-metadata/custom-domains | 添加自定义域名 |
-| DELETE | `/applications/:id/protected-app-metadata/custom-domains/:domain | 删除自定义域名 |
+| GET | `/applications/:id/protected-app-metadata/custom-domains` | 查询自定义域名列表及状态 |
+| POST | `/applications/:id/protected-app-metadata/custom-domains` | 添加自定义域名 |
+| DELETE | `/applications/:id/protected-app-metadata/custom-domains/:domain` | 删除自定义域名 |
 
 ### 2.7 OIDC 客户端配置
 
@@ -281,8 +271,7 @@ if (!refreshToken) throw new InvalidGrant('refresh token not found');
 if (refreshToken.clientId !== client.clientId) throw new InvalidGrant('client mismatch');
 if (refreshToken.isExpired) throw new InvalidGrant('refresh token is expired');
 if (refreshToken.consumed) {
-  // 安全机制：已消费的 refresh_token 立即销毁并撤销整个 grant
-  await Promise.all([refreshToken.destroy(), revoke(ctx, refreshToken.grantId)];
+  await Promise.all([refreshToken.destroy(), revoke(ctx, refreshToken.grantId)]);
   throw new InvalidGrant('refresh token already used');
 }
 ```
@@ -327,7 +316,7 @@ if (refreshToken.consumed) {
      ?client_id=<appId>
      &redirect_uri=https://app.example.com/sign-in-callback
      &response_type=code
-     &scope=openid profile offline_access  # ❓ 推断：必须包含 offline_access
+     &scope=openid profile offline_access
      &state=<随机值>
      &nonce=<随机值>
    ↓
@@ -338,8 +327,8 @@ if (refreshToken.consumed) {
 
 **为什么必须包含 `offline_access` scope**（✅ 可证据的推断链）：
 
-- ✅ 受保护应用未设置 `alwaysIssueRefreshToken: true
-- ✅ 刷新令牌颁发条件要求 `offline_access` scope 或 `alwaysIssueRefreshToken: true
+- ✅ 受保护应用未设置 `alwaysIssueRefreshToken: true`
+- ✅ 刷新令牌颁发条件要求 `offline_access` scope 或 `alwaysIssueRefreshToken: true`
 - ❓ 因此数据面必须在授权请求中包含 `offline_access` scope
 
 **阶段 2：登录回调 ❓ 推断**：
@@ -353,7 +342,7 @@ if (refreshToken.consumed) {
    POST https://logto.example.com/oidc/token
    Authorization: Basic <base64(appId:appSecret)>
    Content-Type: application/x-www-form-urlencoded
-   
+
    grant_type=authorization_code
    &code=<授权码>
    &redirect_uri=https://app.example.com/sign-in-callback
@@ -390,14 +379,14 @@ const cookieConfig = Object.freeze({
 
 **❓ 推断部分**（数据面对用户会话 Cookie 策略）：
 
-| 属性 | 推断值 | 推断依据 |
-|------|---------|-----------|
-| Secure | ✅ | 仅 HTTPS 传输 | 安全最佳实践 |
-| HttpOnly | ✅ | 禁止 JavaScript 访问，防止 XSS | 安全最佳实践 |
-| SameSite | Lax | 防止 CSRF，同时允许外部跳转 | 安全最佳实践 |
-| Path | / | 整个域名有效 | 标准做法 |
+| 属性 | 推断值 | 说明 | 证据归属 |
+|------|--------|------|----------|
+| Secure | ✅ | 仅 HTTPS 传输 | ❓ 安全最佳实践 |
+| HttpOnly | ✅ | 禁止 JavaScript 访问，防止 XSS | ❓ 安全最佳实践 |
+| SameSite | Lax | 防止 CSRF，同时允许外部跳转 | ❓ 安全最佳实践 |
+| Path | / | 整个域名有效 | ❓ 标准做法 |
 | Max-Age | sessionDuration | 与会话时长一致 | ✅ 可证据：配置了 sessionDuration |
-| Domain | 应用域名 | 作用域限制 | 标准做法 |
+| Domain | 应用域名 | 作用域限制 | ❓ 标准做法 |
 
 **Cookie 内容推断**（加密存储）❓ 推断：
 
@@ -409,7 +398,7 @@ const cookieConfig = Object.freeze({
 
 ### 3.4 刷新令牌续期机制
 
-**数据面会调用刷新接口**❓ 推断，依据如下**：
+**数据面会调用刷新接口** ❓ 推断，依据如下：
 
 1. ✅ 受保护应用配置了 `refresh_token` grant type
 2. ✅ 配置了 `sessionDuration`（默认 14 天），远长于 access_token 有效期（通常 1 小时）
@@ -437,7 +426,7 @@ const cookieConfig = Object.freeze({
 5. 调用 Logto Token 端点使用 refresh_token 续期
    POST https://logto.example.com/oidc/token
    Authorization: Basic <base64(appId:appSecret)>
-   
+
    grant_type=refresh_token
    &refresh_token=<refresh_token>
    &scope=openid profile offline_access
@@ -457,16 +446,16 @@ const cookieConfig = Object.freeze({
 
 ### 3.5 请求转发推断
 
-**Worker 转发给上游应用的请求可能包含** ❓ 推断**：
+**Worker 转发给上游应用的请求可能包含** ❓ 推断：
 
 ```http
 GET /protected HTTP/1.1
 Host: <上游应用域名>
 X-Forwarded-For: <用户真实IP>
 X-Forwarded-Proto: https
-Authorization: Bearer <access_token>  // 可选
-X-Logto-User-Sub: <user_id>           // 可选，从 id_token 提取
-X-Logto-User-Email: <email>           // 可选
+Authorization: Bearer <access_token>
+X-Logto-User-Sub: <user_id>
+X-Logto-User-Email: <email>
 ```
 
 ---
@@ -516,7 +505,7 @@ X-Logto-User-Email: <email>           // 可选
 ### 控制面（✅ 可证据）
 
 | 功能模块 | 文件路径 | 关键行号 |
-|---------|---------|---------|
+|---------|---------|----------|
 | 受保护应用核心库 | `packages/core/src/libraries/protected-app.ts` | 149-279 |
 | 受保护应用测试 | `packages/core/src/libraries/protected-app.test.ts` | 1-221 |
 | Cloudflare KV 配置读写 | `packages/core/src/utils/cloudflare/kv.ts` | 19-78 |
@@ -575,6 +564,7 @@ X-Logto-User-Email: <email>           // 可选
 ## 七、已知限制与架构权衡
 
 ### 已知事实（✅ 可证据）
+
 1. **强依赖 Cloudflare**：必须使用 Cloudflare 生态（KV + Custom Hostnames）
 2. **单域名限制**：每个受保护应用仅支持一个自定义域名（代码校验）
 3. **配置同步延迟**：KV 写入后可能有秒级延迟
@@ -583,11 +573,13 @@ X-Logto-User-Email: <email>           // 可选
 6. **令牌轮换时机**：机密客户端超过 70% TTL 时轮换
 
 ### 推断限制（❓）
+
 1. **冷启动延迟**：Cloudflare Worker 冷启动可能增加首次请求延迟
 2. **调试困难**：数据面问题需要在 Cloudflare 侧排查
 3. **定制能力有限**：数据面逻辑不可在本仓库修改
 
 ### 适用场景
+
 - ✅ 遗留系统快速接入认证
 - ✅ 静态网站保护
 - ✅ 第三方 SaaS 应用统一入口
