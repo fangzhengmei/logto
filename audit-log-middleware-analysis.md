@@ -407,7 +407,10 @@ export default function koaExperienceAuditLog() {
 | OIDC 事件 | `ctx.oidc.entities.Account?.accountId` | `log.append(extractInteractionContext(ctx))` | `event-listeners/utils.ts:20` |
 | Experience Submit | `experienceInteraction.identifiedUserId` | `log.append({ userId })` | `experience/index.ts:188` |
 | Token Revocation | `AccessToken?.accountId ?? RefreshToken?.accountId` | `log.append({ userId })` | `event-listeners/grant.ts:52` |
-| SAML Callback | `samlApplication.handleOidcCallbackAndGetUserInfo()` | `log.append({ userInfo })` | `saml-application/anonymous.ts:166` |
+
+**重要说明（非 userId 来源）**：
+- **SAML Callback**：不记录独立的 `userId` 字段，仅记录 `userInfo` 对象（含 sub、name、email 等），**不属于 userId 来源**
+- **Authn SAML**：不记录 `userId` 或 `userInfo`，仅记录 `connectorId`、`ssoSessionId`、`assertionContent`
 
 **OIDC 事件中提取 userId**：
 ```typescript
@@ -803,5 +806,7 @@ const url = buildUrl('api/logs', {
 4. **中间件顺序**：koaAuditLog 需在业务中间件之前挂载，koaExperienceAuditLog 需在之后
 5. **查询白名单**：新增日志类型需在 `includeKeyPrefix` 中添加才能在管理后台查询
 6. **OIDC 事件日志**：OIDC Provider 级挂载的中间件仅在事件监听器中使用，路由处理器不直接调用
-7. **性能考虑**：日志量大时注意日志表分区或归档策略
-8. **敏感字段扩展**：如需新增敏感字段，在 `sensitiveDataKeys` 数组中添加即可
+7. **SAML Callback 字段**：SAML Callback 记录的是 `userInfo` 对象（包含 sub、name、email 等），**不是 userId 来源**，userInfo 中的 sub 字段与 userId 语义不同
+8. **Authn SAML 字段缺失**：`/authn/sso/saml/:connectorId` 路由仅记录 `connectorId`、`ssoSessionId`、`assertionContent`，**不写 applicationId**
+9. **性能考虑**：日志量大时注意日志表分区或归档策略
+10. **敏感字段扩展**：如需新增敏感字段，在 `sensitiveDataKeys` 数组中添加即可
