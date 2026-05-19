@@ -19,12 +19,17 @@
                              ▼
 ┌─────────────────────────────────────────────────────────┐
 │                   QuotaLibrary 核心层                   │
-│  - guardTenantUsageByKey: 统一校验入口                  │
-│    短路条件：!isCloud / adminTenant（仅这两个！）       │
-│  - assertSystemLimit: 系统限制校验（始终执行）           │
-│  - assertQuotaLimit: 订阅配额校验                       │
-│    Add-on 豁免：仅在此阶段判断 Pro/Enterprise           │
-│  - reportSubscriptionUpdatesUsage: 用量上报             │
+│  guardTenantUsageByKey(key) - 统一校验入口              │
+│    入口短路：!isCloud / adminTenant（仅这两个）         │
+│    按 key 类型分支：                                    │
+│    ├─ isSystemUsageKey(key) → assertSystemLimit()      │
+│    └─ isQuotaUsageKey(key)  → assertQuotaLimit()       │
+│  assertSystemLimit: 系统限制校验（仅数值配额）          │
+│  assertQuotaLimit: 订阅配额校验                         │
+│    ├─ 布尔配额：直接判断 true/false                     │
+│    ├─ 数值配额：查询用量 + Add-on 豁免判断              │
+│    └─ Add-on 豁免：Pro/Enterprise 下跳过数值配额校验    │
+│  reportSubscriptionUpdatesUsage: 用量上报               │
 └────────────────────────────┬────────────────────────────┘
                              │
           ┌──────────────────┴──────────────────┐
@@ -129,9 +134,7 @@ await quota.guardTenantUsageByKey('scopesPerResourceLimit', {
 
 > ✅ **重要事实**：`applications` 路由**没有**使用 `koaQuotaGuard` 中间件，而是在处理器内显式调用 `guardTenantUsageByKey`。
 
-### 2.3 短路条件（不拦截的情况）
-
-**核心纠正**：增购资源（Add-on）的豁免**不在 guard 入口处短路**，入口处只有两个短路条件：
+### 2.3 入口短路条件（不拦截的情况）
 
 ```typescript
 // quota.ts:152-162
@@ -148,10 +151,17 @@ guardTenantUsageByKey = async (key, options) => {
     return;
   }
 
-  // 注意：此处没有 Add-on 资源的短路逻辑！
-  // Add-on 豁免仅在 assertQuotaLimit 阶段判断
   const subscriptionData = await this.subscription.getSubscriptionData();
-  // ...
+  const tenantUsageQuery = new TenantUsageQuery(...);
+
+  // ✅ 按 key 类型分支检查
+  if (isSystemUsageKey(key)) {
+    await this.assertSystemLimit(...);
+  }
+
+  if (isQuotaUsageKey(key)) {
+    await this.assertQuotaLimit(...);
+  }
 };
 ```
 
@@ -159,57 +169,77 @@ guardTenantUsageByKey = async (key, options) => {
 1. **非 Cloud 环境**：`!isCloud` - 开源部署无配额限制
 2. **Admin 租户**：`tenantId === adminTenantId` - 管理后台不受限
 
-> ⚠️ **重要事实**：Add-on 资源的豁免判断发生在 `assertQuotaLimit` 阶段（见 5.4 节），而非 guard 入口。
+> ⚠️ **重要事实**：Add-on 资源的豁免判断**不在入口处**，也不在 SystemLimit 阶段，**仅在 assertQuotaLimit 阶段**判断（见 5.4 节）。
 
 ## 三、生效范围：哪些资源被管控？
 
 ### 3.1 配额类型体系
 
 ```
-UsageKey (所有需要检查的键)
-├── SystemUsageKey (系统级硬限制，优先级更高)
-│   ├── applicationsLimit
-│   ├── thirdPartyApplicationsLimit
-│   ├── machineToMachineLimit
-│   ├── resourcesLimit
-│   ├── scopesPerResourceLimit
-│   ├── scopesPerRoleLimit
-│   ├── socialConnectorsLimit
-│   ├── userRolesLimit
-│   ├── machineToMachineRolesLimit
-│   ├── hooksLimit
-│   ├── enterpriseSsoLimit
-│   ├── organizationsLimit
-│   ├── samlApplicationsLimit
-│   ├── customDomainsLimit
-│   ├── usersPerOrganizationLimit           # 系统限制独有
-│   ├── organizationUserRolesLimit         # 系统限制独有
-│   ├── organizationMachineToMachineRolesLimit  # 系统限制独有
-│   └── organizationScopesLimit            # 系统限制独有
+UsageKey (所有需要检查的键，QuotaUsageKey | SystemUsageKey)
+├── SystemUsageKey (系统级硬限制)
+│   ├── SharedUsageKey (与 QuotaUsageKey 交集，14 个)
+│   │   ├── applicationsLimit
+│   │   ├── thirdPartyApplicationsLimit
+│   │   ├── machineToMachineLimit
+│   │   ├── resourcesLimit
+│   │   ├── scopesPerResourceLimit
+│   │   ├── scopesPerRoleLimit
+│   │   ├── socialConnectorsLimit
+│   │   ├── userRolesLimit
+│   │   ├── machineToMachineRolesLimit
+│   │   ├── hooksLimit
+│   │   ├── enterpriseSsoLimit
+│   │   ├── organizationsLimit
+│   │   ├── samlApplicationsLimit
+│   │   └── customDomainsLimit
+│   └── System-only 扩展 (4 个，仅 SystemLimit 检查)
+│       ├── usersPerOrganizationLimit
+│       ├── organizationUserRolesLimit
+│       ├── organizationMachineToMachineRolesLimit
+│       └── organizationScopesLimit
 │
 └── QuotaUsageKey (订阅计划配额)
-    ├── 数值型配额（同 SystemUsageKey 重叠部分）
-    └── 布尔型配额（功能开关）
-        ├── mfaEnabled
-        ├── customJwtEnabled
-        ├── subjectTokenEnabled
-        ├── bringYourUiEnabled
-        ├── collectUserProfileEnabled
-        ├── passkeySignInEnabled
-        ├── securityFeaturesEnabled
-        └── idpInitiatedSsoEnabled
+    ├── SharedUsageKey (与 SystemUsageKey 交集，14 个，数值配额)
+    └── Quota-only 扩展 (9 个，仅 QuotaLimit 检查)
+        ├── 布尔配额 (功能开关)
+        │   ├── customJwtEnabled
+        │   ├── subjectTokenEnabled
+        │   ├── bringYourUiEnabled
+        │   ├── collectUserProfileEnabled
+        │   ├── passkeySignInEnabled
+        │   ├── mfaEnabled
+        │   ├── securityFeaturesEnabled
+        │   └── idpInitiatedSsoEnabled
+        └── 数值配额
+            └── tenantMembersLimit (仅 Quota，不在 SystemLimit 中)
 ```
 
-### 3.2 检查优先级
+### 3.2 Key 类型分支检查
 
-**核心纠正**：SystemLimit 和 QuotaLimit 是**顺序执行**的两层校验，而非互斥关系。
+**核心纠正**：SystemLimit 并**不是始终执行**，而是按 key 类型分支：
 
-1. **先检查 SystemLimit**（系统硬限制）- `quota.ts:172-179`
-   - 即使是 Add-on 资源，SystemLimit 也始终生效
-2. **再检查 QuotaLimit**（订阅配额）- `quota.ts:182-190`
-   - Add-on 资源在 Pro/Enterprise 下会跳过 QuotaLimit 检查
+```typescript
+// quota.ts:172-190
+if (isSystemUsageKey(key)) {
+  await this.assertSystemLimit(...);  // ✅ 仅当 key 属于 SystemUsageKey 时才进入
+}
 
-同一键可能同时存在于两者中，系统限制优先级更高。
+if (isQuotaUsageKey(key)) {
+  await this.assertQuotaLimit(...);   // ✅ 仅当 key 属于 QuotaUsageKey 时才进入
+}
+```
+
+**各类型 Key 的检查路径**：
+
+| Key 类型 | 示例 | SystemLimit | QuotaLimit |
+|---------|------|-------------|------------|
+| **仅 SystemUsageKey** | `usersPerOrganizationLimit` | ✅ 检查 | ❌ 不检查 |
+| **仅 QuotaUsageKey（布尔）** | `subjectTokenEnabled`, `bringYourUiEnabled` | ❌ 不检查 | ✅ 检查 |
+| **仅 QuotaUsageKey（数值）** | `tenantMembersLimit` | ❌ 不检查 | ✅ 检查 |
+| **SharedUsageKey** | `applicationsLimit`, `hooksLimit` | ✅ 检查 | ✅ 检查 |
+
+> ✅ **关键事实**：布尔配额 key（如 `subjectTokenEnabled`）**不会进入** SystemLimit 检查链路，因为它们**不属于** `SystemUsageKey`。
 
 ### 3.3 基于实体 vs 租户级
 
@@ -220,23 +250,84 @@ UsageKey (所有需要检查的键)
 
 ## 四、校验逻辑详解
 
-### 4.1 数值型配额校验（NumericQuotaUsageKey）
+### 4.1 按 Key 类别划分的检查路径对照表
+
+| Key 类别 | SystemLimit 检查 | QuotaLimit 检查 | 用量查询 | 校验逻辑 |
+|---------|-----------------|----------------|---------|---------|
+| **仅 System 的数值配额** | ✅ 检查数值 | ❌ 跳过 | SQL | `usage + consume <= systemLimit` |
+| **仅 Quota 的布尔配额** | ❌ 跳过 | ✅ 检查布尔值 | 无 | `quota[key] === true` |
+| **仅 Quota 的数值配额** | ❌ 跳过 | ✅ 检查数值 | SQL | `usage + consume <= quotaLimit` |
+| **Shared 数值配额（Free）** | ✅ 检查数值 | ✅ 检查数值 | SQL | 两层检查都执行 |
+| **Shared 数值配额（Pro/Ent）** | ✅ 检查数值 | ✅ 但 Add-on 豁免 | SQL | 仅 SystemLimit 生效 |
+
+### 4.2 SystemLimit 检查逻辑（仅数值配额）
 
 ```typescript
-// quota.ts:312-333
-const usage = await tenantUsageQuery.get(key, entityId);
-assertThat(
-  usage + consumeUsageCount <= limit,  // 核心公式：当前用量 + 本次消耗 <= 限制
-  new RequestError({ code: 'subscription.limit_exceeded', status: 403 })
-);
+// quota.ts:230-263
+private readonly assertSystemLimit = async ({ key, entityId, ... }) => {
+  const { systemLimit } = subscriptionData;
+  const limit = systemLimit[key];
+
+  if (limit === undefined) {
+    return;  // 未设置系统限制，跳过
+  }
+
+  // ✅ 所有 SystemUsageKey 都是数值类型，统一查询用量
+  const usage = await tenantUsageQuery.get(key, entityId);
+
+  assertThat(
+    usage + consumeUsageCount <= limit,
+    new RequestError({ code: 'system_limit.limit_exceeded', status: 403 })
+  );
+};
 ```
 
-**校验公式**：`当前使用量 + 本次消耗数量 <= 配额限制`
+> ✅ **事实**：SystemLimit **只处理数值配额**，布尔配额不会进入此阶段。
+
+### 4.3 QuotaLimit 检查逻辑
+
+```typescript
+// quota.ts:265-334
+private readonly assertQuotaLimit = async ({ key, entityId, ... }) => {
+  const { planId, isEnterprisePlan, quota } = subscriptionData;
+
+  // 1. Add-on 豁免：Pro/Enterprise 下跳过数值配额检查
+  if (this.shouldReportSubscriptionUpdates(planId, isEnterprisePlan, key)) {
+    return;
+  }
+
+  const { [key]: limit } = quota;
+
+  if (limit === null) {
+    return;  // 无限额，跳过
+  }
+
+  // 2. 布尔配额：直接判断
+  if (isBooleanQuotaUsageKey(key)) {
+    assertThat(
+      limit === true,  // true=允许，false=禁止
+      new RequestError({ code: 'subscription.limit_exceeded', status: 403 })
+    );
+    return;  // ✅ 直接返回，不查询用量
+  }
+
+  // 3. 数值配额：查询用量
+  if (isNumericQuotaUsageKey(key)) {
+    const usage = await tenantUsageQuery.get(key, entityId);
+    assertThat(
+      usage + consumeUsageCount <= limit,
+      new RequestError({ code: 'subscription.limit_exceeded', status: 403 })
+    );
+  }
+};
+```
+
+**校验公式（数值配额）**：`当前使用量 + 本次消耗数量 <= 配额限制`
 
 - `consumeUsageCount` 默认为 1
 - 批量操作时需手动传入（如一次性给角色分配 5 个 scope）
 
-### 4.2 用量查询路径统一说明
+### 4.4 用量查询路径统一说明
 
 **核心纠正**：并非所有配额键都走 SQL 查询。根据配额类型和检查阶段，查询路径分为三类：
 
@@ -295,12 +386,12 @@ export type SelfComputedUsageKey = Exclude<NumericUsageKey, 'socialConnectorsLim
 
 > ✅ **代码证据**：类型定义明确排除了 `socialConnectorsLimit`，说明它不通过数据库自计算。
 
-### 4.3 错误码区分
+### 4.5 错误码区分
 
 | 错误码 | 场景 |
 |--------|------|
-| `system_limit.limit_exceeded` | 超出系统硬限制 |
-| `subscription.limit_exceeded` | 超出订阅计划配额 |
+| `system_limit.limit_exceeded` | 超出系统硬限制（仅数值配额） |
+| `subscription.limit_exceeded` | 超出订阅计划配额（数值或布尔配额） |
 
 ## 五、与计费数据的对接方式
 
@@ -385,16 +476,16 @@ private get selfComputedUsageQueryRegistery(): UsageQueryRegistery {
 
 ### 5.4 Add-on 资源：SystemLimit 与 QuotaLimit 的约束关系
 
-**核心纠正**：Add-on 豁免**仅在 assertQuotaLimit 阶段判断**，SystemLimit 始终生效。
+**核心纠正**：Add-on 豁免**仅在 assertQuotaLimit 阶段判断**，SystemLimit 仅对属于 SystemUsageKey 的 key 生效。
 
 ```typescript
 // quota.ts:172-190
 if (isSystemUsageKey(key)) {
-  await this.assertSystemLimit(...);  // 1. 先检查 SystemLimit，始终执行，无豁免
+  await this.assertSystemLimit(...);  // 1. 仅当 key 属于 SystemUsageKey 时才检查
 }
 
 if (isQuotaUsageKey(key)) {
-  await this.assertQuotaLimit(...);   // 2. 再检查 QuotaLimit
+  await this.assertQuotaLimit(...);   // 2. 仅当 key 属于 QuotaUsageKey 时才检查
 }
 
 // quota.ts:278-294
@@ -409,16 +500,32 @@ private readonly assertQuotaLimit = async ({ key, ... }) => {
 };
 ```
 
-**执行顺序**：
+**执行顺序（以 SharedUsageKey 为例）**：
 ```
-请求 → guardTenantUsageByKey(key)
+请求 → guardTenantUsageByKey('hooksLimit')
      ↓（入口仅检查 !isCloud 和 adminTenant）
-  1. assertSystemLimit(key) → 始终执行，不豁免
+  1. isSystemUsageKey('hooksLimit') = true
+     → assertSystemLimit('hooksLimit') → 检查系统硬限制
      ↓（通过）
-  2. assertQuotaLimit(key)
+  2. isQuotaUsageKey('hooksLimit') = true
+     → assertQuotaLimit('hooksLimit')
+        ↓
+        ├─ 是 Add-on 且是 Pro/Enterprise → return，跳过 QuotaLimit
+        └─ 否则 → 执行配额校验
+```
+
+**执行顺序（以布尔配额为例）**：
+```
+请求 → guardTenantUsageByKey('subjectTokenEnabled')
+     ↓（入口仅检查 !isCloud 和 adminTenant）
+  1. isSystemUsageKey('subjectTokenEnabled') = false
+     → ❌ 跳过 SystemLimit 检查
      ↓
-     ├─ 是 Add-on 且是 Pro/Enterprise → return，不拦截
-     └─ 否则 → 执行配额校验
+  2. isQuotaUsageKey('subjectTokenEnabled') = true
+     → assertQuotaLimit('subjectTokenEnabled')
+        ↓
+        ├─ isBooleanQuotaUsageKey = true
+        └─ 直接判断 quota['subjectTokenEnabled'] === true
 ```
 
 **Add-on 资源列表**（来自 `allReportSubscriptionUpdatesUsageKeys`）：
@@ -659,7 +766,7 @@ const cleanupDomains = async (staleDays: number): Promise<DomainCleanupSummary> 
 
 ## 七、典型场景分析
 
-### 场景 1：创建应用（显式调用方式）
+### 场景 1：创建应用（显式调用方式，SharedUsageKey）
 
 ```typescript
 // routes/applications/application.ts:222-227
@@ -671,40 +778,87 @@ await Promise.all([
 ]);
 ```
 
-**检查项**：
-1. 总应用数不超限
-2. 若是 M2M 应用，M2M 应用数不超限
-3. 若是第三方应用，第三方应用数不超限
+**执行链路**：
+```
+请求 → guardTenantUsageByKey('applicationsLimit')
+     ↓（入口检查：isCloud=true, 非 admin）
+  1. isSystemUsageKey('applicationsLimit') = true
+     → assertSystemLimit → SQL 查询当前应用数 → 检查 <= systemLimit
+     ↓（通过）
+  2. isQuotaUsageKey('applicationsLimit') = true
+     → assertQuotaLimit
+        ↓
+        ├─ Free 计划 → SQL 查询 → 检查 <= quotaLimit
+        └─ Pro/Ent 计划 → 是 Add-on → return，跳过
+```
 
-### 场景 2：给角色分配 Scope（基于实体 + 批量）
+### 场景 2：启用 Subject Token（布尔配额，仅 Quota）
+
+```typescript
+// routes/subject-token.ts:28
+router.post('/subject-tokens',
+  koaQuotaGuard({ key: 'subjectTokenEnabled', quota }),
+  // ...
+);
+```
+
+**执行链路**：
+```
+请求 → guardTenantUsageByKey('subjectTokenEnabled')
+     ↓（入口检查：isCloud=true, 非 admin）
+  1. isSystemUsageKey('subjectTokenEnabled') = false
+     → ❌ 跳过 SystemLimit
+     ↓
+  2. isQuotaUsageKey('subjectTokenEnabled') = true
+     → assertQuotaLimit
+        ↓
+        ├─ isBooleanQuotaUsageKey = true
+        └─ 直接判断 quota['subjectTokenEnabled'] === true
+```
+
+### 场景 3：给角色分配 Scope（基于实体 + 批量，SharedUsageKey）
 
 ```typescript
 // routes/role.scope.ts:96-99
 await quota.guardTenantUsageByKey('scopesPerRoleLimit', {
-  entityId: id,                // 角色 ID
-  consumeUsageCount: scopeIds.length,  // 本次分配的数量
+  entityId: roleId,
+  consumeUsageCount: scopeIds.length,
 });
 ```
 
-**检查公式**：`该角色已有的 scope 数 + 本次分配数 <= scopesPerRoleLimit`
+**执行链路**：
+```
+请求 → guardTenantUsageByKey('scopesPerRoleLimit', { entityId, consumeUsageCount })
+     ↓（入口检查：isCloud=true, 非 admin）
+  1. isSystemUsageKey('scopesPerRoleLimit') = true
+     → assertSystemLimit → SQL 查询该角色当前 scope 数 → 检查 + consume <= systemLimit
+     ↓（通过）
+  2. isQuotaUsageKey('scopesPerRoleLimit') = true
+     → assertQuotaLimit
+        ↓
+        ├─ Free 计划 → SQL 查询 → 检查 + consume <= quotaLimit
+        └─ Pro/Ent 计划 → 非 Add-on → 同样检查
+```
 
-### 场景 3：Pro 计划下创建 Hook（Add-on 资源）
+### 场景 4：Pro 计划下创建 Hook（Add-on 资源，SharedUsageKey）
 
 ```
 请求 → guardTenantUsageByKey('hooksLimit')
-     ↓（入口仅检查 !isCloud 和 adminTenant）
-  1. assertSystemLimit('hooksLimit') → 检查系统硬限制（始终执行）
+     ↓（入口检查：isCloud=true, 非 admin）
+  1. isSystemUsageKey('hooksLimit') = true
+     → assertSystemLimit('hooksLimit') → 检查系统硬限制（始终执行）
      ↓（通过）
-  2. assertQuotaLimit('hooksLimit')
-     ↓
-     ├─ isReportablePlan(Pro) = true
-     ├─ isReportSubscriptionUpdatesUsageKey('hooksLimit') = true
-     └─ return → 跳过 QuotaLimit 检查
+  2. isQuotaUsageKey('hooksLimit') = true
+     → assertQuotaLimit('hooksLimit')
+        ↓
+        ├─ isReportablePlan(Pro) = true
+        ├─ isReportSubscriptionUpdatesUsageKey('hooksLimit') = true
+        └─ return → 跳过 QuotaLimit 检查
      ↓
   操作成功 → koaReportSubscriptionUpdates → void + trySafe 异步上报
 ```
 
-### 场景 4：非私有区域创建 Custom Domain（手动上报）
+### 场景 5：非私有区域创建 Custom Domain（手动上报）
 
 ```
 请求 → POST /domains
@@ -720,7 +874,7 @@ await quota.guardTenantUsageByKey('scopesPerRoleLimit', {
   返回 201 响应
 ```
 
-### 场景 5：Cleanup 批量删除过期域名（无上报）
+### 场景 6：Cleanup 批量删除过期域名（无上报）
 
 ```
 请求 → POST /domains/cleanup
@@ -736,9 +890,9 @@ await quota.guardTenantUsageByKey('scopesPerRoleLimit', {
 
 | 文件 | 职责 |
 |------|------|
-| `packages/core/src/libraries/quota.ts` | 配额守卫核心逻辑 |
+| `packages/core/src/libraries/quota.ts` | 配额守卫核心逻辑（guardTenantUsageByKey 分支判断、assertSystemLimit、assertQuotaLimit） |
 | `packages/core/src/middleware/koa-quota-guard.ts` | Koa 中间件包装 |
-| `packages/core/src/queries/tenant-usage/types.ts` | 配额类型定义（含 SelfComputedUsageKey 排除 socialConnectorsLimit） |
+| `packages/core/src/queries/tenant-usage/types.ts` | 配额类型定义（isSystemUsageKey、isQuotaUsageKey、isBooleanQuotaUsageKey、SelfComputedUsageKey） |
 | `packages/core/src/queries/tenant-usage/index.ts` | 使用量 SQL 查询 |
 | `packages/core/src/libraries/subscription.ts` | 订阅数据获取与缓存 |
 | `packages/core/src/utils/subscription/types.ts` | 订阅数据结构定义 |
