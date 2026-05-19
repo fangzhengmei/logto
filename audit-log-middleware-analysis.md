@@ -377,7 +377,7 @@ export const getInjectedHeaderValues = (headers: IncomingHttpHeaders) => {
 | Experience 路由 | `interactionDetails.params.client_id` | `prependAllLogEntries({ applicationId })` | `koa-experience-audit-log.ts:19` |
 | OIDC 事件 | `ctx.oidc.entities.Client?.clientId` | `log.append(extractInteractionContext(ctx))` | `event-listeners/utils.ts:16` |
 | SAML 路由 | 路由参数 `:id` | `log.append({ applicationId: id })` | `saml-application/anonymous.ts:133` |
-| Authn SAML | 业务逻辑 | `log.append({ connectorId, ... })` | `authn.ts:242` |
+| Authn SAML | **无** | **不记录 applicationId** | -（仅记录 connectorId、ssoSessionId、assertionContent，不写 applicationId） |
 
 **Experience 路由的 applicationId 注入时机**：
 ```typescript
@@ -429,7 +429,30 @@ export const extractInteractionContext = (ctx): LogPayload => {
 };
 ```
 
-### 5.7 完整字段合并顺序
+### 5.7 userInfo 字段链路
+
+**来源**：
+```typescript
+// saml-application/anonymous.ts:162-167
+const userInfo = await samlApplication.handleOidcCallbackAndGetUserInfo({
+  code,
+});
+log.append({
+  userInfo,
+});
+```
+
+**记录时机**：SAML Callback 业务处理中
+**记录方式**：append（自动脱敏）
+**入库时机**：finally 块中插入数据库
+
+**说明**：
+- `userInfo` 是 SAML 应用回调时从 OIDC 获取的完整用户信息对象
+- 通常包含 `sub`（用户 ID）、`name`、`email`、`picture` 等字段
+- **与 userId 字段的区别**：userId 是独立的字符串字段，userInfo 是完整的用户信息对象
+- 仅在 `SamlApplication.Callback` 日志中记录
+
+### 5.8 完整字段合并顺序
 
 ```
 初始 payload (createLog 时):
