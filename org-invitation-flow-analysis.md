@@ -145,9 +145,233 @@ Click {{link}} to join the organization.
 - `organization`: 组织信息（ID、名称、品牌信息等）
 - `inviter`: 邀请人信息（ID、名称、头像等）
 
-## 三、被邀请人接受时的身份校验
+## 三、邀请链接点击后的前端受理链路
 
-### 3.1 入口 API
+### 3.1 路由配置与 invitationId 读取
+
+**文件位置**: `packages/console/src/cloud/AppRoutes.tsx:41-44`
+
+```typescript
+<Route element={<ProtectedRoutes />}>
+  <Route
+    path={`${GlobalRoute.AcceptInvitation}/:invitationId`}
+    element={<AcceptInvitation />}
+  />
+  ...
+</Route>
+```
+
+**路由路径**: `/accept/:invitationId`
+
+**读取 invitationId**: `packages/console/src/pages/AcceptInvitation/index.tsx:23`
+```typescript
+const { invitationId = '' } = useParams();
+```
+
+### 3.2 AcceptInvitation 页面处理流程
+
+**文件位置**: `packages/console/src/pages/AcceptInvitation/index.tsx:19-74`
+
+#### 3.2.1 邀请信息查询与权限校验
+
+页面加载后自动发起邀请查询请求，由 SWR 管理请求状态：
+
+```typescript
+const { data: invitation, error } = useSWR<InvitationResponse, RequestError>(
+  invitationId && `/api/invitations/${invitationId}`,
+  async () => cloudApi.get('/api/invitations/:invitationId', { params: { invitationId } })
+);
+```
+
+**云端 API 校验逻辑**:
+- 只有当前登录用户的邮箱与邀请的 `invitee` 邮箱匹配时，才返回邀请数据
+- 如果邮箱不匹配，返回 **403 Forbidden** 错误
+
+#### 3.2.2 403 错误处理与切换账号分支
+
+**文件位置**: `packages/console/src/pages/AcceptInvitation/index.tsx:54-63`
+
+```typescript
+if (error?.status === 403) {
+  return (
+    <SwitchAccount
+      onClickSwitch={() => {
+        saveRedirect();
+        void signIn(redirectUri.href);
+      }}
+    />
+  );
+}
+```
+
+**SwitchAccount 组件** (`packages/console/src/pages/AcceptInvitation/SwitchAccount/index.tsx`):
+- 显示当前登录用户的邮箱
+- 提示邮箱不匹配，需要切换账号
+- 点击"切换账号"按钮后：
+  1. `saveRedirect()` 保存当前页面 URL 以便登录后跳转回来
+  2. 调用 `signIn(redirectUri.href)` 触发重新登录流程
+
+#### 3.2.3 其他错误处理
+
+```typescript
+// 邀请不存在
+if (error?.status === 404) {
+  return <AppError errorMessage={t('invitation.invitation_not_found')} />;
+}
+
+// 邀请状态不是 Pending
+if (invitation && invitation.status !== OrganizationInvitationStatus.Pending) {
+  return <AppError errorMessage={t('invitation.invalid_invitation_status')} />;
+}
+```
+
+#### 3.2.4 自动接受邀请与租户切换
+
+当邀请查询成功且状态有效时，`useEffect` 自动执行接受流程：
+
+**文件位置**: `packages/console/src/pages/AcceptInvitation/index.tsx:34-51`
+
+```typescript
+useEffect(() => {
+  if (!invitation) {
+    return;
+  }
+  (async () => {
+    const { id, organizationId } = invitation;
+
+    // 1. 调用云端 API 接受邀请
+    await cloudApi.patch(`/api/invitations/:invitationId/status`, {
+      params: { invitationId: id },
+      body: { status: OrganizationInvitationStatus.Accepted },
+    });
+
+    // 2. 刷新租户列表（新加入的租户会出现在列表中）
+    const data = await cloudApi.get('/api/tenants');
+    resetTenants(data);
+
+    // 3. 从组织 ID 提取租户 ID 并跳转
+    navigateTenant(getTenantIdFromOrganizationId(organizationId));
+  })();
+}, [cloudApi, error, invitation, navigateTenant, resetTenants, t]);
+```
+
+**租户 ID 提取逻辑** (`packages/schemas/src/types/tenant-organization.ts:22-28`):
+```typescript
+export const getTenantIdFromOrganizationId = (organizationId: string) => {
+  if (!organizationId.startsWith('t-')) {
+    throw new Error(`Invalid admin tenant organization ID: ${organizationId}`);
+  }
+  return organizationId.slice(2);
+};
+```
+
+### 3.3 其他接受邀请的入口
+
+除了 AcceptInvitation 页面，还有两个地方可以接受邀请：
+
+#### 3.3.1 租户选择器下拉项
+
+**文件位置**: `packages/console/src/components/Topbar/TenantSelector/TenantInvitationDropdownItem/index.tsx:39-47`
+
+```typescript
+onClick={async () => {
+  await cloudApi.patch(`/api/invitations/:invitationId/status`, {
+    params: { invitationId: id },
+    body: { status: OrganizationInvitationStatus.Accepted },
+  });
+  const data = await cloudApi.get('/api/tenants');
+  resetTenants(data);
+  navigateTenant(getTenantIdFromOrganizationId(organizationId));
+}}
+```
+
+#### 3.3.2 邀请列表页面
+
+**文件位置**: `packages/console/src/cloud/pages/Main/InvitationList/index.tsx:47-60`
+
+```typescript
+onClick={async () => {
+  setIsJoining(true);
+  try {
+    await cloudApi.patch(`/api/invitations/:invitationId/status`, {
+      params: { invitationId: id },
+      body: { status: OrganizationInvitationStatus.Accepted },
+    });
+    const data = await cloudApi.get('/api/tenants');
+    resetTenants(data);
+    navigateTenant(getTenantIdFromOrganizationId(organizationId));
+  } finally {
+    setIsJoining(false);
+  }
+}}
+```
+
+## 四、云端 API 与 Core 层的衔接
+
+### 4.1 前端 → 云端 → Core 的调用链路
+
+```
+前端 Console
+    ↓
+GET /api/invitations/:invitationId (云端 API)
+    ↓
+[云端校验: 当前用户邮箱 == 邀请 invitee 邮箱]
+    ↓
+不匹配 → 返回 403
+匹配 → 返回邀请数据
+    ↓
+前端自动调用:
+PATCH /api/invitations/:invitationId/status (云端 API)
+    ↓
+[云端从认证上下文获取当前用户 ID]
+    ↓
+PUT /api/organization-invitations/:id/status (Core API)
+    body: { status: 'Accepted', acceptedUserId: '<云端注入的用户ID>' }
+```
+
+### 4.2 acceptedUserId 的注入机制
+
+**关键要点**:
+- 前端调用 PATCH 接口时 **不传递** `acceptedUserId` 参数
+- 云端 API 从当前登录用户的认证上下文中自动提取用户 ID
+- 云端调用 Core 层 API 时，将用户 ID 作为 `acceptedUserId` 注入请求体
+
+**Core 层接收** (`packages/core/src/routes/organization-invitation/index.ts:144-161`):
+```typescript
+const { status, acceptedUserId } = ctx.guard.body;
+
+if (status === OrganizationInvitationStatus.Accepted) {
+  assertThat(acceptedUserId, ...); // 确保 acceptedUserId 存在
+  const result = await organizationInvitations.updateStatus(id, status, acceptedUserId);
+  ctx.body = result;
+}
+```
+
+### 4.3 邮箱校验的双重保障
+
+**第一层校验（云端 API）**:
+- 查询邀请时校验：当前用户邮箱必须等于邀请的 `invitee` 邮箱
+- 不匹配则返回 403，前端显示切换账号页面
+
+**第二层校验（Core 层）** (`packages/core/src/libraries/organization-invitation.ts:182-188`):
+```typescript
+const user = await userQueries.findUserById(acceptedUserId);
+if (user.primaryEmail?.toLowerCase() !== entity.invitee.toLowerCase()) {
+  throw new RequestError({
+    status: 422,
+    code: 'request.invalid_input',
+    details: 'The accepted user must have the same email as the invitee.',
+  });
+}
+```
+
+**设计意图**:
+- 云端校验提供友好的用户体验（提前发现问题并引导切换账号）
+- Core 层校验作为安全底线，确保数据一致性和安全性
+
+## 五、被邀请人接受时的身份校验
+
+### 5.1 入口 API
 
 **文件位置**: `packages/core/src/routes/organization-invitation/index.ts:123-171`
 
@@ -166,7 +390,7 @@ router.put('/:id/status', koaGuard({...}), async (ctx) => {
 });
 ```
 
-### 3.2 接受邀请的校验流程
+### 5.2 接受邀请的校验流程
 
 **文件位置**: `packages/core/src/libraries/organization-invitation.ts:148-223`
 
@@ -196,15 +420,15 @@ router.put('/:id/status', koaGuard({...}), async (ctx) => {
    }
    ```
 
-### 3.3 事务保障
+### 5.3 事务保障
 
 所有校验和后续操作都在同一个数据库事务中执行，确保原子性：
 - 校验失败 → 事务回滚，邀请状态不变
 - 校验通过 → 执行成员关系创建和角色分配
 
-## 四、加入后的角色与权限赋予
+## 六、加入后的角色与权限赋予
 
-### 4.1 组织成员关系创建
+### 6.1 组织成员关系创建
 
 **文件位置**: `packages/core/src/libraries/organization-invitation.ts:190-193`
 
@@ -219,7 +443,7 @@ await organizationQueries.relations.users.insert({
 - 建立用户与组织的基本成员关系
 - 无角色的用户仅拥有最基本的组织访问权限
 
-### 4.2 角色权限分配
+### 6.2 角色权限分配
 
 **文件位置**: `packages/core/src/libraries/organization-invitation.ts:195-203`
 
@@ -239,7 +463,7 @@ if (entity.organizationRoles.length > 0) {
 - 从邀请的角色关系中复制角色
 - 每个角色创建一条用户-角色关联记录
 
-### 4.3 邀请状态更新
+### 6.3 邀请状态更新
 
 **文件位置**: `packages/core/src/libraries/organization-invitation.ts:214-219`
 
@@ -252,13 +476,13 @@ const updated = {
 await organizationQueries.invitations.updateById(id, updated);
 ```
 
-### 4.4 数据 Hook 触发
+### 6.4 数据 Hook 触发
 
 接受成功后触发 `Organization.Membership.Updated` 数据钩子，用于通知外部系统成员关系变更。
 
-## 五、状态流转详解
+## 七、状态流转详解
 
-### 5.1 状态流转图
+### 7.1 状态流转图
 
 ```
 Pending (待接受)
@@ -273,7 +497,7 @@ Pending (待接受)
            └─ 创建 organization_role_user_relations 记录
 ```
 
-### 5.2 状态查询的特殊处理
+### 7.2 状态查询的特殊处理
 
 **文件位置**: `packages/core/src/queries/organization/index.ts:209-215`
 
@@ -282,7 +506,7 @@ Pending (待接受)
 - 如果 `expires_at < now()`，返回时自动标记为 `Expired`
 - 这种设计避免了后台定时任务轮询更新过期状态
 
-### 5.3 过期状态的实际更新
+### 7.3 过期状态的实际更新
 
 虽然查询时动态计算过期，但在以下场景会实际更新数据库中的状态：
 - 创建新邀请时，清理该用户在该组织下的过期邀请
@@ -291,7 +515,7 @@ Pending (待接受)
   await organizationQueries.invitations.updateExpiredEntities({ invitee, organizationId });
   ```
 
-## 六、核心数据落库点汇总
+## 八、核心数据落库点汇总
 
 | 阶段 | 操作 | 表 | 关键代码位置 |
 |------|------|-----|------------|
@@ -303,30 +527,30 @@ Pending (待接受)
 | **接受邀请** | 更新邀请状态为Accepted | `organization_invitations` | `organization-invitation.ts:214-219` |
 | **撤销邀请** | 更新邀请状态为Revoked | `organization_invitations` | `organization-invitation.ts:206-208` |
 
-## 七、关键设计特点
+## 九、关键设计特点
 
-### 7.1 事务一致性
+### 9.1 事务一致性
 所有状态变更和数据写入都在数据库事务中执行，确保：
 - 邮件发送失败时，邀请记录回滚
 - 接受邀请时，校验、成员创建、角色分配原子完成
 
-### 7.2 动态过期计算
+### 9.2 动态过期计算
 通过查询时动态计算过期状态，避免了：
 - 后台定时任务的复杂性
 - 数据库状态与实际状态的不一致窗口
 
-### 7.3 角色关系解耦
+### 9.3 角色关系解耦
 邀请的角色信息独立存储在关系表中：
 - 支持多角色分配
 - 接受邀请时从关系表复制到用户角色表
 - 邀请记录保留完整的角色快照
 
-### 7.4 邮箱身份校验
+### 9.4 邮箱身份校验
 通过邮箱匹配确保：
 - 只有被邀请的邮箱对应的用户才能接受邀请
 - 防止恶意用户使用非邀请账号接受邀请
 
-## 八、代码引用速查
+## 十、代码引用速查
 
 | 模块 | 文件路径 |
 |------|---------|
@@ -339,3 +563,4 @@ Pending (待接受)
 | 角色关系表 | `packages/schemas/tables/organization_invitation_role_relations.sql` |
 | 类型定义 | `packages/schemas/src/types/organization.ts` |
 | 集成测试 | `packages/integration-tests/src/tests/api/organization/organization-invitation.*.test.ts` |
+
