@@ -369,23 +369,64 @@ PUT /api/organization-invitations/:id/status (Core API)
     body: { status: 'Accepted', acceptedUserId: '<云端注入的用户ID>' }
 ```
 
-### 4.2 acceptedUserId 的注入机制
+### 4.2 acceptedUserId 传递链：三层证据分类
 
-**关键要点**:
-- 前端调用 PATCH 接口时 **不传递** `acceptedUserId` 参数
-- 云端 API 从当前登录用户的认证上下文中自动提取用户 ID
-- 云端调用 Core 层 API 时，将用户 ID 作为 `acceptedUserId` 注入请求体
+#### 4.2.1 可证实事实（本仓代码可直接证明）
 
-**Core 层接收** (`packages/core/src/routes/organization-invitation/index.ts:144-161`):
+本仓库源码中可直接找到证据的环节：
+
+| 环节 | 证据来源 | 代码位置 | 证据内容 |
+|------|---------|---------|---------|
+| **前端不传递 acceptedUserId** | 可证实 | `packages/console/src/pages/AcceptInvitation/index.tsx:42-44` | `body: { status: OrganizationInvitationStatus.Accepted }` 中无 acceptedUserId |
+| **前端不传递 acceptedUserId** | 可证实 | `packages/console/src/components/Topbar/TenantSelector/TenantInvitationDropdownItem/index.tsx:40-42` | 同上，仅传递 status |
+| **前端不传递 acceptedUserId** | 可证实 | `packages/console/src/cloud/pages/Main/InvitationList/index.tsx:50-52` | 同上 |
+| **Core 层 PUT 接口强制要求 acceptedUserId** | 可证实 | `packages/core/src/routes/organization-invitation/index.ts:152-159` | `assertThat(acceptedUserId, ...)` 确保 acceptedUserId 必须存在 |
+| **Core 层方法签名要求 acceptedUserId** | 可证实 | `packages/core/src/libraries/organization-invitation.ts:148-152` | `updateStatus(id, status: Accepted, acceptedUserId: string)` |
+| **Core 层邮箱校验逻辑** | 可证实 | `packages/core/src/libraries/organization-invitation.ts:182-188` | `user.primaryEmail?.toLowerCase() !== entity.invitee.toLowerCase()` |
+| **Core 层缺失 acceptedUserId 报错** | 可证实 | `packages/core/src/libraries/organization-invitation.ts:176-177` | `if (!acceptedUserId) throw new TypeError(...)` |
+
+**Core 层接收处理** (`packages/core/src/routes/organization-invitation/index.ts:144-161`) - 可证实：
 ```typescript
 const { status, acceptedUserId } = ctx.guard.body;
 
 if (status === OrganizationInvitationStatus.Accepted) {
-  assertThat(acceptedUserId, ...); // 确保 acceptedUserId 存在
+  assertThat(
+    acceptedUserId,
+    new RequestError({
+      status: 422,
+      code: 'request.invalid_input',
+      details: 'The `acceptedUserId` is required when accepting an invitation.',
+    })
+  );
   const result = await organizationInvitations.updateStatus(id, status, acceptedUserId);
   ctx.body = result;
 }
 ```
+
+#### 4.2.2 合理推断（本仓无源码，但逻辑必然）
+
+由于 `@logto/cloud` 包源码不在本仓库，以下环节基于代码证据和架构设计进行推断，**不构成确定事实**：
+
+| 推断环节 | 推断依据 | 置信度 | 说明 |
+|---------|---------|--------|------|
+| **云端从认证上下文获取用户ID** | 前端所有请求都携带认证 Token，云端必须能够解析出当前用户ID | 高 | 这是所有 Web 应用的标准做法 |
+| **云端调用 Core 层时注入 acceptedUserId** | Core 层 PUT 接口强制要求 acceptedUserId，而前端 PATCH 请求未提供，只能由云端在中间层注入 | 高 | 接口契约决定了这一必然行为 |
+| **云端在 GET /api/invitations/:invitationId 时校验邮箱** | 前端收到 403 时邮箱不匹配，说明云端在查询时就进行了校验，而不仅仅是 Core 层 | 高 | HTTP 状态码 403 是权限校验的标准返回 |
+| **云端调用 Core 层 GET /organization-invitations/:id 获取 invitee** | 云端需要获取邀请的 invitee 邮箱才能进行校验，必然调用 Core 层接口 | 中 | 云端不直接访问数据库，必须通过 Core 层 API |
+| **云端缓存邀请校验结果** | 为避免重复调用 Core 层，云端可能缓存 GET 请求的结果 | 低 | 性能优化的常规做法，但非必须 |
+
+> **重要说明**：以上推断仅基于现有证据进行逻辑推导，真实实现需查看 `@logto/cloud` 源码确认。
+
+#### 4.2.3 待外部仓验证（需要 @logto/cloud 源码验证）
+
+以下结论**无法从本仓库证实**，仅能通过查看云端源码最终确认：
+
+| 待验证项 | 验证方式 | 当前状态 |
+|---------|---------|---------|
+| **云端 PATCH 接口的具体实现** | 查看 `@logto/cloud` 包中 `/api/invitations/:invitationId/status` 的 handler | 待验证 |
+| **云端 GET 接口的邮箱校验逻辑** | 查看 `@logto/cloud` 包中 `/api/invitations/:invitationId` 的 handler | 待验证 |
+| **云端调用 Core 层的认证方式** | 查看云端如何向 Core 层认证，是使用用户 Token 还是服务端凭证 | 待验证 |
+| **云端是否在 PATCH 时二次校验邮箱** | 查看云端在转发请求前是否再次校验邮箱与用户匹配 | 待验证 |
 
 ### 4.3 邮箱校验的双重保障
 
@@ -594,13 +635,21 @@ Pending (待接受)
 
 | 模块 | 文件路径 |
 |------|---------|
-| 邀请核心逻辑 | `packages/core/src/libraries/organization-invitation.ts` |
-| 邀请API路由 | `packages/core/src/routes/organization-invitation/index.ts` |
-| 邀请查询逻辑 | `packages/core/src/queries/organization/index.ts` |
-| 用户关系查询 | `packages/core/src/queries/organization/user-relations.ts` |
-| 用户角色关系 | `packages/core/src/queries/organization/user-role-relations.ts` |
-| 表结构定义 | `packages/schemas/tables/organization_invitations.sql` |
-| 角色关系表 | `packages/schemas/tables/organization_invitation_role_relations.sql` |
-| 类型定义 | `packages/schemas/src/types/organization.ts` |
-| 集成测试 | `packages/integration-tests/src/tests/api/organization/organization-invitation.*.test.ts` |
+| **Core 层 - 邀请核心逻辑** | `packages/core/src/libraries/organization-invitation.ts` |
+| **Core 层 - 邀请 API 路由** | `packages/core/src/routes/organization-invitation/index.ts` |
+| **Core 层 - 邀请查询逻辑** | `packages/core/src/queries/organization/index.ts` |
+| **Core 层 - 用户关系查询** | `packages/core/src/queries/organization/user-relations.ts` |
+| **Core 层 - 用户角色关系** | `packages/core/src/queries/organization/user-role-relations.ts` |
+| **Core 层 - findById 错误处理** | `packages/core/src/database/find-entity-by-id.ts` |
+| **表结构定义** | `packages/schemas/tables/organization_invitations.sql` |
+| **角色关系表** | `packages/schemas/tables/organization_invitation_role_relations.sql` |
+| **类型定义** | `packages/schemas/src/types/organization.ts` |
+| **租户-组织 ID 转换** | `packages/schemas/src/types/tenant-organization.ts` |
+| **前端 Console - 接受邀请页面** | `packages/console/src/pages/AcceptInvitation/index.tsx` |
+| **前端 Console - 切换账号组件** | `packages/console/src/pages/AcceptInvitation/SwitchAccount/index.tsx` |
+| **前端 Console - 租户选择器邀请项** | `packages/console/src/components/Topbar/TenantSelector/TenantInvitationDropdownItem/index.tsx` |
+| **前端 Console - 邀请列表页面** | `packages/console/src/cloud/pages/Main/InvitationList/index.tsx` |
+| **前端 Console - 路由配置** | `packages/console/src/cloud/AppRoutes.tsx` |
+| **前端 Console - 租户上下文** | `packages/console/src/contexts/TenantsProvider.tsx` |
+| **集成测试** | `packages/integration-tests/src/tests/api/organization/organization-invitation.*.test.ts` |
 
