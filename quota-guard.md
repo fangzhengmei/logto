@@ -9,15 +9,16 @@
 │                     业务路由层                           │
 │  - 显式调用 quota.guardTenantUsageByKey()              │
 │  - 或使用 koaQuotaGuard 中间件                           │
+│  - 特殊分支：custom domain 私有区域硬编码限制            │
 └────────────────────────────┬────────────────────────────┘
                              │
                              ▼
 ┌─────────────────────────────────────────────────────────┐
 │                   QuotaLibrary 核心层                   │
 │  - guardTenantUsageByKey: 统一校验入口                  │
-│  - assertSystemLimit: 系统限制校验                      │
-│  - assertQuotaLimit: 订阅配额校验                       │
-│  - reportSubscriptionUpdatesUsage: 用量上报             │
+│  - assertSystemLimit: 系统限制校验（优先级更高）          │
+│  - assertQuotaLimit: 订阅配额校验（add-on 可豁免）        │
+│  - reportSubscriptionUpdatesUsage: 用量上报（post-action）│
 └────────────────────────────┬────────────────────────────┘
                              │
           ┌──────────────────┴──────────────────┐
@@ -26,7 +27,8 @@
 │  订阅数据层          │             │  使用量查询层        │
 │  - Subscription     │             │  - TenantUsageQuery │
 │  - Redis 缓存       │             │  - SQL 实时查询      │
-│  - Cloud API 对接   │             │  - 内存缓存          │
+│  - Cloud API 对接   │             │  - Connector 库查询  │
+│  键: tenantId:subscription:#    │  - 内存缓存          │
 └─────────────────────┘             └─────────────────────┘
 ```
 
@@ -72,7 +74,7 @@ await quota.guardTenantUsageByKey('scopesPerRoleLimit', {
 
 1. **非 Cloud 环境**：`!isCloud` - 开源部署无配额限制
 2. **Admin 租户**：`tenantId === adminTenantId` - 管理后台不受限
-3. **Pro/Enterprise 计划的 Add-on 资源**：这些资源按需付费，不硬拦截
+3. **Pro/Enterprise 计划的 Add-on 资源**：这些资源按需付费，不硬拦截（但 SystemLimit 仍生效！详见 5.4 节）
 
 ## 三、生效范围：哪些资源被管控？
 
@@ -115,8 +117,12 @@ UsageKey (所有需要检查的键)
 
 ### 3.2 检查优先级
 
+**核心纠正**：SystemLimit 和 QuotaLimit 是**顺序执行**的两层校验，而非互斥关系。
+
 1. **先检查 SystemLimit**（系统硬限制）- `quota.ts:172-179`
+   - 即使是 Add-on 资源，SystemLimit 也始终生效
 2. **再检查 QuotaLimit**（订阅配额）- `quota.ts:182-190`
+   - Add-on 资源在 Pro/Enterprise 下会跳过 QuotaLimit 检查
 
 同一键可能同时存在于两者中，系统限制优先级更高。
 
@@ -155,9 +161,30 @@ assertThat(
 );
 ```
 
-布尔型配额是**功能开关**，不涉及用量统计，直接判断该功能在当前订阅计划中是否启用。
+**核心差异**：布尔型配额是**功能开关**，不涉及用量统计，直接判断该功能在当前订阅计划中是否启用。
 
-### 4.3 错误码区分
+| 特性 | 布尔型配额 | 数值型配额 | socialConnectorsLimit |
+|------|-----------|-----------|----------------------|
+| 查询路径 | 直接取 `quota[key]` | `tenantUsageQuery.get()` → SQL | `connectorLibrary.getLogtoConnectors()` |
+| 用量统计 | 无 | 实时统计 DB 数量 | 实时获取已配置连接器 |
+| 校验逻辑 | `limit === true` | `usage + consume <= limit` | `usage + consume <= limit` |
+
+### 4.3 socialConnectorsLimit 的特殊查询路径
+
+**核心纠正**：`socialConnectorsLimit` 不通过数据库查询，而是通过 ConnectorLibrary 实时获取。
+
+```typescript
+// quota.ts:371-379
+private readonly getTenantUsage: TenantUsageQueryFunction = async (key, entityId) => {
+  if (key === 'socialConnectorsLimit') {
+    const connectors = await this.connectorLibrary.getLogtoConnectors();
+    return connectors.filter((connector) => connector.type === ConnectorType.Social).length;
+  }
+  return this.queries.tenantUsage.getSelfComputedUsageByKey(this.tenantId, key, entityId);
+};
+```
+
+### 4.4 错误码区分
 
 | 错误码 | 场景 |
 |--------|------|
@@ -166,21 +193,30 @@ assertThat(
 
 ## 五、与计费数据的对接方式
 
-### 5.1 订阅数据来源
+### 5.1 订阅数据来源与缓存
+
+**核心纠正**：真实的 Redis 缓存键结构。
 
 ```typescript
-// libraries/subscription.ts:80-84
+// caches/base-cache.ts:176-178
+protected cacheKey(type: CacheKeyOf<CacheMapT>, key: string) {
+  return `${this.tenantId}:${type}:${key}`;
+}
+
+// 实际调用
 this.getSubscriptionData = this.subscriptionCache.memoize(
-  async () => getTenantSubscription(this.cloudConnection),  // 从 Cloud API 获取
-  [SubscriptionRedisCacheKey.Subscription],
-  ({ currentPeriodEnd }) => getSubscriptionCacheExpiration(currentPeriodEnd)
+  async () => getTenantSubscription(this.cloudConnection),
+  [SubscriptionRedisCacheKey.Subscription],  // type = 'subscription'
+  // 未提供 cacheKey 函数，使用 BaseCache.defaultKey = '#'
 );
 ```
+
+**真实缓存键**：`{tenantId}:subscription:#`
 
 **数据链路**：
 1. 调用 Cloud API `/api/tenants/my/subscription` 获取订阅数据
 2. 通过 Redis 缓存，过期时间 = 当前订阅周期结束时间（最长 24 小时）
-3. 缓存键：`tenant:{tenantId}:subscription`
+3. 缓存键示例：`tenant123:subscription:#`
 
 ### 5.2 订阅数据结构
 
@@ -234,9 +270,65 @@ private get selfComputedUsageQueryRegistery(): UsageQueryRegistery {
 
 每个配额键对应一个 SQL 查询函数，实时统计数据库中的实际使用量。
 
-### 5.4 用量上报（Add-on 资源）
+### 5.4 Add-on 资源：SystemLimit 与 QuotaLimit 的约束关系
 
-对于 Pro/Enterprise 计划的 Add-on 资源（如 organizationsLimit, hooksLimit），不硬拦截，而是**上报使用量**：
+**核心纠正**：Add-on 豁免**仅针对 QuotaLimit**，SystemLimit 始终生效。
+
+```typescript
+// quota.ts:172-190
+if (isSystemUsageKey(key)) {
+  await this.assertSystemLimit(...);  // 1. 先检查 SystemLimit，始终执行
+}
+
+if (isQuotaUsageKey(key)) {
+  await this.assertQuotaLimit(...);   // 2. 再检查 QuotaLimit
+}
+
+// quota.ts:280-283
+private readonly assertQuotaLimit = async ({ key, ... }) => {
+  // 仅在 QuotaLimit 检查中豁免 Add-on 资源
+  if (this.shouldReportSubscriptionUpdates(planId, isEnterprisePlan, key)) {
+    return;  // Pro/Enterprise 下 Add-on 资源跳过 QuotaLimit
+  }
+  // ... 后续校验
+};
+```
+
+**执行顺序**：
+```
+请求 → guardTenantUsageByKey(key)
+     ↓
+  1. assertSystemLimit(key) → 始终执行，不豁免
+     ↓（通过）
+  2. assertQuotaLimit(key)
+     ↓
+     ├─ 是 Add-on 且是 Pro/Enterprise → return，不拦截
+     └─ 否则 → 执行配额校验
+```
+
+**Add-on 资源列表**（来自 `allReportSubscriptionUpdatesUsageKeys`）：
+```typescript
+// utils/subscription/types.ts:59-73
+export const allReportSubscriptionUpdatesUsageKeys = Object.freeze([
+  'machineToMachineLimit',
+  'resourcesLimit',
+  'mfaEnabled',
+  'organizationsLimit',
+  'tenantMembersLimit',
+  'enterpriseSsoLimit',
+  'hooksLimit',
+  'securityFeaturesEnabled',
+  'thirdPartyApplicationsLimit',
+  'userRolesLimit',
+  'machineToMachineRolesLimit',
+  'samlApplicationsLimit',
+  'customDomainsLimit',
+]);
+```
+
+### 5.5 用量上报（Add-on 资源）
+
+对于 Pro/Enterprise 计划的 Add-on 资源，不硬拦截，而是**上报使用量**：
 
 ```typescript
 // quota.ts:193-216
@@ -254,12 +346,72 @@ reportSubscriptionUpdatesUsage = async (key) => {
 export function koaReportSubscriptionUpdates({ key, quota }) {
   return async (_, next) => {
     await next();  // 先执行业务逻辑
-    void quota.reportSubscriptionUpdatesUsage(key);  // 异步上报
+    void quota.reportSubscriptionUpdatesUsage(key);  // 异步上报，不等待
   };
 }
 ```
 
-## 六、典型场景分析
+**典型路由配置顺序**：
+```typescript
+// routes/sso-connector/index.ts:75-86
+router.post(
+  '/sso-connectors',
+  koaQuotaGuard({ key: 'enterpriseSsoLimit', quota }),        // 1. Pre-action: 配额检查
+  koaGuard({ ... }),                                           // 2. 参数校验
+  koaReportSubscriptionUpdates({ key: 'enterpriseSsoLimit', quota }),  // 3. Post-action: 上报
+  async (ctx, next) => { /* 业务逻辑 */ }
+);
+```
+
+## 六、Custom Domain 私有区域分支
+
+**核心纠正**：Custom Domain 有特殊的私有区域分支逻辑，完全绕过配额守卫。
+
+```typescript
+// utils/domain.ts:15-47
+export const assertCustomDomainLimit = async ({
+  isPrivateRegionFeature,
+  quotaLibrary,
+  existingDomainCount,
+}) => {
+  // 私有区域特殊处理：硬编码限制，不走配额系统
+  if (isPrivateRegionFeature) {
+    assertThat(
+      existingDomainCount < maxCustomDomains,  // 默认 10
+      new RequestError({ code: 'domain.exceed_domain_limit', status: 422 })
+    );
+    return;  // 直接返回，不走 quota guard
+  }
+
+  // 非私有区域：走正常配额守卫
+  await quotaLibrary.guardTenantUsageByKey('customDomainsLimit');
+};
+```
+
+**调用位置**：
+```typescript
+// routes/domain.ts:87-91
+await assertCustomDomainLimit({
+  isPrivateRegionFeature,
+  quotaLibrary: quota,
+  existingDomainCount: existingDomains.length,
+});
+```
+
+### 与异步上报的一致性语义
+
+| 场景 | 配额检查 | 用量上报 | 一致性 |
+|------|---------|---------|-------|
+| 非私有区域 | `quota.guardTenantUsageByKey('customDomainsLimit')` | 路由需配置 `koaReportSubscriptionUpdates` | ✅ 一致，都经过配额系统 |
+| 私有区域 | 硬编码 `maxCustomDomains` 检查 | ❌ 无上报（绕过了配额系统） | ⚠️ 不一致，私有区域用量不会上报到 Cloud |
+
+**关键语义**：私有区域分支是历史兼容逻辑，未来将在自定义开发计划功能实现后移除。该分支下：
+1. 不检查订阅配额（QuotaLimit）
+2. 不检查系统限制（SystemLimit）
+3. 不触发用量上报
+4. 仅受硬编码的全局限制（默认 10 个）
+
+## 七、典型场景分析
 
 ### 场景 1：创建应用
 
@@ -290,7 +442,23 @@ await quota.guardTenantUsageByKey('scopesPerRoleLimit', {
 
 **检查公式**：`该角色已有的 scope 数 + 本次分配数 <= scopesPerRoleLimit`
 
-## 七、关键文件索引
+### 场景 3：Pro 计划下创建 Hook（Add-on 资源）
+
+```
+请求 → guardTenantUsageByKey('hooksLimit')
+     ↓
+  1. assertSystemLimit('hooksLimit') → 检查系统硬限制（始终执行）
+     ↓（通过）
+  2. assertQuotaLimit('hooksLimit')
+     ↓
+     ├─ isReportablePlan(Pro) = true
+     ├─ isReportSubscriptionUpdatesUsageKey('hooksLimit') = true
+     └─ return → 跳过 QuotaLimit 检查
+     ↓
+  操作成功 → koaReportSubscriptionUpdates → 异步上报用量
+```
+
+## 八、关键文件索引
 
 | 文件 | 职责 |
 |------|------|
@@ -300,3 +468,7 @@ await quota.guardTenantUsageByKey('scopesPerRoleLimit', {
 | `packages/core/src/queries/tenant-usage/index.ts` | 使用量 SQL 查询 |
 | `packages/core/src/libraries/subscription.ts` | 订阅数据获取与缓存 |
 | `packages/core/src/utils/subscription/types.ts` | 订阅数据结构定义 |
+| `packages/core/src/utils/subscription/index.ts` | 上报逻辑与 Add-on 判断 |
+| `packages/core/src/utils/domain.ts` | Custom Domain 私有区域分支 |
+| `packages/core/src/caches/base-cache.ts` | 缓存键生成逻辑 |
+| `packages/core/src/caches/tenant-subscription.ts` | 订阅缓存实现 |
