@@ -7,18 +7,20 @@
 ```
 ┌─────────────────────────────────────────────────────────┐
 │                     业务路由层                           │
-│  - 显式调用 quota.guardTenantUsageByKey()              │
-│  - 或使用 koaQuotaGuard 中间件                           │
-│  - 特殊分支：custom domain 私有区域硬编码限制            │
-│  - 用量上报：手动调用 reportSubscriptionUpdatesUsage    │
-│           或 koaReportSubscriptionUpdates 中间件        │
+│  配额检查调用方式：                                     │
+│  1. 中间件方式：koaQuotaGuard({ key, quota })           │
+│  2. 显式调用：quota.guardTenantUsageByKey(key, options) │
+│  特殊分支：custom domain 私有区域硬编码限制            │
+│  用量上报方式：                                         │
+│  1. 中间件方式：koaReportSubscriptionUpdates            │
+│  2. 手动调用：void quota.reportSubscriptionUpdatesUsage │
 └────────────────────────────┬────────────────────────────┘
                              │
                              ▼
 ┌─────────────────────────────────────────────────────────┐
 │                   QuotaLibrary 核心层                   │
 │  - guardTenantUsageByKey: 统一校验入口                  │
-│    短路条件：!isCloud / adminTenant                     │
+│    短路条件：!isCloud / adminTenant（仅这两个！）       │
 │  - assertSystemLimit: 系统限制校验（始终执行）           │
 │  - assertQuotaLimit: 订阅配额校验                       │
 │    Add-on 豁免：仅在此阶段判断 Pro/Enterprise           │
@@ -43,34 +45,89 @@
 配额守卫采用 **pre-action 校验** 模式，在实际执行数据库操作之前进行检查：
 
 ```typescript
-// 示例：创建应用前检查
-await quota.guardTenantUsageByKey('applicationsLimit');
+// 示例：创建资源前检查
+await quota.guardTenantUsageByKey('resourcesLimit');
 // 检查通过后才执行创建
-await queries.applications.insert(applicationData);
+await queries.resources.insert(resourceData);
 ```
 
-### 2.2 两种调用方式
+### 2.2 两种调用方式对比
 
 #### 方式一：路由中间件（koaQuotaGuard）
-适用于简单的租户级配额检查，在路由定义时直接挂载：
+
+**适用场景**：简单的租户级配额检查，无需 entityId 和批量参数。
+
+**仓内真实调用点**：
 
 ```typescript
-// packages/core/src/middleware/koa-quota-guard.ts:13-21
-router.post('/applications', koaQuotaGuard({ key: 'applicationsLimit', quota }), async (ctx) => {
-  // 实际创建逻辑
-});
+// packages/core/src/routes/subject-token.ts:28
+router.post('/subject-tokens',
+  koaQuotaGuard({ key: 'subjectTokenEnabled', quota }),  // 布尔配额
+  koaGuard({ ... }),
+  async (ctx) => { /* ... */ }
+);
+
+// packages/core/src/routes/resource.ts:82
+router.post('/resources',
+  koaQuotaGuard({ key: 'resourcesLimit', quota }),  // 数值配额
+  koaGuard({ ... }),
+  async (ctx) => { /* ... */ }
+);
+
+// packages/core/src/routes/hook.ts:184
+router.post('/hooks',
+  koaQuotaGuard({ key: 'hooksLimit', quota }),  // 数值配额
+  koaGuard({ ... }),
+  async (ctx) => { /* ... */ }
+);
+
+// packages/core/src/routes/sso-connector/index.ts:77
+router.post('/sso-connectors',
+  koaQuotaGuard({ key: 'enterpriseSsoLimit', quota }),  // 数值配额
+  koaGuard({ ... }),
+  async (ctx) => { /* ... */ }
+);
+
+// packages/core/src/routes/sign-in-experience/custom-ui-assets/index.ts:32
+router.post('/sign-in-exp/default/custom-ui-assets',
+  koaQuotaGuard({ key: 'bringYourUiEnabled', quota }),  // 布尔配额
+  koaGuard({ ... }),
+  async (ctx) => { /* ... */ }
+);
 ```
 
 #### 方式二：显式调用（guardTenantUsageByKey）
-适用于需要传入 `entityId` 或批量操作的场景：
+
+**适用场景**：需要传入 `entityId`（基于实体的配额）或 `consumeUsageCount`（批量操作）。
+
+**仓内真实调用点**：
 
 ```typescript
+// packages/core/src/routes/applications/application.ts:222-227
+// 批量检查多个配额键
+await Promise.all([
+  rest.type === ApplicationType.MachineToMachine &&
+    quota.guardTenantUsageByKey('machineToMachineLimit'),
+  rest.isThirdParty && quota.guardTenantUsageByKey('thirdPartyApplicationsLimit'),
+  quota.guardTenantUsageByKey('applicationsLimit'),
+]);
+
 // packages/core/src/routes/role.scope.ts:96-99
+// 基于实体的配额 + 批量消耗
 await quota.guardTenantUsageByKey('scopesPerRoleLimit', {
-  entityId: roleId,           // 基于实体的配额需要指定实体 ID
-  consumeUsageCount: 5,       // 批量操作时指定本次消耗数量
+  entityId: roleId,
+  consumeUsageCount: scopeIds.length,
+});
+
+// packages/core/src/routes/resource.scope.ts
+// 基于实体的配额
+await quota.guardTenantUsageByKey('scopesPerResourceLimit', {
+  entityId: resourceId,
+  consumeUsageCount: scopeIds.length,
 });
 ```
+
+> ✅ **重要事实**：`applications` 路由**没有**使用 `koaQuotaGuard` 中间件，而是在处理器内显式调用 `guardTenantUsageByKey`。
 
 ### 2.3 短路条件（不拦截的情况）
 
@@ -179,17 +236,17 @@ assertThat(
 - `consumeUsageCount` 默认为 1
 - 批量操作时需手动传入（如一次性给角色分配 5 个 scope）
 
-### 4.2 布尔配额与 socialConnectorsLimit 的非 SQL 查询路径
+### 4.2 用量查询路径统一说明
 
-**核心纠正**：并非所有配额键都走 SQL 查询，存在两条非 SQL 路径。
+**核心纠正**：并非所有配额键都走 SQL 查询。根据配额类型和检查阶段，查询路径分为三类：
 
-| 配额类型 | 查询路径 | 用量统计 | 校验逻辑 |
+| 配额类型 | 检查阶段 | 查询路径 | 代码证据 |
 |---------|---------|---------|---------|
-| **布尔型配额** | 直接取 `subscriptionData.quota[key]` | 无，纯开关判断 | `limit === true` |
-| **普通数值配额** | `tenantUsageQuery.get()` → SQL 查询 | 实时统计 DB 数量 | `usage + consume <= limit` |
-| **socialConnectorsLimit** | `connectorLibrary.getLogtoConnectors()` | 实时获取已配置连接器 | `usage + consume <= limit` |
+| **布尔型配额** | QuotaLimit | 直接取 `subscriptionData.quota[key]`，**不调用** `tenantUsageQuery.get()` | `quota.ts:293-308` 中 `isBooleanQuotaUsageKey(key)` 分支直接 return，无查询调用 |
+| **socialConnectorsLimit** | SystemLimit / QuotaLimit | `connectorLibrary.getLogtoConnectors()`，**不查询数据库** | `quota.ts:371-379` 中 `key === 'socialConnectorsLimit'` 走特殊分支 |
+| **其他数值配额** | SystemLimit / QuotaLimit | `tenantUsageQuery.get()` → SQL 查询 | `queries/tenant-usage/index.ts:69-88` 中各 count* 函数 |
 
-#### 布尔配额校验逻辑
+#### 布尔配额：无用量查询
 
 ```typescript
 // quota.ts:292-308
@@ -202,19 +259,19 @@ if (isBooleanQuotaUsageKey(key)) {
     limit,  // 直接检查配额值：true=允许，false=禁止
     new RequestError({ code: 'subscription.limit_exceeded', status: 403, data: { key } })
   );
-  return;  // 直接返回，不调用 tenantUsageQuery.get()
+  return;  // ✅ 直接返回，不调用 tenantUsageQuery.get()
 }
 ```
 
-> ✅ **事实**：布尔配额**不调用** `tenantUsageQuery.get()`，因此**不产生 SQL 查询**。
+> ✅ **代码证据**：布尔配额**不调用** `tenantUsageQuery.get()`，因此**不产生 SQL 查询**，也不经过 TenantUsageQuery 缓存层。
 
-#### socialConnectorsLimit 特殊查询路径
+#### socialConnectorsLimit：ConnectorLibrary 路径
 
 ```typescript
 // quota.ts:371-379
 private readonly getTenantUsage: TenantUsageQueryFunction = async (key, entityId) => {
   if (key === 'socialConnectorsLimit') {
-    // 不走 SQL，通过 ConnectorLibrary 获取
+    // ✅ 不走 SQL，通过 ConnectorLibrary 获取已配置的连接器
     const connectors = await this.connectorLibrary.getLogtoConnectors();
     return connectors.filter((connector) => connector.type === ConnectorType.Social).length;
   }
@@ -223,7 +280,20 @@ private readonly getTenantUsage: TenantUsageQueryFunction = async (key, entityId
 };
 ```
 
-> ✅ **事实**：`socialConnectorsLimit` **不查询数据库**，而是通过 ConnectorLibrary 实时获取已配置的社交连接器数量。
+> ✅ **代码证据**：`socialConnectorsLimit` **不查询数据库**，而是通过 ConnectorLibrary 实时获取已配置的社交连接器数量。
+
+#### 类型系统佐证
+
+```typescript
+// queries/tenant-usage/types.ts:150-155
+/**
+ * Self-computed usage keys - usage data queryable from the database.
+ * Excludes `socialConnectorsLimit` as it requires querying the Connector Library.
+ */
+export type SelfComputedUsageKey = Exclude<NumericUsageKey, 'socialConnectorsLimit'>;
+```
+
+> ✅ **代码证据**：类型定义明确排除了 `socialConnectorsLimit`，说明它不通过数据库自计算。
 
 ### 4.3 错误码区分
 
@@ -244,7 +314,7 @@ protected cacheKey(type: CacheKeyOf<CacheMapT>, key: string) {
   return `${this.tenantId}:${type}:${key}`;
 }
 
-// 实际调用
+// libraries/subscription.ts:80-84
 this.getSubscriptionData = this.subscriptionCache.memoize(
   async () => getTenantSubscription(this.cloudConnection),
   [SubscriptionRedisCacheKey.Subscription],  // type = 'subscription'
@@ -295,6 +365,8 @@ class TenantUsageQuery {
 ```
 
 **作用**：同一次请求中，若同时检查 SystemLimit 和 QuotaLimit，避免重复查询数据库。
+
+> ⚠️ **注意**：布尔配额不经过此缓存层，因为它不调用 `tenantUsageQuery.get()`。
 
 #### 自计算使用量查询
 
@@ -460,9 +532,9 @@ router.post('/domains', koaGuard({ ... }), async (ctx, next) => {
 
 > ✅ **事实**：`customDomains` 的创建和删除操作都在路由内手动调用 `reportSubscriptionUpdatesUsage`，删除时同理（见 domain.ts:154-156）。
 
-## 六、Custom Domain 私有区域分支
+## 六、Custom Domain 完整分支分析
 
-**核心纠正**：Custom Domain 有特殊的私有区域分支逻辑，完全绕过配额守卫。
+### 6.1 私有区域分支
 
 ```typescript
 // utils/domain.ts:15-47
@@ -495,14 +567,91 @@ await assertCustomDomainLimit({
 });
 ```
 
-### 与异步上报的一致性语义
+### 6.2 四个操作分支的上报语义对比
+
+| 操作 | 配额检查 | 用量上报 | 一致性 |
+|------|---------|---------|-------|
+| **POST /domains（非私有）** | `quota.guardTenantUsageByKey('customDomainsLimit')` | 路由内手动调用 `void quota.reportSubscriptionUpdatesUsage('customDomainsLimit')` | ✅ 一致 |
+| **POST /domains（私有）** | 硬编码 `maxCustomDomains` 检查 | ❌ 无上报 | ⚠️ 不一致 |
+| **DELETE /domains/:id（非私有）** | 无（删除操作不检查配额） | 路由内手动调用 `void quota.reportSubscriptionUpdatesUsage('customDomainsLimit')` | ✅ 上报触发 |
+| **POST /domains/cleanup** | 无（清理操作不检查配额） | ❌ 无上报（见下方分析） | ⚠️ 缺失上报 |
+
+### 6.3 Domains Cleanup 分支分析
+
+**核心补充**：`/domains/cleanup` 分支会删除过期域名，但**未触发用量上报**。
+
+```typescript
+// routes/domain.ts:117-145
+router.post(
+  '/domains/cleanup',
+  koaGuard({
+    body: z.object({ staleDays: z.number().int().positive() }),
+    response: z.object({
+      scannedCount: z.number(),
+      deletedCount: z.number(),  // 可能删除多个域名
+      skippedActiveCount: z.number(),
+      failedCount: z.number(),
+    }),
+    status: 200,
+  }),
+  async (ctx, next) => {
+    const { staleDays } = ctx.guard.body;
+    const summary = await cleanupDomains(staleDays);  // ✅ 内部会调用 deleteDomain 删除域名
+
+    // 只同步 SAML 应用重定向 URL，未触发用量上报
+    await trySafe(async () => {
+      const domains = await findAllDomains();
+      const syncedDomains = await Promise.all(
+        domains.map(async (domain) => syncDomainStatus(domain))
+      );
+      await syncCustomDomainsToSamlApplicationRedirectUrls(tenantId, [...syncedDomains]);
+    });
+
+    ctx.status = 200;
+    ctx.body = summary;
+    return next();
+  }
+);
+```
+
+**cleanupDomains 内部实现**：
+```typescript
+// libraries/domain.ts:125-198
+const cleanupDomains = async (staleDays: number): Promise<DomainCleanupSummary> => {
+  // ...
+  for (const domain of domains) {
+    // 1. 孤立记录（无 Cloudflare 数据）：直接从 DB 删除
+    if (!domain.cloudflareData) {
+      await deleteDomainById(domain.id);
+      summary.deletedCount += 1;
+      continue;
+    }
+    // ...
+    // 2. 过期非活跃域名：调用 deleteDomain 完整删除
+    await deleteDomain(domain.id);  // ✅ 会删除 Cloudflare 和 DB 记录
+    summary.deletedCount += 1;
+  }
+  return summary;
+};
+```
+
+**影响说明**：
+1. `cleanupDomains` 可能删除多个域名（`summary.deletedCount` 可能 > 1）
+2. 但**未触发** `reportSubscriptionUpdatesUsage('customDomainsLimit')`
+3. 这意味着 Cloud 侧的用量统计可能**滞后**，直到下次创建/删除单个域名时才会同步
+4. 属于**最终一致性**设计：用量上报不追求实时精确，只要最终状态正确即可
+
+### 6.4 与异步上报的一致性语义总结
+
+**关键语义**：私有区域分支和 cleanup 分支是历史兼容/边缘场景，存在上报不一致。
 
 | 场景 | 配额检查 | 用量上报 | 一致性 |
 |------|---------|---------|-------|
-| 非私有区域 | `quota.guardTenantUsageByKey('customDomainsLimit')` | 路由内手动调用 `void quota.reportSubscriptionUpdatesUsage('customDomainsLimit')` | ✅ 一致，都经过配额系统 |
-| 私有区域 | 硬编码 `maxCustomDomains` 检查 | ❌ 无上报（绕过了配额系统） | ⚠️ 不一致，私有区域用量不会上报到 Cloud |
+| 非私有区域 CRUD | 经过配额系统 | 手动调用上报 | ✅ 一致 |
+| 私有区域 | 硬编码限制 | ❌ 无上报 | ⚠️ 不一致，私有区域用量不会上报到 Cloud |
+| Cleanup 批量删除 | 无配额检查 | ❌ 无上报 | ⚠️ 最终一致性，依赖后续操作同步 |
 
-**关键语义**：私有区域分支是历史兼容逻辑，未来将在自定义开发计划功能实现后移除。该分支下：
+**私有区域分支**（未来将移除）：
 1. 不检查订阅配额（QuotaLimit）
 2. 不检查系统限制（SystemLimit）
 3. 不触发用量上报
@@ -510,7 +659,7 @@ await assertCustomDomainLimit({
 
 ## 七、典型场景分析
 
-### 场景 1：创建应用
+### 场景 1：创建应用（显式调用方式）
 
 ```typescript
 // routes/applications/application.ts:222-227
@@ -527,7 +676,7 @@ await Promise.all([
 2. 若是 M2M 应用，M2M 应用数不超限
 3. 若是第三方应用，第三方应用数不超限
 
-### 场景 2：给角色分配 Scope
+### 场景 2：给角色分配 Scope（基于实体 + 批量）
 
 ```typescript
 // routes/role.scope.ts:96-99
@@ -555,7 +704,7 @@ await quota.guardTenantUsageByKey('scopesPerRoleLimit', {
   操作成功 → koaReportSubscriptionUpdates → void + trySafe 异步上报
 ```
 
-### 场景 4：非私有区域创建 Custom Domain
+### 场景 4：非私有区域创建 Custom Domain（手动上报）
 
 ```
 请求 → POST /domains
@@ -571,18 +720,31 @@ await quota.guardTenantUsageByKey('scopesPerRoleLimit', {
   返回 201 响应
 ```
 
+### 场景 5：Cleanup 批量删除过期域名（无上报）
+
+```
+请求 → POST /domains/cleanup
+     ↓
+  const summary = await cleanupDomains(staleDays)
+     ↓（内部可能删除多个域名）
+  同步 SAML 应用重定向 URL
+     ↓（无上报调用）
+  返回 summary（含 deletedCount）
+```
+
 ## 八、关键文件索引
 
 | 文件 | 职责 |
 |------|------|
 | `packages/core/src/libraries/quota.ts` | 配额守卫核心逻辑 |
 | `packages/core/src/middleware/koa-quota-guard.ts` | Koa 中间件包装 |
-| `packages/core/src/queries/tenant-usage/types.ts` | 配额类型定义 |
+| `packages/core/src/queries/tenant-usage/types.ts` | 配额类型定义（含 SelfComputedUsageKey 排除 socialConnectorsLimit） |
 | `packages/core/src/queries/tenant-usage/index.ts` | 使用量 SQL 查询 |
 | `packages/core/src/libraries/subscription.ts` | 订阅数据获取与缓存 |
 | `packages/core/src/utils/subscription/types.ts` | 订阅数据结构定义 |
 | `packages/core/src/utils/subscription/index.ts` | 上报逻辑与 Add-on 判断（含 trySafe） |
 | `packages/core/src/utils/domain.ts` | Custom Domain 私有区域分支 |
-| `packages/core/src/routes/domain.ts` | Custom Domain 路由（手动调用上报） |
+| `packages/core/src/routes/domain.ts` | Custom Domain 路由（手动调用上报 + cleanup 分支） |
+| `packages/core/src/libraries/domain.ts` | Custom Domain 业务逻辑（cleanupDomains 实现） |
 | `packages/core/src/caches/base-cache.ts` | 缓存键生成逻辑 |
 | `packages/core/src/caches/tenant-subscription.ts` | 订阅缓存实现 |
