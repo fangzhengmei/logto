@@ -92,11 +92,15 @@ issueRefreshToken: (_, client, code) => {
    - **选项 A**：授权请求中包含 `offline_access` scope
    - **选项 B**：应用是 web 类型且 `alwaysIssueRefreshToken = true`
 
-**受保护应用的实际情况**（✅ 可证据 + ❓ 推断结合）：
+**受保护应用的实际配置情况**（✅ 可证据）：
 
 - ✅ 代码中未看到 Protected 应用默认设置 `alwaysIssueRefreshToken: true`
 - ✅ `customClientMetadataDefault` 中无此配置（`packages/schemas/src/consts/oidc.ts:14-18`）
-- ❓ 因此数据面必须在授权请求中包含 `offline_access` scope 才能获取 refresh_token
+
+**数据面的授权请求策略推断**（❓ 推断）：
+
+- ❓ **默认场景**：数据面必须在授权请求中包含 `offline_access` scope 才能获取 refresh_token
+- ❓ **可选配置分支**：若用户手动将受保护应用的 `alwaysIssueRefreshToken` 配置为 `true`，则无需 `offline_access` scope 也能获取 refresh_token
 
 ### 2.4 刷新令牌 TTL 与轮换策略
 
@@ -159,10 +163,17 @@ const rotateRefreshToken = (ctx) => {
 ```typescript
 // packages/core/src/libraries/protected-app.ts:154-196 ✅ 可证据
 const syncAppConfigsToRemote = async (applicationId: string): Promise<void> => {
+  const protectedAppConfigProviderConfig = await getProviderConfig();
+
   const { protectedAppMetadata, id, secret, tenantId } = await findApplicationById(applicationId);
+  if (!protectedAppMetadata) {
+    return;
+  }
+
+  const { customDomains, ...rest } = protectedAppMetadata;
 
   const siteConfigs = {
-    ...protectedAppMetadata,
+    ...rest,
     sdkConfig: {
       appId: id,
       appSecret: secret,
@@ -170,14 +181,39 @@ const syncAppConfigsToRemote = async (applicationId: string): Promise<void> => {
     },
   };
 
-  // 写入 Cloudflare KV
+  // Update default host (subdomain of the default domain)
   await updateProtectedAppSiteConfigs(
     protectedAppConfigProviderConfig,
     protectedAppMetadata.host,
     siteConfigs
   );
+
+  // Update custom domains sites
+  if (customDomains && customDomains.length > 0) {
+    await Promise.all(
+      customDomains.map(async ({ domain }) => {
+        await updateProtectedAppSiteConfigs(protectedAppConfigProviderConfig, domain, {
+          ...siteConfigs,
+          host: domain,
+        });
+      })
+    );
+  }
 };
 ```
+
+**配置同步链路**（✅ 可证据）：
+
+1. **默认域名同步**：将配置写入 `host` 对应的 KV 键
+2. **自定义域名同步**：遍历 `customDomains` 数组，为每个自定义域名单独写入 KV
+   - 每个自定义域名的 `siteConfigs` 中 `host` 字段会被替换为当前自定义域名
+   - 所有自定义域名共享相同的 `sdkConfig`（appId、appSecret、endpoint）
+
+**触发时机**（✅ 可证据）：
+
+- 创建受保护应用时：`packages/core/src/routes/applications/application.ts:243-251`
+- 更新受保护应用元数据时：`packages/core/src/routes/applications/application.ts:389-414`
+- 删除受保护应用时：`packages/core/src/routes/applications/application.ts:441-448`
 
 **配置结构**（KV 中存储的数据）：
 
@@ -325,11 +361,11 @@ if (refreshToken.consumed) {
 5. Logto → 重定向回 https://app.example.com/sign-in-callback?code=<授权码>&state=<state>
 ```
 
-**为什么必须包含 `offline_access` scope**（✅ 可证据的推断链）：
+**为什么默认必须包含 `offline_access` scope**（✅ 可证据的推断链）：
 
 - ✅ 受保护应用未设置 `alwaysIssueRefreshToken: true`
 - ✅ 刷新令牌颁发条件要求 `offline_access` scope 或 `alwaysIssueRefreshToken: true`
-- ❓ 因此数据面必须在授权请求中包含 `offline_access` scope
+- ❓ 因此默认场景下数据面必须在授权请求中包含 `offline_access` scope
 
 **阶段 2：登录回调 ❓ 推断**：
 
@@ -478,15 +514,15 @@ X-Logto-User-Email: <email>
 └──────┬──────┘
        │
        ▼
-┌─────────────┐
-│ 同步到 KV   │  ✅ 可证据：syncAppConfigsToRemote()
-│ (Cloudflare │
-│  Workers &  │
-│  Pages KV)  │
-└──────┬──────┘
-       │
-       │ 配置数据
-       ▼
+┌───────────────────────────────────┐
+│ 同步到 KV                        │  ✅ 可证据：syncAppConfigsToRemote()
+│ - 更新默认 host 的 KV 配置       │
+│ - 遍历 customDomains，逐个更新   │
+│   每个自定义域名的 KV 配置        │
+└──────────────┬────────────────────┘
+               │
+               │ 配置数据
+               ▼
 ┌─────────────────────────────────────┐
 │  Cloudflare Worker（数据面）         │  ❓ 推断
 │  - 读取 KV 配置                     │
@@ -544,7 +580,7 @@ X-Logto-User-Email: <email>
 |--------|-------------|-----------|------|
 | 应用配置存储 | ✅ | | protected-app.ts |
 | 配置下发到 KV | ✅ | | syncAppConfigsToRemote() |
-| 自定义域名管理 | ✅ | | cloudflare/index.ts |
+| 自定义域名配置同步 | ✅ | | protected-app.ts:185-195 |
 | 刷新令牌 Grant 实现 | ✅ | | refresh-token.ts |
 | 登录回调 URL 定义 | ✅ | | constants/index.ts |
 | 会话时长配置 | ✅ | | SessionForm.tsx |
@@ -569,8 +605,8 @@ X-Logto-User-Email: <email>
 2. **单域名限制**：每个受保护应用仅支持一个自定义域名（代码校验）
 3. **配置同步延迟**：KV 写入后可能有秒级延迟
 4. **应用密钥暴露**：appSecret 存储在 Cloudflare KV 中
-5. **刷新令牌条件**：必须包含 `offline_access` scope（推导）
-6. **令牌轮换时机**：机密客户端超过 70% TTL 时轮换
+5. **令牌轮换时机**：机密客户端超过 70% TTL 时轮换
+6. **配置同步范围**：默认 host 和所有 customDomains 都会同步配置
 
 ### 推断限制（❓）
 
