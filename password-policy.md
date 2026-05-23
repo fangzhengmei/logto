@@ -58,9 +58,15 @@ await passwordValidator.validatePassword(password, identifierProfile);
 
 **应用特点**：
 1. **有用户上下文**：需先通过验证码识别用户，传入 user 参数
-2. **reset 标志**：`reset=true`，跳过"密码已存在于当前账户"检查
+2. **reset 标志**：`reset=true`，仅跳过"密码已存在于当前账户"检查
 3. **仍需策略校验**：密码强度、敏感字段比对等正常执行
-4. **跳过旧密码检查**：不对比当前密码（因为用户忘记了）
+4. **新旧密码相同检查仍执行**：`same_password` 检查在 `validatePassword()` 内部，只要传入 user 就执行，与 reset 无关
+
+> **重要澄清**：两个本质不同的检查
+> - `same_password`：比对新旧密码内容是否相同（argon2Verify 哈希比对）
+> - `password_exists_in_profile`：检查用户账户是否已设置过密码（`!user.passwordEncrypted`）
+> 
+> `reset=true` 仅跳过后者，不影响前者。
 
 **代码流程**：
 ```typescript
@@ -82,21 +88,23 @@ async setPasswordDigestWithValidation(password: string, reset = false) {
 
 ### 2.3 改密流程 (ChangePassword)
 
-改密流程有两个独立入口：
+改密流程有两个独立入口，检查范围略有不同：
 
 #### 入口 1：账户中心改密
 - `account/index.ts:181-221` - `POST /account/password`
 - 需身份验证 (`identityVerified`)
+- 直接调用 `PasswordValidator.validatePassword()`，不经过 `setPasswordDigestWithValidation`
+- **不执行**"密码已存在"检查
 
 #### 入口 2：交互流程改密
 - `profile-routes.ts:114-117` - `POST /experience/profile` (type='password')
 - `Profile.setPasswordDigestWithValidation(password, false)`
+- `reset=false`，执行完整检查
 
 **应用特点**：
 1. **有用户上下文**：必须传入 user 参数
-2. **reset=false**：执行完整检查
-3. **旧密码比对**：`PasswordValidator.validatePassword()` 中检查新旧密码是否相同
-4. **密码存在性检查**：检查密码是否已存在于当前账户
+2. **新旧密码比对**：`PasswordValidator.validatePassword()` 中检查新旧密码是否相同（两个入口都执行）
+3. **密码存在性检查**：仅交互流程改密执行（`reset=false`），账户中心改密不执行
 
 **代码流程**：
 ```typescript
@@ -113,18 +121,62 @@ if (this.user) {
 }
 ```
 
-### 2.4 三条流程对比表
+### 2.4 reset=true 影响范围分析
 
-| 检查项 | 注册 | 找回密码 | 改密 |
-|--------|------|----------|------|
-| 密码长度 | ✓ | ✓ | ✓ |
-| 字符类型 | ✓ | ✓ | ✓ |
-| 已泄露密码 (pwned) | ✓ | ✓ | ✓ |
-| 重复/序列密码 | ✓ | ✓ | ✓ |
-| 用户信息敏感字段 | ✓ | ✓ | ✓ |
-| 自定义拒绝词 | ✓ | ✓ | ✓ |
-| 新旧密码相同检查 | ✗ | ✗ | ✓ |
-| 密码已存在检查 | ✗ | ✗ | ✓ |
+**执行顺序** (`profile.ts:170-182`):
+```typescript
+async setPasswordDigestWithValidation(password: string, reset = false) {
+  const user = await this.safeGetIdentifiedUser();
+  const passwordValidator = new PasswordValidator(passwordPolicy, user);
+  
+  // 第1步：validatePassword - 包含 same_password 检查
+  await passwordValidator.validatePassword(password, this.#data);  // ← 只要有 user，这里就检查 same_password！
+  
+  const passwordDigests = await passwordValidator.createPasswordDigest(password);
+
+  // 第2步：reset 仅影响这一步
+  if (user && !reset) {
+    this.profileValidator.guardProfileNotExistInCurrentUserAccount(user, passwordDigests);
+  }
+}
+```
+
+**受 reset=true 影响（被跳过）的检查：**
+
+| 检查项 | 位置 | 错误码 | 说明 |
+|--------|------|--------|------|
+| 密码已存在检查 | `profile-validator.ts:140-148` | `user.password_exists_in_profile` | 检查 `!user.passwordEncrypted`，防止给已有密码的用户重复设置 |
+
+**不受 reset=true 影响（仍执行）的检查：**
+
+| 检查项 | 位置 | 说明 |
+|--------|------|------|
+| 密码长度 | `password-policy.ts:244-254` | 最小/最大长度检查 |
+| 字符类型 | `password-policy.ts:256-266` | 字符类型数量检查 |
+| 已泄露密码 (pwned) | `password-policy.ts:175-179` | HaveIBeenPwned API 检查 |
+| 重复/序列密码 | `password-policy.ts:203-206` | 重复字符、序列模式检查 |
+| 用户信息敏感字段 | `password-policy.ts:212-218` | 姓名、用户名、邮箱、手机号比对 |
+| 自定义拒绝词 | `password-policy.ts:208-210` | 自定义词列表检查 |
+| **新旧密码相同检查** | `password-validator.ts:57-67` | **argon2Verify 比对新旧密码哈希**，只要 `this.user` 存在就执行 |
+
+### 2.5 三条流程对比表
+
+| 检查项 | 注册 | 找回密码 | 改密（交互） | 改密（账户中心） |
+|--------|------|----------|------------|----------------|
+| 密码长度 | ✓ | ✓ | ✓ | ✓ |
+| 字符类型 | ✓ | ✓ | ✓ | ✓ |
+| 已泄露密码 (pwned) | ✓ | ✓ | ✓ | ✓ |
+| 重复/序列密码 | ✓ | ✓ | ✓ | ✓ |
+| 用户信息敏感字段 | ✓ | ✓ | ✓ | ✓ |
+| 自定义拒绝词 | ✓ | ✓ | ✓ | ✓ |
+| 新旧密码相同检查 (`same_password`) | ✗ | ✓ | ✓ | ✓ |
+| 密码已存在检查 (`password_exists_in_profile`) | ✗ | ✗ | ✓ | ✗ |
+
+**关键差异说明**：
+- **注册**：无 user 上下文，不执行任何用户相关的历史密码检查
+- **找回密码**：有 user 上下文，`reset=true` 仅跳过"密码已存在"检查，但`same_password` 检查仍执行
+- **改密（交互）**：有 user 上下文，`reset=false`，执行全部检查
+- **改密（账户中心）**：直接调用 `PasswordValidator.validatePassword()`，不经过 `setPasswordDigestWithValidation`，所以不执行"密码已存在"检查，但 `same_password` 检查仍执行
 
 ---
 
