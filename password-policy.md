@@ -111,15 +111,37 @@ async setPasswordDigestWithValidation(password: string, reset = false) {
 // 账户中心改密 - account/index.ts
 const passwordPolicyChecker = new PasswordValidator(signInExperience.passwordPolicy, user);
 await passwordPolicyChecker.validatePassword(password, user);
-
-// PasswordValidator.validatePassword() 中的旧密码检查
-if (this.user) {
-  assertThat(
-    !(await argon2Verify({ password, hash: oldPasswordEncrypted })),
-    new RequestError({ code: 'user.same_password', status: 422 })
-  );
-}
 ```
+
+---
+
+### 2.3.1 same_password 触发条件深度分析
+
+`same_password` 检查在代码中有两处独立实现，但判断逻辑**完全相同**：
+
+**实现 1：experience 侧** (`password-validator.ts:57-67`)
+**实现 2：interaction 侧** (`profile-verification.ts:199-206`)
+
+```typescript
+// 完全相同的三层 OR 逻辑
+assertThat(
+  !oldPasswordEncrypted ||                                     // 条件1：无旧密码 → 通过
+    passwordEncryptionMethod !== UsersPasswordEncryptionMethod.Argon2i ||  // 条件2：非Argon2i加密 → 通过（迁移用户）
+    !(await argon2Verify({ password, hash: oldPasswordEncrypted })),        // 条件3：Argon2i且密码不同 → 通过
+  new RequestError({ code: 'user.same_password', status: 422 })
+);
+```
+
+**真值表 - 触发 `user.same_password` 错误的条件**：
+
+| oldPasswordEncrypted | passwordEncryptionMethod | argon2Verify 结果 | 触发 same_password？ | 场景说明 |
+|---------------------|-------------------------|-------------------|---------------------|----------|
+| null/undefined | - | - | ✗ | 用户从未设置过密码 |
+| 存在 | 非 Argon2i | - | ✗ | 迁移用户（如 SHA-256、BCrypt 等），允许使用相同密码重新加密 |
+| 存在 | Argon2i | false（密码不同） | ✗ | 正常改密，新密码与旧密码不同 |
+| 存在 | Argon2i | true（密码相同） | ✓ | **唯一触发场景**：Argon2i 加密用户尝试使用相同密码 |
+
+> **关键洞察**：迁移用户（非 Argon2i 加密）在找回密码时，即使输入与旧密码完全相同的新密码，也不会触发 `same_password` 错误。这是为了支持"将旧算法密码平滑迁移到 Argon2i"的场景。
 
 ### 2.4 reset=true 影响范围分析
 
@@ -174,9 +196,108 @@ async setPasswordDigestWithValidation(password: string, reset = false) {
 
 **关键差异说明**：
 - **注册**：无 user 上下文，不执行任何用户相关的历史密码检查
-- **找回密码**：有 user 上下文，`reset=true` 仅跳过"密码已存在"检查，但`same_password` 检查仍执行
+- **找回密码**：有 user 上下文，`reset=true` 仅跳过"密码已存在"检查，但`same_password` 检查仍执行（注意 Argon2i 迁移用户例外）
 - **改密（交互）**：有 user 上下文，`reset=false`，执行全部检查
 - **改密（账户中心）**：直接调用 `PasswordValidator.validatePassword()`，不经过 `setPasswordDigestWithValidation`，所以不执行"密码已存在"检查，但 `same_password` 检查仍执行
+
+---
+
+### 2.6 找回密码：interaction 侧 vs experience 侧校验链路
+
+找回密码有两套独立的 API 链路，校验时机和范围存在差异：
+
+#### 链路 A：experience 侧（新版）
+- **入口**：`PUT /experience/profile/password` (`profile-routes.ts:141-179`)
+- **校验时机**：密码提交时立即校验
+- **校验流程**：
+  ```
+  setPasswordDigestWithValidation(password, true)
+    → PasswordValidator.validatePassword()
+       → 密码策略校验（长度、字符类型、pwned等）
+       → same_password 检查（含 Argon2i 条件）✓
+    → reset=true，跳过 password_exists_in_profile 检查 ✗
+  ```
+
+#### 链路 B：interaction 侧（旧版）
+- **入口**：`PUT /interaction` → `PUT /interaction/profile` → `POST /interaction/submit`
+- **校验时机**：分两阶段校验
+- **校验流程**：
+  ```
+  阶段1：创建/更新 Profile 时
+    → validatePassword() (interaction/utils/validate-password.ts:58-76)
+       → 仅调用 checker.check()，做密码策略校验 ✓
+       → ❗ 不检查 same_password ✗
+       → ❗ 不检查 password_exists_in_profile ✗
+  
+  阶段2：提交 Interaction 时
+    → verifyProfile() (interaction/verifications/profile-verification.ts:163-214)
+       → forgotPasswordProfileGuard 确保 password 存在 ✓
+       → same_password 检查（含 Argon2i 条件，与 experience 侧完全相同）✓
+       → ❗ 不检查 password_exists_in_profile ✗
+  ```
+
+**两侧关键差异对比**：
+
+| 校验项 | experience 侧 | interaction 侧 |
+|--------|--------------|----------------|
+| 密码策略校验 | 提交时 | 提交时 |
+| same_password 检查 | 提交时立即 | 延迟到 submit 时 |
+| password_exists_in_profile | ✗ | ✗ |
+| Argon2i 迁移用户例外 | ✓ | ✓ |
+
+---
+
+### 2.7 password_exists_in_profile 判定口径差异
+
+`password_exists_in_profile` 检查在两处有不同的判定逻辑：
+
+#### 判定口径 1：interaction 侧（SignIn 事件专用）
+**位置**：`profile-verification.ts:153-160`
+```typescript
+if (password) {
+  assertThat(
+    !isUserPasswordSet(user),
+    new RequestError({ code: 'user.password_exists_in_profile' })
+  );
+}
+
+// isUserPasswordSet 定义 (interaction/utils/index.ts:24-29)
+export const isUserPasswordSet = ({
+  passwordEncrypted,
+  identities,
+}: Pick<User, 'passwordEncrypted' | 'identities'>): boolean => {
+  return Boolean(passwordEncrypted) || Object.keys(identities).length > 0;
+};
+```
+**判定逻辑**：有密码哈希 **或** 有社交身份 → 认为"已设置密码"
+**适用场景**：仅 SignIn 事件，ForgotPassword 事件不执行此检查
+
+#### 判定口径 2：experience 侧（Profile 类专用）
+**位置**：`profile-validator.ts:140-148`
+```typescript
+if (passwordEncrypted) {
+  assertThat(
+    !user.passwordEncrypted,
+    new RequestError({ code: 'user.password_exists_in_profile', status: 422 })
+  );
+}
+```
+**判定逻辑**：仅判断 `!user.passwordEncrypted`，不考虑社交身份
+**适用场景**：`setPasswordDigestWithValidation` 且 `reset=false` 时（即改密交互流程）
+
+**判定口径差异总结**：
+
+| 判定维度 | interaction 侧 | experience 侧 |
+|---------|--------------|----------------|
+| 检查 `passwordEncrypted` | ✓ | ✓ |
+| 检查 `identities` 长度 | ✓ | ✗ |
+| 用户有社交身份但无密码 | 认为"已设置密码" | 认为"未设置密码" |
+| 适用场景 | SignIn 事件 | Profile.setPasswordDigestWithValidation |
+| ForgotPassword 事件 | 不执行此检查 | reset=true 时不执行 |
+
+> **设计意图差异**：
+> - interaction 侧的 `isUserPasswordSet` 认为"社交身份可替代密码"，所以有社交身份的用户不需要再设置密码
+> - experience 侧的判断更直接，只看是否有密码哈希，用于防止给已有密码的用户重复设置密码
 
 ---
 
@@ -419,10 +540,13 @@ public async getPasswordPolicy() {
 | 模块 | 文件路径 | 核心职责 |
 |------|----------|----------|
 | 策略核心 | `packages/toolkit/core-kit/src/password-policy.ts` | 策略定义、校验算法 |
-| 校验器 | `packages/core/src/routes/experience/classes/libraries/password-validator.ts` | 流程级校验封装 |
-| interaction 校验 | `packages/core/src/routes/interaction/utils/validate-password.ts` | Interaction 路由密码校验 |
+| 校验器 | `packages/core/src/routes/experience/classes/libraries/password-validator.ts` | 流程级校验封装，含 same_password 检查 |
+| interaction 策略校验 | `packages/core/src/routes/interaction/utils/validate-password.ts` | Interaction 路由密码策略校验（不含 same_password） |
+| interaction 完整校验 | `packages/core/src/routes/interaction/verifications/profile-verification.ts` | Interaction submit 时完整校验，含 same_password |
+| interaction 工具 | `packages/core/src/routes/interaction/utils/index.ts` | `isUserPasswordSet()` 判定函数 |
 | 注册流程 | `packages/core/src/routes/experience/classes/verifications/new-password-identity-verification.ts` | 注册密码验证 |
-| Profile 类 | `packages/core/src/routes/experience/classes/profile.ts` | 改密/找回密码校验 |
+| Profile 类 | `packages/core/src/routes/experience/classes/profile.ts` | 改密/找回密码校验入口 |
+| Profile 校验器 | `packages/core/src/routes/experience/classes/libraries/profile-validator.ts` | 密码已存在性检查（experience 侧口径） |
 | 账户改密 | `packages/core/src/routes/account/index.ts` | 账户中心改密 |
 | 多租户注入 | `packages/core/src/routes/interaction/middleware/koa-interaction-sie.ts` | 密码策略中间件 |
 | 前端校验 | `packages/experience/src/hooks/use-password-policy-checker.ts` | 前端快速校验 |
