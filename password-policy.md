@@ -117,31 +117,39 @@ await passwordPolicyChecker.validatePassword(password, user);
 
 ### 2.3.1 same_password 触发条件深度分析
 
-`same_password` 检查在代码中有两处独立实现，但判断逻辑**完全相同**：
+`same_password` 检查在代码中有两处独立实现，但判断逻辑**完全相同**。**前提条件**：必须有 `this.user`（用户上下文），无 user 时直接跳过。
 
 **实现 1：experience 侧** (`password-validator.ts:57-67`)
 **实现 2：interaction 侧** (`profile-verification.ts:199-206`)
 
 ```typescript
-// 完全相同的三层 OR 逻辑
-assertThat(
-  !oldPasswordEncrypted ||                                     // 条件1：无旧密码 → 通过
-    passwordEncryptionMethod !== UsersPasswordEncryptionMethod.Argon2i ||  // 条件2：非Argon2i加密 → 通过（迁移用户）
-    !(await argon2Verify({ password, hash: oldPasswordEncrypted })),        // 条件3：Argon2i且密码不同 → 通过
-  new RequestError({ code: 'user.same_password', status: 422 })
-);
+// 外层条件：必须有 user
+if (this.user) {  // ← 前提条件！无 user 直接跳过
+  const { passwordEncrypted: oldPasswordEncrypted, passwordEncryptionMethod } = this.user;
+  
+  // 三层 OR 逻辑（只要任一为 true，就不抛错）
+  assertThat(
+    !oldPasswordEncrypted ||                                     // 条件1：无旧密码 → 通过
+      passwordEncryptionMethod !== UsersPasswordEncryptionMethod.Argon2i ||  // 条件2：非Argon2i → 通过（迁移用户）
+      !(await argon2Verify({ password, hash: oldPasswordEncrypted })),        // 条件3：Argon2i且密码不同 → 通过
+    new RequestError({ code: 'user.same_password', status: 422 })
+  );
+}
 ```
 
-**真值表 - 触发 `user.same_password` 错误的条件**：
+**真值表 - 触发 `user.same_password` 错误的完整条件**：
 
-| oldPasswordEncrypted | passwordEncryptionMethod | argon2Verify 结果 | 触发 same_password？ | 场景说明 |
-|---------------------|-------------------------|-------------------|---------------------|----------|
-| null/undefined | - | - | ✗ | 用户从未设置过密码 |
-| 存在 | 非 Argon2i | - | ✗ | 迁移用户（如 SHA-256、BCrypt 等），允许使用相同密码重新加密 |
-| 存在 | Argon2i | false（密码不同） | ✗ | 正常改密，新密码与旧密码不同 |
-| 存在 | Argon2i | true（密码相同） | ✓ | **唯一触发场景**：Argon2i 加密用户尝试使用相同密码 |
+| 外层条件 | oldPasswordEncrypted | 加密方法 | argon2Verify | 触发 same_password？ | 场景说明 |
+|---------|---------------------|---------|-------------|---------------------|----------|
+| 无 user | - | - | - | ✗ | 注册流程，无用户上下文 |
+| 有 user | null/undefined | - | - | ✗ | 用户从未设置过密码 |
+| 有 user | 存在 | 非 Argon2i | - | ✗ | 迁移用户（如 SHA-256、BCrypt 等），允许使用相同密码重新加密 |
+| 有 user | 存在 | Argon2i | false（密码不同） | ✗ | 正常改密，新密码与旧密码不同 |
+| 有 user | 存在 | Argon2i | true（密码相同） | ✓ | **唯一触发场景**：Argon2i 加密用户尝试使用相同密码 |
 
 > **关键洞察**：迁移用户（非 Argon2i 加密）在找回密码时，即使输入与旧密码完全相同的新密码，也不会触发 `same_password` 错误。这是为了支持"将旧算法密码平滑迁移到 Argon2i"的场景。
+>
+> **避免歧义**：不能简单说"找回密码会检查新旧密码是否相同"，准确表述是"找回密码会执行 same_password 检查逻辑，但只有 Argon2i 加密且密码真正相同时才会拦截"。
 
 ### 2.4 reset=true 影响范围分析
 
@@ -179,9 +187,9 @@ async setPasswordDigestWithValidation(password: string, reset = false) {
 | 重复/序列密码 | `password-policy.ts:203-206` | 重复字符、序列模式检查 |
 | 用户信息敏感字段 | `password-policy.ts:212-218` | 姓名、用户名、邮箱、手机号比对 |
 | 自定义拒绝词 | `password-policy.ts:208-210` | 自定义词列表检查 |
-| **新旧密码相同检查** | `password-validator.ts:57-67` | **argon2Verify 比对新旧密码哈希**，只要 `this.user` 存在就执行 |
+| **新旧密码相同检查** | `password-validator.ts:57-67` | **argon2Verify 比对新旧密码哈希**，需同时满足：`this.user` 存在、`oldPasswordEncrypted` 非空、`passwordEncryptionMethod === Argon2i`、密码相同 |
 
-### 2.5 三条流程对比表
+### 2.5 四条流程对比表
 
 | 检查项 | 注册 | 找回密码 | 改密（交互） | 改密（账户中心） |
 |--------|------|----------|------------|----------------|
@@ -191,14 +199,18 @@ async setPasswordDigestWithValidation(password: string, reset = false) {
 | 重复/序列密码 | ✓ | ✓ | ✓ | ✓ |
 | 用户信息敏感字段 | ✓ | ✓ | ✓ | ✓ |
 | 自定义拒绝词 | ✓ | ✓ | ✓ | ✓ |
-| 新旧密码相同检查 (`same_password`) | ✗ | ✓ | ✓ | ✓ |
-| 密码已存在检查 (`password_exists_in_profile`) | ✗ | ✗ | ✓ | ✗ |
+| **新旧密码相同检查 (`same_password`)** | ✗ | ◇<sup>[1]</sup> | ◇<sup>[1]</sup> | ◇<sup>[1]</sup> |
+| 密码已存在检查 (`password_exists_in_profile`) | ✗ | ✗ | ✓<sup>[2]</sup> | ✗ |
+
+> **注解**：
+> - [1] **◇ 有条件执行**：仅当 `user` 存在、`oldPasswordEncrypted` 非空、`passwordEncryptionMethod === Argon2i`、且 `argon2Verify(新密码, 旧哈希) = true` 四个条件同时满足时才拦截。迁移用户（非 Argon2i 加密）即使密码相同也不会被拦截。
+> - [2] interaction 侧 SignIn 事件的判定口径包含社交身份（`identities` 长度 > 0 也算"已设置密码"），experience 侧仅判断 `passwordEncrypted` 字段。
 
 **关键差异说明**：
 - **注册**：无 user 上下文，不执行任何用户相关的历史密码检查
-- **找回密码**：有 user 上下文，`reset=true` 仅跳过"密码已存在"检查，但`same_password` 检查仍执行（注意 Argon2i 迁移用户例外）
+- **找回密码**：有 user 上下文，`reset=true` 仅跳过"密码已存在"检查，但 `same_password` 检查逻辑仍会执行（注意 Argon2i 迁移用户例外）
 - **改密（交互）**：有 user 上下文，`reset=false`，执行全部检查
-- **改密（账户中心）**：直接调用 `PasswordValidator.validatePassword()`，不经过 `setPasswordDigestWithValidation`，所以不执行"密码已存在"检查，但 `same_password` 检查仍执行
+- **改密（账户中心）**：直接调用 `PasswordValidator.validatePassword()`，不经过 `setPasswordDigestWithValidation`，所以不执行"密码已存在"检查，但 `same_password` 检查逻辑仍执行
 
 ---
 
@@ -208,42 +220,76 @@ async setPasswordDigestWithValidation(password: string, reset = false) {
 
 #### 链路 A：experience 侧（新版）
 - **入口**：`PUT /experience/profile/password` (`profile-routes.ts:141-179`)
-- **校验时机**：密码提交时立即校验
+- **校验时机**：密码提交时一次性完整校验
 - **校验流程**：
   ```
   setPasswordDigestWithValidation(password, true)
     → PasswordValidator.validatePassword()
-       → 密码策略校验（长度、字符类型、pwned等）
+       → 密码策略校验（长度、字符类型、pwned等）✓
        → same_password 检查（含 Argon2i 条件）✓
     → reset=true，跳过 password_exists_in_profile 检查 ✗
   ```
 
 #### 链路 B：interaction 侧（旧版）
 - **入口**：`PUT /interaction` → `PUT /interaction/profile` → `POST /interaction/submit`
-- **校验时机**：分两阶段校验
+- **校验时机**：策略校验即时，same_password 检查延迟
 - **校验流程**：
-  ```
-  阶段1：创建/更新 Profile 时
-    → validatePassword() (interaction/utils/validate-password.ts:58-76)
-       → 仅调用 checker.check()，做密码策略校验 ✓
-       → ❗ 不检查 same_password ✗
-       → ❗ 不检查 password_exists_in_profile ✗
-  
-  阶段2：提交 Interaction 时
-    → verifyProfile() (interaction/verifications/profile-verification.ts:163-214)
-       → forgotPasswordProfileGuard 确保 password 存在 ✓
-       → same_password 检查（含 Argon2i 条件，与 experience 侧完全相同）✓
-       → ❗ 不检查 password_exists_in_profile ✗
-  ```
+
+  **步骤 1：创建交互**（`PUT /interaction`, `index.ts:101-104`）
+  - 调用 `validatePassword(tenant, profile?.password, ...)`
+  - `password` 是可选的（`profile?.password`），如果创建时不带密码则跳过
+  - 只要 `password` 存在就执行密码策略校验 ✓
+  - ❗ 不检查 same_password ✗
+
+  **步骤 2：替换 Profile**（`PUT /interaction/profile`, `index.ts:232-235`）
+  - 调用 `validatePassword(tenant, profilePayload.password, ...)`
+  - 只要 `password` 存在就执行密码策略校验 ✓
+  - ❗ 不检查 same_password ✗
+
+  **步骤 3：更新 Profile**（`PATCH /interaction/profile`, `index.ts:276-280`）
+  - 调用 `validatePassword(tenant, profilePayload.password, ...)`
+  - 只要 `password` 存在就执行密码策略校验 ✓
+  - ❗ 不检查 same_password ✗
+
+  **步骤 4：提交交互**（`POST /interaction/submit` → `verifyProfile()`, `profile-verification.ts:199-206`）
+  - `forgotPasswordProfileGuard` 确保 `password` 字段存在 ✓
+  - same_password 检查（含 Argon2i 条件，与 experience 侧完全相同）✓
+  - ❗ 不检查 password_exists_in_profile ✗
+
+> **重要澄清**：interaction 侧的密码策略校验**不是**延迟到某个"阶段1"，而是在**每个调用点**（创建交互、替换 Profile、更新 Profile）都会即时执行。只要请求中携带了 `password` 字段，`validatePassword()` 就会立即做策略校验。只有 `same_password` 检查是延迟到 submit 时才执行。
 
 **两侧关键差异对比**：
 
 | 校验项 | experience 侧 | interaction 侧 |
 |--------|--------------|----------------|
-| 密码策略校验 | 提交时 | 提交时 |
-| same_password 检查 | 提交时立即 | 延迟到 submit 时 |
+| 密码策略校验时机 | 提交时一次性 | 每个调用点即时（共 3 处） |
+| 密码策略校验完整性 | 完整 | 完整（与 experience 侧相同） |
+| same_password 检查时机 | 提交时立即 | 仅 submit 时 |
 | password_exists_in_profile | ✗ | ✗ |
 | Argon2i 迁移用户例外 | ✓ | ✓ |
+
+**interaction 侧密码策略校验的 3 个调用点汇总**：
+
+| 路由 | 调用位置 | password 参数 | 说明 |
+|------|---------|--------------|------|
+| `PUT /interaction` | `index.ts:101-104` | `profile?.password`（可选） | 创建交互时，如果 body 带 profile.password 就校验 |
+| `PUT /interaction/profile` | `index.ts:232-235` | `profilePayload.password`（可选） | 替换 Profile 时，如果带 password 就校验 |
+| `PATCH /interaction/profile` | `index.ts:276-280` | `profilePayload.password`（可选） | 更新 Profile 时，如果带 password 就校验 |
+
+**`validatePassword()` 函数行为**（`interaction/utils/validate-password.ts:58-76`）：
+```typescript
+export const validatePassword = async (tenant, password, checker, { identifiers, profile }) => {
+  if (password === undefined) {
+    return;  // 无密码直接返回，不抛错
+  }
+  // 执行完整策略校验（长度、字符类型、pwned、重复/序列、用户信息、拒绝词）
+  const issues = await checker.check(password, userInfo);
+  if (issues.length > 0) {
+    throw new RequestError('password.rejected', issues);
+  }
+};
+```
+> 注意：`validatePassword()` 只做**策略校验**，从不做 `same_password` 检查，这一点两侧完全一致。
 
 ---
 
