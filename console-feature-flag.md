@@ -265,7 +265,7 @@ if (hasScopesRevoked) {
 
 ### 3.4 边界场景：同一轮权限同时新增和撤销
 
-当管理员在同一操作中同时授予和撤销多个权限时，代码中的两个 `if` 分支会按顺序执行。
+当管理员在同一操作中同时授予和撤销多个权限时，代码中的两个 `if` 分支**都会进入**，因为第一个分支的异步逻辑不会阻塞第二个分支。
 
 **代码执行顺序** (`hooks.ts:48-65`)：
 ```typescript
@@ -275,17 +275,25 @@ const hasScopesRevoked = tokenClaims.some((claim) => !scopes?.includes(claim));
 
 if (hasScopesGranted) {
   // 分支 1：新权限授予
-  saveRedirect();
-  await clearAllTokens();  // ✅ 会 await 完成
-  void signIn({ ... });     // ⚡ 触发页面跳转，组件卸载
+  // ⚠️  注意：这里是异步 IIFE，用 void 调用，不阻塞后续代码！
+  (async () => {
+    saveRedirect();
+    await clearAllTokens();  // await 只阻塞 IIFE 内部，不阻塞外部
+    void signIn({ ... });     // 触发页面跳转
+  })();
 }
 
 if (hasScopesRevoked) {
   // 分支 2：权限撤销
-  // ❌ 当分支 1 执行时，这里永远不会执行
+  // ✅ 当分支 1 执行时，这里仍然会执行！
   void clearAccessToken();
 }
 ```
+
+**关键代码细节**：
+- 第一个 `if` 内部是**异步 IIFE**，使用 `void` 调用，**不返回 Promise，不阻塞**后续代码执行
+- `await clearAllTokens()` 只阻塞 IIFE 函数内部，**不会阻塞**外面的第二个 `if` 判断
+- 所以当两个条件都为 `true` 时，**两个分支都会进入**
 
 **执行时序与结果**：
 
@@ -295,33 +303,53 @@ hasScopesGranted = true AND hasScopesRevoked = true
     ▼
 进入第一个 if 块
     │
-    ├─ saveRedirect() — 保存当前页面 URL
+    ├─ 调用 void (async () => { ... })() — 启动异步函数，不阻塞
+    │   ├─ saveRedirect() — 同步执行，保存当前页面 URL
+    │   ├─ await clearAllTokens() — 开始执行，返回 Promise，函数挂起
+    │   └─ ⏳ 等待 clearAllTokens 完成
     │
-    ├─ await clearAllTokens() — 清除所有 token（等待完成）
+    ▼
+立即进入第二个 if 块（无需等待第一个分支完成！）
     │
-    └─ void signIn({ prompt: Prompt.Consent }) — 触发跳转，无需等待
-        │
-        ▼
-    浏览器开始导航到授权页面，当前组件开始卸载
-        │
-        ▼
-    第二个 if 块永远不会执行（组件已卸载，effect 清理）
-        │
-        ▼
+    └─ void clearAccessToken() — 同步执行，清除 access token
+    │
+    ▼
+此时两个异步操作并发执行：
+    ├─ clearAccessToken() 已完成
+    └─ clearAllTokens() 仍在执行中
+    │
+    ▼
+clearAllTokens() 完成，继续执行：
+    └─ void signIn({ prompt: Prompt.Consent }) — 触发跳转
+    │
+    ▼
+浏览器开始导航到授权页面，当前组件卸载
+    │
+    ▼
 用户在授权页面同意授权
-        │
-        ▼
+    │
+    ▼
 授权服务器返回最新权限的 token（同时包含新增和排除已撤销）
-        │
-        ▼
+    │
+    ▼
 跳转回保存的页面，新 token 生效
-        │
-        ▼
+    │
+    ▼
 ✅ 最终结果：权限状态正确，无需额外处理
 ```
 
+**对最终令牌的影响**：
+
+| 操作 | 执行时机 | 对令牌的影响 |
+|------|---------|-------------|
+| `clearAccessToken()` | 先执行 | 清除 access token 缓存 |
+| `clearAllTokens()` | 后执行（await 中） | 清除所有 token（access + refresh） |
+| `signIn()` | 最后执行 | 获取全新 token，包含最新权限 |
+
 **关键设计考量**：
-- 即使 `hasScopesRevoked` 分支未执行，重新授权后从服务器获取的新 token 已经是最新的权限集合，天然排除了已撤销的权限
+- 即使两个分支都执行，最终结果仍然正确
+- `clearAllTokens()` 内部已经包含了清除 access token 的逻辑，和 `clearAccessToken()` 重复执行不影响结果
+- 重新授权后从服务器获取的新 token 天然就是最新的权限集合，自动排除了已撤销的权限
 - 这是有意的设计：通过重新授权一次性解决所有权限变更，避免了复杂的状态同步
 
 ---
@@ -342,10 +370,13 @@ useCurrentTenantScopes 获取最新 scopes
     │
     ├─► scopes.length === 0 ──► 移除租户，跳转根路径
     │
-    ├─► hasScopesGranted ──► 保存重定向，清除全部 Token，重新授权
-    │                          （若同时有撤销，新 token 自动排除）
+    ├─► hasScopesGranted ──► 异步执行：保存重定向 → await clearAllTokens() → signIn()
+    │   │                     （void 调用，不阻塞后续代码）
+    │   │
+    │   └─► 若同时 hasScopesRevoked = true
+    │          └─► 第二个 if 也会进入，void clearAccessToken() 并行执行
     │
-    └─► hasScopesRevoked ──► 清除 access token，自动刷新获取缩小范围的新 Token
+    └─► 仅 hasScopesRevoked ──► 清除 access token，自动刷新获取缩小范围的新 Token
     │
     ▼
 页面内 useCurrentTenantScopes().access 反映最新权限
@@ -376,9 +407,10 @@ SWR 的缓存 key 就是 API 请求路径，**不包含租户 ID**：
 
 ### 4.2 缓存清理实现
 
-位置：`containers/TenantAccess/index.tsx:51-71`
+位置：`containers/TenantAccess/index.tsx:49-98`
 
 ```typescript
+// ⚠️  注意：isCacheCleared 是组件 state，不会随 currentTenantId 变化自动重置！
 const [isCacheCleared, setIsCacheCleared] = useState(false);
 
 // 当 currentTenantId 变化时清理缓存
@@ -400,7 +432,7 @@ useEffect(() => {
   })();
 }, [mutate, currentTenantId]);
 
-// 缓存清理完成前不渲染任何内容
+// 仅首次挂载时为 false，切换租户时保持 true，不会白屏
 if (!isCacheCleared) {
   return null;
 }
@@ -408,47 +440,82 @@ if (!isCacheCleared) {
 return <Outlet />;
 ```
 
+**关键代码细节**：
+- `isCacheCleared` 是**组件内部 state**，初始值为 `false`
+- 仅在首次挂载时为 `false`，一旦设为 `true` 后**永远不会自动重置**
+- `currentTenantId` 变化只会触发 `useEffect` 重新执行，**不会重置 state**
+- 所以切换租户时，`isCacheCleared` 始终为 `true`，**不会白屏**
+
 ### 4.3 清理流程时序
 
+#### 首次挂载（tenant-A）
+
 ```
-用户点击切换租户（从 tenant-A 到 tenant-B）
+组件首次挂载
     │
     ▼
-URL 变化，React Router 匹配新的 currentTenantId
+isCacheCleared = false (初始值)
     │
     ▼
-TenantAccess 组件检测到 currentTenantId 变化
+返回 null（白屏）
     │
-    ├─ isCacheCleared 重置为 false
+    ▼
+useEffect 执行：
+    ├─ await mutate(...) — 清理所有缓存
+    └─ setIsCacheCleared(true)
     │
-    ├─ 调用 mutate() 批量清理 SWR 缓存
-    │   ├─ 清除 'api/applications' 缓存（tenant-A 的数据）
-    │   ├─ 清除 'api/users' 缓存（tenant-A 的数据）
-    │   ├─ ...（其他所有业务数据缓存）
-    │   └─ 保留 'me' 和 '/.well-known/' 相关缓存
+    ▼
+isCacheCleared = true
     │
-    └─ isCacheCleared 设为 true
-        │
-        ▼
-    <Outlet /> 渲染新租户的页面内容
-        │
-        ▼
-    各页面组件检测到数据为 undefined，自动发起新请求
-        │
-        ▼
-    新请求携带 tenant-B 的上下文，获取正确数据
-        │
-        ▼
+    ▼
+返回 <Outlet />，显示 tenant-A 的内容
+```
+
+#### 切换租户（从 tenant-A 到 tenant-B）
+
+```
+用户点击切换租户
+    │
+    ▼
+URL 变化，currentTenantId 从 tenant-A 变为 tenant-B
+    │
+    ▼
+TenantAccess 组件检测到变化，但组件不卸载，state 保持不变
+    │
+    ├─ isCacheCleared 仍然是 true ⭐ （不会重置！）
+    │
+    ├─ 继续返回 <Outlet />，显示 tenant-A 的旧内容
+    │
+    ├─ useEffect 重新执行：
+    │   ├─ await mutate(..., undefined) — 将缓存设为 undefined
+    │   ├─ 各页面组件检测到数据变为 undefined，显示 loading 状态
+    │   └─ setIsCacheCleared(true) — 值无变化，不触发重渲染
+    │
+    ▼
+各页面组件自动发起新请求，携带 tenant-B 上下文
+    │
+    ▼
+新数据返回，替换为 tenant-B 的内容
+    │
+    ▼
 ✅ 最终结果：页面显示 tenant-B 的数据，无跨租户脏数据
+```
+
+**⏱️ 用户体感时序**：
+```
+点击切换 → 旧内容保持 → 各页面进入 loading → 新内容显示
+      (无白屏)    (缓存被设为 undefined)    (数据请求完成)
 ```
 
 ### 4.4 为什么这种方式能避免脏数据
 
 | 不清理缓存的后果 | 清理缓存后的正确行为 |
 |-----------------|---------------------|
-| SWR 返回缓存的 tenant-A 数据 | 缓存被设为 undefined，触发重新请求 |
-| 用户短暂看到前一个租户的数据 | 清理期间显示 null（白屏），然后显示新数据 |
-| 可能触发错误的操作（如删除前租户资源） | 所有操作基于新租户的正确数据 |
+| SWR 返回缓存的 tenant-A 数据 | `mutate(undefined)` 将缓存设为 undefined，触发重新请求 |
+| 用户看到前一个租户的数据 | 切换瞬间仍显示旧内容，但缓存立即失效，随后显示 loading |
+| 可能触发错误的操作（如删除前租户资源） | 所有新请求基于新租户的正确上下文 |
+
+> **⚠️ 注意**：`mutate(undefined)` 会立即将缓存值设为 undefined，但不会导致白屏，因为 `isCacheCleared` 始终为 `true`，`<Outlet />` 持续渲染。页面组件会根据 `data = undefined` 显示各自的 loading 状态。
 
 ---
 
@@ -982,8 +1049,9 @@ location.reload();
 1. 用两个浏览器窗口登录不同账号（管理员 A 和成员 B）
 2. 管理员 A 给成员 B 授予新权限或撤销现有权限
 3. 观察成员 B 的控制台：
-   - 授予新权限：自动跳转到授权页面，同意后返回原页面
-   - 撤销权限：页面静默刷新，相关功能按钮消失
+   - 仅授予新权限：自动跳转到授权页面，同意后返回原页面
+   - 仅撤销权限：静默清除 access token，自动刷新获取缩小范围的新 token，相关功能按钮消失
+   - 同时授予和撤销：两个分支都会执行，`clearAccessToken` 和 `clearAllTokens` 并行触发，最终跳转到授权页面，新 token 包含最新权限
    - 移除所有权限：自动跳转回租户选择页面
 
 ---
@@ -998,14 +1066,15 @@ location.reload();
    - 授予新权限：`manage:tenant`
    - 撤销现有权限：`invite:member`
 3. 观察成员 B 的控制台：
-   - ✅ 自动跳转到授权页面（证明 `hasScopesGranted` 分支先执行）
+   - ✅ 自动跳转到授权页面（`hasScopesGranted` 分支触发）
+   - ✅ 两个 `if` 分支都会进入（`clearAccessToken` 也会执行）
    - ✅ 同意授权后返回原页面
    - ✅ `canInviteMember = false`（原权限已撤销）
    - ✅ `canManageTenant = true`（新权限已生效）
    - ✅ 邀请成员按钮消失
    - ✅ 租户设置-订阅标签页可见
 
-**预期结果**：通过一次重新授权，权限状态完全正确。
+**预期结果**：通过一次重新授权，权限状态完全正确，两个分支并行执行不影响最终结果。
 
 ---
 
@@ -1015,12 +1084,16 @@ location.reload();
 1. 登录租户 A，进入「应用」页面，查看应用列表（如 App1, App2）
 2. 切换到租户 B，同样进入「应用」页面
 3. 观察：
-   - ✅ 切换瞬间短暂白屏（缓存清理期间）
+   - ✅ 切换瞬间**不会白屏**（`isCacheCleared` 始终为 `true`）
+   - ✅ 短暂显示租户 A 的 App1, App2 旧内容
+   - ✅ 随后进入 loading 状态（缓存被 `mutate(undefined)` 清空）
    - ✅ 显示租户 B 的应用列表，**不显示**租户 A 的 App1, App2
    - ✅ 打开浏览器 DevTools → Application → Local Storage → 查看 SWR 缓存
    - ✅ 缓存中只有租户 B 的数据，租户 A 的数据已被清理
 
-**预期结果**：无跨租户数据泄露。
+**用户体感时序**：`点击切换 → 旧内容 → loading → 新内容`
+
+**预期结果**：无跨租户数据泄露，切换过程平滑无白屏。
 
 ---
 
