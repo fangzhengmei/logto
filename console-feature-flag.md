@@ -277,16 +277,16 @@ if (hasScopesGranted) {
   // 分支 1：新权限授予
   // ⚠️  注意：这里是异步 IIFE，用 void 调用，不阻塞后续代码！
   (async () => {
-    saveRedirect();
-    await clearAllTokens();  // await 只阻塞 IIFE 内部，不阻塞外部
-    void signIn({ ... });     // 触发页面跳转
-  })();
+    saveRedirect();              // [同步段] 立即执行
+    await clearAllTokens();      // [await 挂起点] 返回 Promise，函数暂停
+    void signIn({ ... });         // [恢复点] Promise resolve 后执行
+  })();  // ← void 调用，不返回 Promise，不阻塞！
 }
 
 if (hasScopesRevoked) {
   // 分支 2：权限撤销
   // ✅ 当分支 1 执行时，这里仍然会执行！
-  void clearAccessToken();
+  void clearAccessToken();       // [同步段] 立即执行
 }
 ```
 
@@ -295,56 +295,119 @@ if (hasScopesRevoked) {
 - `await clearAllTokens()` 只阻塞 IIFE 函数内部，**不会阻塞**外面的第二个 `if` 判断
 - 所以当两个条件都为 `true` 时，**两个分支都会进入**
 
-**执行时序与结果**：
+---
+
+### 3.4.1 事件循环视角下的执行顺序
+
+以 `hasScopesGranted = true` 且 `hasScopesRevoked = true` 为例，从 JavaScript 事件循环视角精确分析：
+
+#### 📍 阶段 1：同步执行段（Call Stack 执行）
 
 ```
-hasScopesGranted = true AND hasScopesRevoked = true
-    │
-    ▼
-进入第一个 if 块
-    │
-    ├─ 调用 void (async () => { ... })() — 启动异步函数，不阻塞
-    │   ├─ saveRedirect() — 同步执行，保存当前页面 URL
-    │   ├─ await clearAllTokens() — 开始执行，返回 Promise，函数挂起
-    │   └─ ⏳ 等待 clearAllTokens 完成
-    │
-    ▼
-立即进入第二个 if 块（无需等待第一个分支完成！）
-    │
-    └─ void clearAccessToken() — 同步执行，清除 access token
-    │
-    ▼
-此时两个异步操作并发执行：
-    ├─ clearAccessToken() 已完成
-    └─ clearAllTokens() 仍在执行中
-    │
-    ▼
-clearAllTokens() 完成，继续执行：
-    └─ void signIn({ prompt: Prompt.Consent }) — 触发跳转
-    │
-    ▼
-浏览器开始导航到授权页面，当前组件卸载
-    │
-    ▼
-用户在授权页面同意授权
-    │
-    ▼
-授权服务器返回最新权限的 token（同时包含新增和排除已撤销）
-    │
-    ▼
-跳转回保存的页面，新 token 生效
-    │
-    ▼
-✅ 最终结果：权限状态正确，无需额外处理
+Call Stack:
+┌───────────────────────────────────────────────────┐
+│ 1. hasScopesGranted = true                       │
+│ 2. 进入第一个 if 块                               │
+│ 3. 调用 void (async () => { ... })()              │
+│    ├─ 执行 saveRedirect() ✓ 同步完成             │
+│    ├─ 调用 clearAllTokens() → 返回 Promise P1    │
+│    └─ 遇到 await P1 → 函数挂起，注册微任务       │
+│ 4. 退出第一个 if 块                               │
+│ 5. hasScopesRevoked = true                       │
+│ 6. 进入第二个 if 块                               │
+│ 7. 调用 void clearAccessToken()                   │
+│    └─ 执行 clearAccessToken() → 返回 Promise P2  │
+│       (void 忽略 Promise，继续执行)                │
+│ 8. 退出第二个 if 块                               │
+│ 9. Call Stack 清空                                │
+└───────────────────────────────────────────────────┘
+         │
+         ▼
+Microtask Queue: [ P1.then(恢复 IIFE 执行) ]
+Macrotask Queue: [ 浏览器事件、渲染等 ]
 ```
 
-**对最终令牌的影响**：
+**⏰ 时间点 T0**：两个 `if` 判断都已完成同步执行
+- `saveRedirect()` 已完成
+- `clearAllTokens()` 已开始执行（Promise P1 pending）
+- `clearAccessToken()` 已开始执行（Promise P2 pending）
+- 两个异步操作**并发执行**
 
-| 操作 | 执行时机 | 对令牌的影响 |
-|------|---------|-------------|
-| `clearAccessToken()` | 先执行 | 清除 access token 缓存 |
-| `clearAllTokens()` | 后执行（await 中） | 清除所有 token（access + refresh） |
-| `signIn()` | 最后执行 | 获取全新 token，包含最新权限 |
+---
+
+#### 📍 阶段 2：微任务执行（Microtask Queue 处理）
+
+假设 `clearAccessToken()` 先完成：
+
+```
+时间点 T1: P2 resolve (clearAccessToken 完成)
+Microtask Queue: [ P1.then(...) ]
+
+时间点 T2: P1 resolve (clearAllTokens 完成)
+Microtask Queue: [ P1.then(恢复 IIFE 执行) ]
+
+→ 取出微任务执行：
+   ┌──────────────────────────────────────────┐
+   │ 恢复 IIFE 执行：                         │
+   │ await clearAllTokens() 后面的代码        │
+   │ void signIn({ prompt: Prompt.Consent })  │
+   │ → 触发浏览器导航                         │
+   └──────────────────────────────────────────┘
+```
+
+**⏰ 时间点 T2**：`signIn()` 开始执行，触发页面跳转
+- 浏览器开始导航到授权页面
+- 当前组件开始卸载
+
+---
+
+#### 📍 完整执行时序图（事件循环视角）
+
+```
+T0 ── 同步段 ──┬───────────────────────────────────
+              │
+              ├─ saveRedirect() ✓
+              ├─ clearAllTokens() → P1 [pending]
+              ├─ await P1 → 挂起
+              ├─ clearAccessToken() → P2 [pending]
+              │
+T1 ───────────┼─ P2 resolve (clearAccessToken 完成)
+              │
+T2 ───────────┼─ P1 resolve (clearAllTokens 完成)
+              │
+              ├─ 微任务执行：恢复 IIFE
+              ├─ signIn() → 触发跳转
+              │
+T3 ───────────┴─ 浏览器导航，组件卸载
+```
+
+---
+
+### 3.4.2 对最终令牌的影响
+
+| 操作 | 执行阶段 | 实际效果 | 对最终令牌的影响 |
+|------|---------|---------|-----------------|
+| `saveRedirect()` | T0 同步段 | 保存当前 URL 到 sessionStorage | 无影响 |
+| `clearAccessToken()` | T0 同步段启动<br>T1 完成 | 清除 access token 缓存 | 已清除 access token |
+| `clearAllTokens()` | T0 同步段启动<br>T2 完成 | 清除 **所有** token（access + refresh） | 已清除所有 token（包含 access） |
+| `signIn()` | T2 微任务阶段 | 跳转到授权页面 | 获取 **全新 token**，包含最新权限 |
+
+**🔍 关键观察**：
+
+1. **`clearAccessToken()` 的执行是多余但无害的**：
+   - `clearAccessToken()` 在 T1 清除 access token
+   - `clearAllTokens()` 在 T2 又清除了所有 token（包括 access）
+   - 重复清除不影响结果，只是多做了一次操作
+
+2. **最终令牌状态完全由 `signIn()` 决定**：
+   - 无论之前清除了多少次，`signIn()` 都会从授权服务器获取**全新的 token**
+   - 新 token 包含最新的权限集合（已加入新权限，已排除撤销的权限）
+   - 所以即使两个分支都执行，最终结果仍然正确
+
+3. **为什么不做 `if-else`**：
+   - 如果是 `if-else`，当同时有新增和撤销时，只会走新增分支
+   - 但当前设计是两个独立 `if`，撤销分支也会执行
+   - 这是有意的鲁棒性设计：即使 `signIn()` 失败，撤销分支也已确保 access token 被清除，不会保留过期权限
 
 **关键设计考量**：
 - 即使两个分支都执行，最终结果仍然正确
@@ -417,13 +480,16 @@ const [isCacheCleared, setIsCacheCleared] = useState(false);
 useEffect(() => {
   (async () => {
     /**
-     * 官方推荐的缓存清理方式。
-     * 例外：
-     * - 'me'：用户个人信息，不感知租户
-     * - '/.well-known/'：静态配置，无需重新验证
+     * 官方推荐的缓存清理方式，see {@link https://github.com/vercel/swr/issues/1887#issuecomment-1171269211 | this comment}.
+     *
+     * Exceptions:
+     * - Exclude the `me` key because it's not tenant-aware. If don't, we need to manually
+     *   revalidate the `me` key to make console work again.
+     * - Exclude keys that include `/.well-known/` because they are usually static and
+     *   should not be revalidated.
      */
     await mutate(
-      // 匹配规则：清理所有字符串 key，除了 'me' 和 '/.well-known/'
+      // 谓词函数：返回 true 表示清理该 key
       (key) => typeof key !== 'string' || (key !== 'me' && !key.includes('/.well-known/')),
       undefined,  // 将缓存值设为 undefined
       { rollbackOnError: false, throwOnError: false }  // 静默清理
@@ -445,6 +511,48 @@ return <Outlet />;
 - 仅在首次挂载时为 `false`，一旦设为 `true` 后**永远不会自动重置**
 - `currentTenantId` 变化只会触发 `useEffect` 重新执行，**不会重置 state**
 - 所以切换租户时，`isCacheCleared` 始终为 `true`，**不会白屏**
+
+### 4.2.1 缓存清理谓词精确命中分析
+
+谓词函数逻辑：`(key) => typeof key !== 'string' || (key !== 'me' && !key.includes('/.well-known/'))`
+
+谓词返回 `true` → 该 key 会被清理。
+
+**精确真值表**：
+
+| key 类型 | key 示例 | `typeof key !== 'string' | `key !== 'me'` | `!key.includes('/.well-known/')` | 整体结果 | 是否被清理 |
+|---------|----------|------------------------|--------------|---------------------------------|----------|------------|
+| `string` | `'me'` | `false` | `false` | `true` | `false \|\| (false && true)`<br>= `false` | ❌ **保留** |
+| `string` | `'api/.well-known/openid-configuration` | `false` | `true` | `false` | `false \|\| (true && false)`<br>= `false` | ❌ **保留** |
+| `string` | `'api/applications'` | `false` | `true` | `true` | `false \|\| (true && true)`<br>= `true` | ✅ **清理** |
+| `string` | `'api/users'` | `false` | `true` | `true` | `true` | ✅ **清理** |
+| `string` | `'api/dashboard/statistics'` | `false` | `true` | `true` | `true` | ✅ **清理** |
+| `object` | `{ path: 'api/hooks/123' }` | `true` | - | - | `true \|\| ...` = `true` | ✅ **清理** |
+| `array` | `['api/users', { page: 1 }]` | `true` | - | - | `true \|\| ...` = `true` | ✅ **清理** |
+| 其他非字符串 | 数字、Symbol 等 | `true` | - | - | `true \|\| ...` = `true` | ✅ **清理** |
+
+**命中范围总结**：
+
+✅ **会被清理的 key**：
+1. **所有非字符串 key**（对象、数组、数字、Symbol 等）全部清理
+2. **字符串 key** 中，除了 `'me'` 和包含 `'/.well-known/'` 的，其余全部清理
+
+❌ **会被保留的 key**：
+1. 字符串 key **等于 `'me'`**（用户个人信息，不感知租户）
+2. 字符串 key **包含 `'/.well-known/'`**（静态配置，无需重新验证）
+
+**代码中的非字符串 key 场景**：
+
+虽然控制台大部分 SWR key 是字符串路径（如 `'api/applications'`），但也存在非字符串 key 的使用场景：
+
+```typescript
+// 乐观更新时，使用对象作为 key（通过 SWR 内部 key）
+mutate({ ...updatedHook, executionStats: data.executionStats });
+```
+
+这些非字符串 key 在租户切换时**全部会被清理**，确保不会有跨租户数据泄露。
+
+> **为什么谓词这样设计**：`typeof key !== 'string'` 放在 `||` 前面，确保所有非字符串 key 都匹配第一个条件直接返回 `true`，不会进入后面的字符串判断逻辑。这是一种防御性设计，即使未来引入非字符串 key，也能被正确清理。
 
 ### 4.3 清理流程时序
 
@@ -1074,6 +1182,20 @@ location.reload();
    - ✅ 邀请成员按钮消失
    - ✅ 租户设置-订阅标签页可见
 
+**事件循环视角验证**（高级调试）：
+
+在 DevTools 中对以下位置打断点，观察执行顺序：
+
+| 断点位置 | 预期执行顺序 | 验证点 |
+|---------|-------------|--------|
+| `hooks.ts:50`（第一个 if 入口） | T0 | 进入 hasScopesGranted 分支 |
+| `hooks.ts:53`（`saveRedirect()` 后） | T0 | 同步代码已执行 |
+| `hooks.ts:54`（`await clearAllTokens()`） | T0 | 函数挂起，注册微任务 |
+| `hooks.ts:61`（第二个 if 入口） | T0 | **立即进入**，无需等待 |
+| `hooks.ts:64`（`clearAccessToken()`） | T0 | 同步代码已执行，返回 Promise |
+| `hooks.ts:55`（`await` 恢复后） | T2 | 微任务执行，`clearAllTokens` 已完成 |
+| `hooks.ts:55`（`signIn()`） | T2 | 触发跳转 |
+
 **预期结果**：通过一次重新授权，权限状态完全正确，两个分支并行执行不影响最终结果。
 
 ---
@@ -1092,6 +1214,24 @@ location.reload();
    - ✅ 缓存中只有租户 B 的数据，租户 A 的数据已被清理
 
 **用户体感时序**：`点击切换 → 旧内容 → loading → 新内容`
+
+**缓存清理谓词验证**（可选高级测试）：
+```javascript
+// 在浏览器控制台验证谓词逻辑
+const predicate = (key) => 
+  typeof key !== 'string' || (key !== 'me' && !key.includes('/.well-known/'));
+
+// 测试字符串 key
+console.log(predicate('me'));                     // false ❌ 保留
+console.log(predicate('api/.well-known/config')); // false ❌ 保留
+console.log(predicate('api/applications'));       // true ✅ 清理
+console.log(predicate('api/users'));              // true ✅ 清理
+
+// 测试非字符串 key
+console.log(predicate({ path: 'api/hooks/123' })); // true ✅ 清理
+console.log(predicate(['api/users', 1]));          // true ✅ 清理
+console.log(predicate(123));                       // true ✅ 清理
+```
 
 **预期结果**：无跨租户数据泄露，切换过程平滑无白屏。
 
