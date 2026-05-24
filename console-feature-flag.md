@@ -263,7 +263,70 @@ if (hasScopesRevoked) {
 相关功能按钮隐藏或禁用
 ```
 
-### 3.4 权限变更链路时序图
+### 3.4 边界场景：同一轮权限同时新增和撤销
+
+当管理员在同一操作中同时授予和撤销多个权限时，代码中的两个 `if` 分支会按顺序执行。
+
+**代码执行顺序** (`hooks.ts:48-65`)：
+```typescript
+// 两个独立的 if 语句，不是 if-else
+const hasScopesGranted = scopes?.some((scope) => !tokenClaims.includes(scope));
+const hasScopesRevoked = tokenClaims.some((claim) => !scopes?.includes(claim));
+
+if (hasScopesGranted) {
+  // 分支 1：新权限授予
+  saveRedirect();
+  await clearAllTokens();  // ✅ 会 await 完成
+  void signIn({ ... });     // ⚡ 触发页面跳转，组件卸载
+}
+
+if (hasScopesRevoked) {
+  // 分支 2：权限撤销
+  // ❌ 当分支 1 执行时，这里永远不会执行
+  void clearAccessToken();
+}
+```
+
+**执行时序与结果**：
+
+```
+hasScopesGranted = true AND hasScopesRevoked = true
+    │
+    ▼
+进入第一个 if 块
+    │
+    ├─ saveRedirect() — 保存当前页面 URL
+    │
+    ├─ await clearAllTokens() — 清除所有 token（等待完成）
+    │
+    └─ void signIn({ prompt: Prompt.Consent }) — 触发跳转，无需等待
+        │
+        ▼
+    浏览器开始导航到授权页面，当前组件开始卸载
+        │
+        ▼
+    第二个 if 块永远不会执行（组件已卸载，effect 清理）
+        │
+        ▼
+用户在授权页面同意授权
+        │
+        ▼
+授权服务器返回最新权限的 token（同时包含新增和排除已撤销）
+        │
+        ▼
+跳转回保存的页面，新 token 生效
+        │
+        ▼
+✅ 最终结果：权限状态正确，无需额外处理
+```
+
+**关键设计考量**：
+- 即使 `hasScopesRevoked` 分支未执行，重新授权后从服务器获取的新 token 已经是最新的权限集合，天然排除了已撤销的权限
+- 这是有意的设计：通过重新授权一次性解决所有权限变更，避免了复杂的状态同步
+
+---
+
+### 3.5 权限变更链路时序图
 
 ```
 管理员在后台修改成员权限
@@ -280,6 +343,7 @@ useCurrentTenantScopes 获取最新 scopes
     ├─► scopes.length === 0 ──► 移除租户，跳转根路径
     │
     ├─► hasScopesGranted ──► 保存重定向，清除全部 Token，重新授权
+    │                          （若同时有撤销，新 token 自动排除）
     │
     └─► hasScopesRevoked ──► 清除 access token，自动刷新获取缩小范围的新 Token
     │
@@ -292,9 +356,225 @@ UI 自动更新（按钮隐藏/禁用、标签页裁剪等）
 
 ---
 
-## 4. 侧边栏菜单显隐逻辑
+## 4. 租户切换后的缓存清理机制
 
-### 4.1 菜单数据结构
+### 4.1 问题根源：SWR 缓存不感知租户
+
+SWR 的缓存 key 就是 API 请求路径，**不包含租户 ID**：
+```typescript
+// useCurrentTenantScopes 中的缓存 key
+`api/tenants/${currentTenantId}/members/${userId}/scopes`
+// => 注意：这个 key 包含 tenantId，但其他大部分 API 不包含
+
+// 其他典型 API 缓存 key
+'api/applications'           // ❌ 不包含租户 ID
+'api/users'                  // ❌ 不包含租户 ID
+'api/dashboard/statistics'   // ❌ 不包含租户 ID
+```
+
+如果不清理缓存，切换租户后会显示**上一个租户的数据**，造成严重的跨租户数据泄露风险。
+
+### 4.2 缓存清理实现
+
+位置：`containers/TenantAccess/index.tsx:51-71`
+
+```typescript
+const [isCacheCleared, setIsCacheCleared] = useState(false);
+
+// 当 currentTenantId 变化时清理缓存
+useEffect(() => {
+  (async () => {
+    /**
+     * 官方推荐的缓存清理方式。
+     * 例外：
+     * - 'me'：用户个人信息，不感知租户
+     * - '/.well-known/'：静态配置，无需重新验证
+     */
+    await mutate(
+      // 匹配规则：清理所有字符串 key，除了 'me' 和 '/.well-known/'
+      (key) => typeof key !== 'string' || (key !== 'me' && !key.includes('/.well-known/')),
+      undefined,  // 将缓存值设为 undefined
+      { rollbackOnError: false, throwOnError: false }  // 静默清理
+    );
+    setIsCacheCleared(true);
+  })();
+}, [mutate, currentTenantId]);
+
+// 缓存清理完成前不渲染任何内容
+if (!isCacheCleared) {
+  return null;
+}
+
+return <Outlet />;
+```
+
+### 4.3 清理流程时序
+
+```
+用户点击切换租户（从 tenant-A 到 tenant-B）
+    │
+    ▼
+URL 变化，React Router 匹配新的 currentTenantId
+    │
+    ▼
+TenantAccess 组件检测到 currentTenantId 变化
+    │
+    ├─ isCacheCleared 重置为 false
+    │
+    ├─ 调用 mutate() 批量清理 SWR 缓存
+    │   ├─ 清除 'api/applications' 缓存（tenant-A 的数据）
+    │   ├─ 清除 'api/users' 缓存（tenant-A 的数据）
+    │   ├─ ...（其他所有业务数据缓存）
+    │   └─ 保留 'me' 和 '/.well-known/' 相关缓存
+    │
+    └─ isCacheCleared 设为 true
+        │
+        ▼
+    <Outlet /> 渲染新租户的页面内容
+        │
+        ▼
+    各页面组件检测到数据为 undefined，自动发起新请求
+        │
+        ▼
+    新请求携带 tenant-B 的上下文，获取正确数据
+        │
+        ▼
+✅ 最终结果：页面显示 tenant-B 的数据，无跨租户脏数据
+```
+
+### 4.4 为什么这种方式能避免脏数据
+
+| 不清理缓存的后果 | 清理缓存后的正确行为 |
+|-----------------|---------------------|
+| SWR 返回缓存的 tenant-A 数据 | 缓存被设为 undefined，触发重新请求 |
+| 用户短暂看到前一个租户的数据 | 清理期间显示 null（白屏），然后显示新数据 |
+| 可能触发错误的操作（如删除前租户资源） | 所有操作基于新租户的正确数据 |
+
+---
+
+## 5. scopes 归零与租户不可用的两类跳转路径
+
+这两种情况都会导致用户离开当前租户，但触发条件、检测位置、处理方式完全不同。
+
+### 5.1 两类跳转的差异对比
+
+| 维度 | scopes 归零（权限被全部撤销） | 租户不可用（租户不存在/无访问权） |
+|------|-----------------------------|---------------------------------|
+| **触发条件** | `isCloud && !isLoading && scopes?.length === 0` | `isAuthenticated && currentTenantId && !currentTenant` |
+| **检测位置** | `useTenantScopeListener` (`hooks.ts:35-42`) | `TenantAccess` (`TenantAccess/index.tsx:73-92`) |
+| **用户租户列表状态** | 用户仍在租户列表中，但权限为空 | 租户 ID 不在用户租户列表中 |
+| **典型场景** | 管理员撤销了用户的所有权限但未移除用户 | 租户被删除、用户被移出租户、URL 输入不存在的租户 ID |
+| **跳转方式** | `navigateTenant('')`（React Router 软跳转） | `window.location.href = '/'`（浏览器硬跳转） |
+| **是否清理 Token** | 否（仅从本地租户列表移除） | 否（保留登录状态） |
+
+### 5.2 scopes 归零的处理流程
+
+**代码** (`hooks.ts:35-42`)：
+```typescript
+useEffect(() => {
+  if (isCloud && !isLoading && scopes?.length === 0) {
+    // 用户无任何租户权限，导航到根路径
+    // 根路径会返回最后访问的租户，或降级到创建新租户页面
+    removeTenant(currentTenantId);
+    navigateTenant('');
+  }
+}, [currentTenantId, isLoading, navigateTenant, removeTenant, scopes?.length]);
+```
+
+**流程**：
+```
+API 返回 scopes = []
+    │
+    ▼
+调用 removeTenant(currentTenantId)
+  └─ 从本地 tenants 数组中过滤掉该租户
+    │
+    ▼
+调用 navigateTenant('')
+  └─ React Router 导航到 /
+    │
+    ▼
+根路径逻辑：
+  ├─ 如果有其他租户：自动跳转到最后访问的租户
+  └─ 如果没有其他租户：显示创建新租户页面
+```
+
+### 5.3 租户不可用的处理流程
+
+**代码** (`TenantAccess/index.tsx:73-92`)：
+```typescript
+useEffect(() => {
+  if (isAuthenticated && currentTenantId && !currentTenant) {
+    // 特殊处理：通配符 'to' 替换为用户默认租户 ID
+    if (isCloud && defaultTenantId && currentTenantId === reservedTenantIdWildcard) {
+      window.location.href = pathname.replace('to', defaultTenantId);
+      return;
+    }
+    // 其他情况：硬跳转到首页
+    window.location.href = '/';
+  }
+}, [currentTenant, currentTenantId, isAuthenticated, pathname, defaultTenantId]);
+```
+
+**通配符 'to' 的特殊处理**：
+
+`reservedTenantIdWildcard = 'to'` 是一个特殊的租户 ID 通配符，用于文档链接等场景：
+```
+文档中的链接：https://cloud.logto.io/to/applications
+                                  ↑
+                            用 'to' 代替实际租户 ID
+```
+
+当用户访问 `/to/applications` 时：
+1. `currentTenantId` 被解析为 `'to'`
+2. `currentTenant` 为 `undefined`（因为没有 ID 为 `'to'` 的租户）
+3. 触发租户不可用逻辑
+4. 检测到 `currentTenantId === 'to'`，执行特殊替换：
+   ```typescript
+   pathname.replace('to', defaultTenantId)
+   // '/to/applications' → '/default-tenant-id/applications'
+   ```
+5. 硬跳转到正确的租户 URL
+
+**完整流程**：
+```
+用户访问不存在的租户 ID（或被移除的租户）
+    │
+    ▼
+URL 解析出 currentTenantId = 'unknown-tenant'
+    │
+    ▼
+currentTenant = tenants.find(t => t.id === 'unknown-tenant')
+              = undefined
+    │
+    ▼
+触发租户不可用逻辑
+    │
+    ├─ 检查是否为通配符 'to'？
+    │   ├─ 是：替换为 defaultTenantId，硬跳转
+    │   └─ 否：继续
+    │
+    ▼
+window.location.href = '/' （硬跳转，整页刷新）
+    │
+    ▼
+首页逻辑：
+  ├─ 如果有租户：自动跳转到最后访问的租户
+  └─ 如果没有租户：显示欢迎/创建页面
+```
+
+### 5.4 为什么使用不同的跳转方式
+
+| 跳转方式 | 适用场景 | 原因 |
+|---------|---------|------|
+| **React Router 软跳转** (`navigateTenant`) | scopes 归零 | 用户仍在登录状态，租户列表在内存中，无需刷新页面，体验更流畅 |
+| **浏览器硬跳转** (`window.location.href`) | 租户不可用 | 可能涉及 Token 失效、租户列表需要重新获取等，整页刷新确保状态干净 |
+
+---
+
+## 6. 侧边栏菜单显隐逻辑
+
+### 6.1 菜单数据结构
 
 定义于 `containers/ConsoleContent/Sidebar/hook.tsx:23-36`：
 
@@ -342,7 +622,7 @@ const findFirstItem = (sections: SidebarSection[]): Optional<SidebarItem> => {
 
 > **注意**：当前代码中 `isHidden` 字段在静态配置中均未设置值。特性开关和配额控制主要在**页面内部**进行，而非直接控制菜单项显隐。
 
-### 4.3 当前菜单分组
+### 6.3 当前菜单分组
 
 | 分组 | 菜单项 |
 |------|--------|
@@ -355,7 +635,7 @@ const findFirstItem = (sections: SidebarSection[]): Optional<SidebarItem> => {
 
 ---
 
-## 5. 租户设置页按权限和套餐裁剪标签页的路由构建逻辑
+## 7. 租户设置页按权限和套餐裁剪标签页的路由构建逻辑
 
 租户设置页面是最典型的「动态路由构建 + 标签页裁剪」示例。
 
@@ -367,7 +647,7 @@ const findFirstItem = (sections: SidebarSection[]): Optional<SidebarItem> => {
 export const useTenantSettings = isCloud ? useCloudTenantSettings : useOssTenantSettings;
 ```
 
-### 5.2 云环境租户设置路由构建
+### 7.2 云环境租户设置路由构建
 
 Hook：`useCloudTenantSettings` (`tenant-settings.tsx:32-83`)
 
@@ -434,7 +714,7 @@ const tenantSettings: RouteObject = useMemo(() => ({
 | **Subscription** | `/tenant-settings/subscription` | `!isDevTenant && canManageTenant` |
 | **Billing History** | `/tenant-settings/billing-history` | `!isDevTenant && canManageTenant && quotaScope !== 'shared'` |
 
-### 5.4 UI 层标签页同步裁剪
+### 7.4 UI 层标签页同步裁剪
 
 位置：`pages/TenantSettings/index.tsx:33-59`
 
@@ -488,7 +768,7 @@ const useOssTenantSettings = (): RouteObject =>
   }, []);
 ```
 
-### 5.6 成员页面内的次级权限控制
+### 7.6 成员页面内的次级权限控制
 
 位置：`pages/TenantSettings/TenantMembers/index.tsx:37-91`
 
@@ -522,13 +802,13 @@ function TenantMembers() {
 
 ---
 
-## 6. 配额（Quota）对功能的控制
+## 8. 配额（Quota）对功能的控制
 
 配额数据来源于 `SubscriptionDataContext`，通过订阅 API 获取（云环境）或使用默认值（OSS 环境）。
 
 配额控制**不在路由或菜单级别**，而是在**页面内部**精细控制各功能按钮和组件的显隐。
 
-### 6.1 各功能配额控制详情
+### 8.1 各功能配额控制详情
 
 | 功能 | 配额字段 | 控制逻辑 | 代码位置 |
 |------|---------|---------|----------|
@@ -539,7 +819,7 @@ function TenantMembers() {
 | **IdP 发起 SSO** | `idpInitiatedSsoEnabled` | `isDevFeaturesEnabled && isCloud && SAML && idpInitiatedSsoEnabled` | `pages/EnterpriseSsoDetails/index.tsx:70-77` |
 | **安全功能** | `securityFeaturesEnabled` | 配额中定义，在各安全子功能中检查 | `consts/tenants.ts` |
 
-### 6.2 配额检查工具函数
+### 8.2 配额检查工具函数
 
 **`isFeatureEnabled`** (`utils/subscription.ts:120-122`)：
 ```typescript
@@ -560,9 +840,9 @@ export const hasSurpassedSubscriptionQuotaLimit = <T>(options) =>
 
 ---
 
-## 7. 权限（Scope）控制
+## 9. 权限（Scope）控制
 
-### 7.1 租户成员权限
+### 9.1 租户成员权限
 
 定义于 `hooks/use-current-tenant-scopes.ts:32-40`：
 
@@ -589,9 +869,9 @@ OSS 环境下不调用此 API，`scopes` 为 `undefined`，所有权限判断默
 
 ---
 
-## 8. 最终显隐策略叠加
+## 10. 最终显隐策略叠加
 
-### 8.1 路由可访问性
+### 10.1 路由可访问性
 
 ```
 路由可访问 = 
@@ -604,7 +884,7 @@ OSS 环境下不调用此 API，`scopes` 为 `undefined`，所有权限判断默
   ✓ 路由级特性开关满足 (如 isDevFeaturesEnabled)
 ```
 
-### 8.2 菜单可见性
+### 10.2 菜单可见性
 
 ```
 菜单可见 = 
@@ -613,7 +893,7 @@ OSS 环境下不调用此 API，`scopes` 为 `undefined`，所有权限判断默
   ✓ 菜单项自身 isHidden !== true
 ```
 
-### 8.3 页面内功能可见性
+### 10.3 页面内功能可见性
 
 ```
 功能可见 = 
@@ -626,7 +906,7 @@ OSS 环境下不调用此 API，`scopes` 为 `undefined`，所有权限判断默
   ✓ 付费墙规则满足 (Paywall)
 ```
 
-### 8.4 完整判断流程示例（以「租户设置-账单历史」为例）
+### 10.4 完整判断流程示例（以「租户设置-账单历史」为例）
 
 ```
 1. 路由 /tenant-settings/billing-history 可访问性检查
@@ -663,23 +943,23 @@ OSS 环境下不调用此 API，`scopes` 为 `undefined`，所有权限判断默
 
 ---
 
-## 10. 典型使用场景
+## 12. 典型使用场景
 
-### 10.1 新增一个受特性开关保护的页面
+### 12.1 新增一个受特性开关保护的页面
 
 1. 在 `use-console-routes/routes/` 中定义路由配置
 2. 在 `ConsoleRoutes/index.tsx` 或对应路由文件中用 `isDevFeaturesEnabled` 包裹
 3. 在 `Sidebar/hook.tsx` 中添加菜单项，可选设置 `isHidden`
 4. 页面内部根据需要添加配额和权限检查
 
-### 10.2 新增一个配额控制的功能
+### 12.2 新增一个配额控制的功能
 
 1. 在 `SubscriptionQuota` 类型中添加对应字段
 2. 在 `defaultSubscriptionQuota` 中设置默认值
 3. 在页面组件中通过 `useContext(SubscriptionDataContext)` 获取配额
 4. 使用 `isFeatureEnabled()` 或自定义逻辑判断显隐
 
-### 10.3 手动开启开发特性（生产环境）
+### 12.3 手动开启开发特性（生产环境）
 
 **正确方式**（注意完整的存储键）：
 
@@ -695,7 +975,7 @@ location.reload();
 
 > **错误方式**：`localStorage.setItem('isDevFeaturesEnabled', 'true')` — 缺少前缀，不会生效。
 
-### 10.4 模拟权限变更测试
+### 12.4 模拟权限变更测试
 
 在云环境中，可以通过修改其他租户成员的权限来验证权限变更链路：
 
@@ -705,3 +985,76 @@ location.reload();
    - 授予新权限：自动跳转到授权页面，同意后返回原页面
    - 撤销权限：页面静默刷新，相关功能按钮消失
    - 移除所有权限：自动跳转回租户选择页面
+
+---
+
+### 12.5 边界场景测试指南
+
+#### 场景 A：同一轮权限同时新增和撤销
+
+**测试步骤**：
+1. 成员 B 当前拥有权限：`[invite:member]`
+2. 管理员 A 在同一请求中：
+   - 授予新权限：`manage:tenant`
+   - 撤销现有权限：`invite:member`
+3. 观察成员 B 的控制台：
+   - ✅ 自动跳转到授权页面（证明 `hasScopesGranted` 分支先执行）
+   - ✅ 同意授权后返回原页面
+   - ✅ `canInviteMember = false`（原权限已撤销）
+   - ✅ `canManageTenant = true`（新权限已生效）
+   - ✅ 邀请成员按钮消失
+   - ✅ 租户设置-订阅标签页可见
+
+**预期结果**：通过一次重新授权，权限状态完全正确。
+
+---
+
+#### 场景 B：租户切换缓存隔离
+
+**测试步骤**：
+1. 登录租户 A，进入「应用」页面，查看应用列表（如 App1, App2）
+2. 切换到租户 B，同样进入「应用」页面
+3. 观察：
+   - ✅ 切换瞬间短暂白屏（缓存清理期间）
+   - ✅ 显示租户 B 的应用列表，**不显示**租户 A 的 App1, App2
+   - ✅ 打开浏览器 DevTools → Application → Local Storage → 查看 SWR 缓存
+   - ✅ 缓存中只有租户 B 的数据，租户 A 的数据已被清理
+
+**预期结果**：无跨租户数据泄露。
+
+---
+
+#### 场景 C：scopes 归零 vs 租户不可用
+
+**测试步骤对比**：
+
+| 操作 | 预期行为 | 跳转方式 |
+|------|---------|---------|
+| 管理员撤销成员的**所有权限**（但不移除成员） | 成员控制台自动跳转到最后访问的其他租户，或创建新租户页面 | React Router 软跳转，页面不刷新 |
+| 管理员将成员**移出租户** | 成员控制台硬跳转到首页，整页刷新 | `window.location.href` 硬跳转，整页刷新 |
+| 手动在 URL 中输入**不存在的租户 ID** | 硬跳转到首页 | `window.location.href` 硬跳转，整页刷新 |
+| 访问 `/to/applications`（通配符链接） | 自动替换为用户默认租户 ID，跳转正确页面 | `window.location.href` 硬跳转 |
+
+---
+
+#### 场景 D：手动开启开发特性
+
+**测试步骤**：
+1. 在生产环境登录控制台
+2. 打开浏览器 DevTools → Console
+3. 执行（注意完整的存储键）：
+   ```javascript
+   localStorage.setItem('logto:admin_console:is_dev_features_enabled', 'true');
+   location.reload();
+   ```
+4. 观察：
+   - ✅ `__internal__/import-error` 路由可访问
+   - ✅ 各页面中标记为 `isDevFeaturesEnabled` 的功能可见
+
+**关闭方式**：
+```javascript
+localStorage.removeItem('logto:admin_console:is_dev_features_enabled');
+location.reload();
+```
+
+> **⚠️ 常见错误**：使用 `localStorage.setItem('isDevFeaturesEnabled', 'true')` 不会生效，因为缺少 `logto:admin_console:` 前缀。
