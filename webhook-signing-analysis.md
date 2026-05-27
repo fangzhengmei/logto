@@ -208,9 +208,127 @@ const sendWebhooks = async <T extends HookEventPayloadWithoutHookId>(
 
 ---
 
-## 五、失败处理与审计
+## 五、边界问题分析：调用链、失败传播与恢复路径
 
-### 5.1 审计日志
+### 5.1 触发调用链：Fire-and-Forget 模式
+
+**核心设计原则**: "Hooks should not crash the app"
+
+所有场景下的 Hook 触发都使用 `void trySafe()` 模式：
+
+```typescript
+// Management API: packages/core/src/middleware/koa-management-api-hooks.ts:54
+void trySafe(hooks.triggerDataHooks(getConsoleLogFromContext(ctx), hooksContextManager));
+
+// Experience 交互流程: packages/core/src/routes/experience/middleware/koa-experience-interaction-hooks.ts:86
+void trySafe(
+  triggerInteractionHooks(
+    getConsoleLogFromContext(ctx),
+    interactionHookContext.getReleaseOnSuccessDispatchContext()
+  )
+);
+```
+
+**关键特性**:
+- `void`: 明确表示不等待 Promise 完成
+- `trySafe`: 捕获所有异常，不向外传播
+
+### 5.2 失败传播：Hook 失败不会影响主请求
+
+| 场景 | Hook 触发时机 | 是否阻塞主请求 | Hook 失败是否影响主请求 |
+|------|-------------|:--------------:|:----------------------:|
+| **Management API 数据 Hook** | `try { await next() }` 块末尾 | ❌ 不阻塞 | ❌ 完全隔离 |
+| **Experience 交互 Hook** | `try { await next() }` 块末尾 | ❌ 不阻塞 | ❌ 完全隔离 |
+| **Experience Release-Always Hook** | `finally` 块 | ❌ 不阻塞 | ❌ 完全隔离 |
+| **Exception Hook** | `finally` 块 | ❌ 不阻塞 | ❌ 完全隔离 |
+
+**调用链时序图**:
+```
+客户端请求
+    │
+    ├─→ 执行业务逻辑
+    │    │
+    │    ├─→ appendDataHookContext(...)  // 收集事件
+    │    │
+    │    └─→ 业务处理完成
+    │
+    ├─→ 返回 HTTP 200 给客户端  ─────── 客户端收到响应
+    │
+    └─→ 【后台异步】
+         │
+         └─→ void trySafe(triggerDataHooks(...))
+              │
+              ├─ 成功 → 写 Success 日志
+              └─ 失败 → 写 Error 日志（无重试，无影响）
+```
+
+### 5.3 retries 配置运行时真相
+
+**三级配置链条**:
+
+| 层级 | 配置 | 实际效果 |
+|------|------|---------|
+| 1. Schema 层 | `retries` (0-3, deprecated) | 保留兼容，注释说明"固定为 3" |
+| 2. 代码层 | `retry: { limit: retries ?? 3 }` | 仅设置 limit，不覆盖 methods |
+| 3. Ky 默认层 | `methods: ['get', 'put', 'head', 'delete', 'options', 'trace']` | **POST 不在其中** |
+
+**最终结论**: `retries` 配置对 POST Webhook **完全无效**。
+
+### 5.4 失败后的恢复路径：两种重发机制对比
+
+Logto 提供两种不同的重发机制，行为差异巨大：
+
+| 维度 | 重新触发业务事件 | 测试发送 API |
+|------|----------------|-------------|
+| **触发方式** | 重新执行业务操作（重新登录/重新创建角色） | 调用 `POST /hooks/:id/test` |
+| **代码位置** | 业务流程 + 中间件收集 + 异步触发 | `packages/core/src/libraries/hook/index.ts:218-251` |
+| **Payload** | 真实业务数据 | `generateHookTestPayload()` 生成的 Mock 数据 |
+| **发送模式** | 异步 Fire-and-Forget | 同步等待响应 |
+| **失败处理** | 写 Error 日志，静默失败 | 抛出 HTTP 422 错误给调用方 |
+| **是否写审计日志** | ✅ 写 | ❌ 不写 |
+| **并发控制** | ✅ pMap 10 并发 | ❌ 直接 Promise.all |
+
+**测试发送的同步行为** (`triggerTestHook`):
+```typescript
+const triggerTestHook = async (hookId: string, events: HookEvent[], config: HookConfig) => {
+  const { signingKey } = await findHookById(hookId);
+  try {
+    await Promise.all(  // 【同步等待】所有请求完成
+      events.map(async (event) => {
+        const testPayload = generateHookTestPayload(hookId, event);
+        await sendWebhookRequest({  // 直接调用，不经过 sendWebhooks
+          hookConfig: config,
+          payload: testPayload,
+          signingKey,
+        });
+      })
+    );
+  } catch (error: unknown) {
+    // 【抛出错误】给调用方，HTTP 422
+    if (error instanceof HTTPError) {
+      throw new RequestError(
+        { status: 422, code: 'hook.endpoint_responded_with_error' },
+        { responseStatus: error.response.status, responseBody: await error.response.text() }
+      );
+    }
+    throw new RequestError({ code: 'hook.send_test_payload_failed', status: 422 });
+  }
+};
+```
+
+### 5.5 恢复路径总结
+
+| 场景 | 是否可重发 | Payload 真实性 | 对调用方影响 |
+|------|:----------:|:--------------:|------------|
+| **真实业务事件触发** | ❌ 失败即终局（无重试） | ✅ 真实数据 | ❌ 无影响（后台异步） |
+| **测试发送 API** | ✅ 可手动重复调用 | ❌ Mock 数据 | ✅ 失败会返回 422 错误 |
+| **重新执行业务操作** | ✅ 可触发新的 Webhook | ✅ 新的真实数据 | ✅ 会产生实际业务影响 |
+
+---
+
+## 六、失败处理与审计
+
+### 6.1 审计日志
 
 **核心代码**: `packages/core/src/libraries/hook/index.ts:46-87`
 
@@ -228,7 +346,7 @@ logEntry.append({
 
 **日志 Key 格式**: `TriggerHook.<EventName>`
 
-### 5.2 无死信队列
+### 6.2 无死信队列
 
 - 当前实现**没有内置死信队列（DLQ）**
 - 失败的 Webhook 不会自动重新入队
@@ -237,9 +355,9 @@ logEntry.append({
 
 ---
 
-## 六、接收方签名验证
+## 七、接收方签名验证
 
-### 6.1 Node.js 验证示例
+### 7.1 Node.js 验证示例
 
 ```javascript
 import { createHmac, timingSafeEqual } from 'node:crypto';
@@ -256,7 +374,7 @@ function verifyLogtoWebhook(rawBody, signatureHeader, signingKey) {
 }
 ```
 
-### 6.2 关键注意事项
+### 7.2 关键注意事项
 
 1. **必须使用原始请求体**：不能用 `JSON.parse()` 后再 `stringify()`，键顺序可能不同
 2. **时间安全比较**：使用 `timingSafeEqual` 防止时序攻击
@@ -265,7 +383,7 @@ function verifyLogtoWebhook(rawBody, signatureHeader, signingKey) {
 
 ---
 
-## 七、总结
+## 八、总结
 
 | 维度 | 实际情况 |
 |------|---------|
@@ -276,11 +394,15 @@ function verifyLogtoWebhook(rawBody, signatureHeader, signingKey) {
 | **POST 超时重试** | ❌ 不重试（`retryOnTimeout` 默认为 false） |
 | **退避策略** | 理论存在（指数退避），但对 POST 无效 |
 | **并发控制** | p-map，最大 10 并发 |
-| **失败处理** | 写审计日志，无死信队列 |
+| **触发模式** | Fire-and-Forget，`void trySafe()` 异步触发 |
+| **失败传播** | Hook 失败完全隔离，不影响主请求 |
+| **真实业务触发** | 异步 Fire-and-Forget，失败写日志 |
+| **测试发送 API** | 同步等待，失败返回 422，Payload 是 Mock 数据 |
+| **死信队列** | 无，依赖审计日志人工排查 |
 
 ---
 
-## 八、代码引用清单
+## 九、代码引用清单
 
 | 功能模块 | 文件路径 | 行号 |
 |---------|---------|------|
@@ -290,4 +412,8 @@ function verifyLogtoWebhook(rawBody, signatureHeader, signingKey) {
 | 审计日志记录 | `packages/core/src/libraries/hook/index.ts` | 46-87 |
 | 交互 Hook 触发 | `packages/core/src/libraries/hook/index.ts` | 118-185 |
 | 数据 Hook 触发 | `packages/core/src/libraries/hook/index.ts` | 190-199 |
+| 测试发送 Hook | `packages/core/src/libraries/hook/index.ts` | 218-251 |
 | HookConfig Schema | `packages/schemas/src/foundations/jsonb-types/hooks.ts` | 100-114 |
+| Management API 中间件 | `packages/core/src/middleware/koa-management-api-hooks.ts` | 22-65 |
+| Experience 交互中间件 | `packages/core/src/routes/experience/middleware/koa-experience-interaction-hooks.ts` | 28-119 |
+| 测试发送 API 路由 | `packages/core/src/routes/hook.ts` | 218-237 |
