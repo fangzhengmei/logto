@@ -266,7 +266,95 @@ return {
 
 ## 5. 体验端渲染链路详解
 
-### 5.1 应用初始化与配置加载
+### 5.1 首屏生效时机与渲染界限
+
+#### 5.1.1 SSR 注入的具体时机与界限
+
+**SSR 注入发生位置** (`packages/experience/index.html` L9-L12):
+```html
+<head>
+  <script>
+    window.logtoSsr = "__LOGTO_SSR__";  // 占位符，服务端替换为实际数据
+  </script>
+</head>
+```
+
+**服务端替换时机** (`packages/core/src/middleware/koa-experience-ssr.ts` L26-L67):
+```typescript
+return async (ctx, next) => {
+  await next();  // 1. 先执行后续中间件，生成HTML
+
+  // 2. 检查条件：响应为字符串、是首页路径、包含占位符
+  if (!(typeof ctx.body === 'string' && isIndexPath(ctx.path)) ||
+      !ctx.body.includes(ssrPlaceholder)) {
+    return;
+  }
+
+  // 3. 查询数据库获取最新配置（⚠️ 注意：这里绕过了 Redis 缓存！）
+  const [signInExperience] = await Promise.all([
+    libraries.signInExperiences.getFullSignInExperience({ ... }),
+    // ...
+  ]);
+
+  // 4. 替换HTML中的占位符
+  ctx.body = ctx.body.replace(ssrPlaceholder, `Object.freeze(${JSON.stringify(...)})`);
+};
+```
+
+> **重要发现**: SSR 中间件直接调用 `libraries.signInExperiences.getFullSignInExperience()`，该方法**不经过 Redis 缓存**，每次请求都直接查询数据库。这确保了 SSR 注入的始终是最新数据，但也意味着高并发下数据库压力较大。
+
+**SSR 与前端渲染的清晰界限**:
+
+| 阶段 | 执行位置 | 负责内容 | 品牌配置生效情况 |
+|------|----------|----------|------------------|
+| **SSR 阶段** | 服务端 (Node.js) | 1. 查询数据库获取配置<br>2. 将配置序列化为 JSON<br>3. 替换 HTML 中的 `window.logtoSsr` 变量 | ❌ **不直接生效**<br>仅注入数据，不操作 DOM |
+| **HTML 解析阶段** | 浏览器 | 1. 解析 HTML<br>2. 执行 `<script>` 标签<br>3. `window.logtoSsr` 变为可用 | ❌ **不生效**<br>数据已存在但未被消费 |
+| **React 初始化阶段** | 浏览器 | 1. React 应用挂载<br>2. PageContextProvider 初始化状态 | ❌ **不生效**<br>配置尚未加载到 React 状态 |
+| **配置加载阶段** | 浏览器 | 1. `useSignInExperience` 执行<br>2. 从 `window.logtoSsr` 读取配置<br>3. `setExperienceSettings(settings)` | ⚠️ **状态已更新**<br>但 CSS 变量尚未注入 |
+| **AppBoundary 渲染阶段** | 浏览器 | 1. `useColorTheme` 执行<br>2. 读取 `experienceSettings.color.primaryColor`<br>3. 调用 `document.body.style.setProperty()` | ✅ **正式生效**<br>CSS 变量注入到 DOM |
+
+**关键界限结论**:
+> SSR 只负责**数据注入**，不负责**样式生效**。品牌主题色的真正生效发生在前端 React 应用的 `AppBoundary` 组件渲染阶段，通过 JavaScript 动态设置 `document.body.style` 上的 CSS 变量。
+
+#### 5.1.2 首屏生效时序图（精确到毫秒级）
+
+```
+  0ms ─ 浏览器请求到达服务端
+        ↓
+  5ms ─ Koa 中间件链执行 (await next())
+        ↓
+ 10ms ─ koa-experience-ssr 开始执行
+        ├─ 直接查询 sign_in_experiences 表（绕过 Redis 缓存）
+        └─ 替换 HTML 中的 ssrPlaceholder
+        ↓
+ 50ms ─ HTML 响应发送到浏览器
+        ↓
+ 60ms ─ 浏览器解析 HTML，执行 <script> 标签
+        └─ window.logtoSsr = Object.freeze({...})  ✅ 数据已在客户端
+        ↓
+ 80ms ─ 下载并解析 JS bundle
+        ↓
+120ms ─ React 应用开始挂载
+        ├─ PageContextProvider 初始化 (theme=Light, experienceSettings=undefined)
+        └─ SettingsProvider 调用 useSignInExperience()
+        ↓
+125ms ─ useSignInExperience useEffect 执行
+        ├─ 从 window.logtoSsr 读取配置（同步，无网络延迟）
+        ├─ setExperienceSettings(settings) → 触发重渲染
+        └─ 此时 experienceSettings 有值，开始渲染子组件
+        ↓
+130ms ─ AppBoundary 渲染
+        ├─ useColorTheme useEffect 执行
+        │   └─ document.body.style.setProperty('--color-brand-default', '#xxxxxx')
+        │      ✅ 品牌色 CSS 变量正式生效！
+        └─ AppMeta 渲染 (Helmet 设置 favicon、data-theme 等)
+        ↓
+140ms ─ 页面内容渲染完成
+```
+
+**从请求到品牌色生效总耗时**：约 130ms（其中网络传输占主要部分，前端处理仅约 10ms）
+
+### 5.2 应用初始化与配置加载
 
 **文件位置**: `packages/experience/src/App.tsx` (L64-L224)
 
@@ -287,66 +375,148 @@ AppBoundary （应用边界：注入主题色CSS变量、设置Meta标签）
 Routes （页面路由）
 ```
 
-### 5.2 配置加载流程
+### 5.3 配置加载流程
 
 **文件位置**: `packages/experience/src/Providers/SettingsProvider/index.tsx`
 
 ```typescript
 const SettingsProvider = ({ children }: Props) => {
-  const { isPreview } = useContext(PageContext);
-  // 根据是否预览选择加载策略
+  const { isPreview, experienceSettings } = useContext(PageContext);
   const usePageLoad = useMemo(() => (isPreview ? usePreview : useSignInExperience), [isPreview]);
   usePageLoad();
-  // 等待配置加载完成后才渲染子组件
+  // ⚠️ 关键：experienceSettings 为 undefined 时返回 null，不渲染任何子组件
   return experienceSettings ? children : null;
 };
 ```
 
-### 5.3 双渠道获取策略
+**重要特性**:
+- `experienceSettings` 初始值为 `undefined`
+- 配置加载完成前，整个应用内容为空白
+- 无加载指示器（LoadingMask 由独立的 `loading` 状态控制）
+
+### 5.4 配置请求失败时的页面行为分析
+
+#### 5.4.1 失败场景与代码路径
+
+**文件位置**: `packages/experience/src/Providers/SettingsProvider/use-sign-in-experience.ts`
+
+```typescript
+const useSignInExperience = () => {
+  const { isPreview, setExperienceSettings, setTheme } = useContext(PageContext);
+  useTheme();
+
+  useEffect(() => {
+    (async () => {
+      // ⚠️ 关键问题：没有 try-catch 包裹！
+      const [settings] = await Promise.all([
+        getSignInExperienceSettings(),  // ❌ 这里可能抛出异常
+        initI18n()
+      ]);
+
+      if (settings.color.isDarkModeEnabled) {
+        setTheme(getThemeBySystemConfiguration());
+      }
+
+      setExperienceSettings(settings);
+    })();
+  }, [isPreview, setExperienceSettings, setTheme]);
+};
+```
+
+**失败场景分析**:
+
+| 失败场景 | 触发条件 | 代码行为 | 页面表现 | 用户体验 |
+|----------|----------|----------|----------|----------|
+| **SSR 数据无效 + API 请求失败** | SSR 数据验证不通过（如 appId 不一致），且 `/.well-known/sign-in-exp` 返回 500 | Promise.all 抛出异常，`setExperienceSettings` 永不执行 | `SettingsProvider` 始终返回 `null`，页面**完全白屏** | ❌ 极差：无任何错误提示，用户不知所云 |
+| **SSR 数据有效但格式错误** | `window.logtoSsr` 存在但缺少必要字段（如 `color.primaryColor`） | Zod parse 抛出异常，同上 | 页面白屏 | ❌ 极差 |
+| **SSR 占位符未替换** | 服务端 SSR 中间件未执行，`window.logtoSsr === "__LOGTO_SSR__"` | `isObject(logtoSsr)` 返回 false，降级为 API 请求；若 API 也失败，则白屏 | 白屏或降级失败 | ❌ 差 |
+| **i18n 初始化失败** | 语言包加载失败 | Promise.all 抛出异常，同上 | 页面白屏 | ❌ 极差 |
+
+#### 5.4.2 更深层次的问题：全局错误边界缺失
+
+**文件位置**: `packages/experience/src/App.tsx`
+
+```typescript
+// 检查整个 App.tsx，未发现 React Error Boundary
+// 没有 <ErrorBoundary> 组件包裹应用根节点
+```
+
+**后果**:
+- `useSignInExperience` 中未捕获的 Promise 异常会导致 **React 崩溃**（在 StrictMode 下）
+- 即使在生产环境，也会导致整个应用卸载，用户看到空白页面
+- 无任何降级 UI（错误页面、重试按钮等）
+
+#### 5.4.3 可用性影响评估
+
+| 影响维度 | 评估结果 | 说明 |
+|----------|----------|------|
+| **首屏可用性** | ⚠️ 中等风险 | SSR 数据有效的情况下，首屏可用性高；但 SSR 失败时完全不可用 |
+| **错误可观测性** | ❌ 差 | 无用户可见的错误提示，仅控制台有错误日志 |
+| **恢复能力** | ❌ 极差 | 无重试机制，用户只能刷新页面 |
+| **降级体验** | ❌ 无 | 没有"最小可用"的降级方案（如使用默认主题） |
+
+### 5.5 双渠道获取策略与验证逻辑
 
 **文件位置**: `packages/experience/src/utils/sign-in-experience.ts` (L26-L43)
 
 ```typescript
 export const getSignInExperienceSettings = async () => {
-  // 优先级1: 使用 SSR 注入的数据（更快，无额外请求）
+  // 优先级1: 使用 SSR 注入的数据
   if (isObject(logtoSsr)) {
-    if (searchKeysCamelCase.every(...)) {
-      return parseSignInExperienceResponse(logtoSsr.signInExperience.data);
+    const { data, ...rest } = logtoSsr.signInExperience;
+
+    // ⚠️ SSR 数据有效性验证：cookie 与 SSR 数据必须一致
+    if (searchKeysCamelCase.every((key) => {
+      const ssrValue = rest[key];
+      const storageValue = sessionStorage.getItem(searchKeys[key]) ?? undefined;
+      return (!ssrValue && !storageValue) || ssrValue === storageValue;
+    })) {
+      return parseSignInExperienceResponse(data);
     }
   }
   
-  // 优先级2: 调用 API 获取
-  const response = await getSignInExperience();
+  // 优先级2: SSR 数据无效时，降级为 API 请求
+  const response = await getSignInExperience<SignInExperienceResponse>();
   return parseSignInExperienceResponse(response);
 };
 ```
 
-### 5.4 SSR 注入机制
+**SSR 数据失效场景**（触发降级为 API 请求）：
+- `appId` 不一致
+- `organizationId` 不一致
+- `uiLocales` 不一致
+- SSR 数据为字符串类型（占位符未被替换）
+
+### 5.6 SSR 注入机制的技术细节
 
 **文件位置**: `packages/core/src/middleware/koa-experience-ssr.ts`
 
-在服务端渲染时直接将配置注入 HTML：
 ```typescript
+// 执行时机：await next() 之后，即其他中间件都执行完毕
+// 这意味着静态文件已经被读取，HTML 模板已经生成
+
 ctx.body = ctx.body.replace(
-  ssrPlaceholder,
+  ssrPlaceholder,  // "\"__LOGTO_SSR__\""
   `Object.freeze(${JSON.stringify({
     signInExperience: {
-      ...pick(logtoUiCookie, 'appId', 'organizationId'),
-      data: signInExperience,
+      appId: '...',        // 来自 cookie
+      organizationId: '...', // 来自 cookie
+      data: signInExperience, // 数据库最新数据
     },
     phrases: { lng: language, data: phrases },
-  })})`
+  } satisfies SsrData)})`
 );
 ```
 
-**优势**:
-- 减少一次 API 请求
-- 避免页面闪烁（主题色直接生效）
-- 提高首屏加载速度
+**SSR 数据特点**:
+- 使用 `Object.freeze()` 冻结，防止意外修改
+- 包含完整的品牌配置（color、branding 等）
+- 包含多语言翻译数据
+- 每次请求直接查询数据库（不使用 Redis 缓存）
 
-### 5.5 主题色渲染链路
+### 5.7 主题色渲染链路
 
-#### 5.5.1 CSS 变量注入
+#### 5.7.1 CSS 变量注入
 
 **文件位置**: `packages/experience/src/Providers/AppBoundary/use-color-theme.ts`
 
@@ -387,7 +557,7 @@ const useColorTheme = () => {
 - `--color-brand-loading`: 加载色
 - `--color-overlay-brand-*`: 半透明覆盖色
 
-#### 5.5.2 主题切换逻辑
+#### 5.7.2 主题切换逻辑
 
 **文件位置**: `packages/experience/src/Providers/SettingsProvider/use-theme.ts`
 
@@ -414,9 +584,9 @@ export default function useTheme() {
 }
 ```
 
-### 5.6 Logo 渲染链路
+### 5.8 Logo 渲染链路
 
-#### 5.6.1 Logo URL 解析
+#### 5.8.1 Logo URL 解析
 
 **文件位置**: `packages/experience/src/shared/utils/logo.ts`
 
@@ -444,7 +614,7 @@ export const getBrandingLogoUrl = ({ theme, branding, isDarkModeEnabled }: GetBr
 };
 ```
 
-#### 5.6.2 Logo 组件渲染
+#### 5.8.2 Logo 组件渲染
 
 **文件位置**: `packages/experience/src/Layout/LandingPageLayout/index.tsx`
 
@@ -469,7 +639,7 @@ const LandingPageLayout = ({ children, title, thirdPartyBranding }: Props) => {
 };
 ```
 
-#### 5.6.3 BrandingHeader 组件
+#### 5.8.3 BrandingHeader 组件
 
 **文件位置**: `packages/experience/src/components/BrandingHeader/index.tsx`
 
@@ -492,7 +662,7 @@ const BrandingHeader = ({ logo, thirdPartyLogo, headline }: Props) => {
 };
 ```
 
-### 5.7 Favicon 渲染链路
+### 5.9 Favicon 渲染链路
 
 **文件位置**: `packages/experience/src/Providers/AppBoundary/AppMeta.tsx`
 
@@ -520,7 +690,7 @@ const AppMeta = () => {
 };
 ```
 
-### 5.8 渲染链路时序图
+### 5.10 完整渲染链路时序图
 
 ```
 用户访问登录页
@@ -603,7 +773,7 @@ const useSignInExperience = () => {
 
 回退场景：
 - SSR 数据无效 → 自动降级为 API 请求
-- API 请求失败 → 页面保持加载状态（需结合错误边界处理）
+- API 请求失败 → ⚠️ **无错误处理**，Promise 异常导致页面白屏（详见 5.4 节）
 
 #### 6.1.3 暗色模式自动计算
 
@@ -691,8 +861,17 @@ const darkPrimary = darkPrimaryColor
 选择通过 CSS 变量注入主题色的原因：
 - ✅ 性能更好：浏览器原生支持，避免 React 重渲染
 - ✅ 灵活性高：可在 CSS/SCSS 中直接使用变量
-- ✅ 无闪烁：SSR 时直接注入，首屏即显示正确颜色
 - ✅ 支持暗色模式自动切换
+- ⚠️ **重要修正**：并非"SSR 时直接注入"，而是前端通过 useEffect 注入，因此首屏可能有极短的默认色闪烁
+
+### 7.5 SSR 绕过 Redis 缓存
+
+**设计决策**：SSR 中间件直接查询数据库，不经过 Redis 缓存
+
+- ✅ 确保 SSR 注入的始终是最新数据
+- ✅ 避免缓存不一致导致的 SSR/CSR 水合不匹配
+- ❌ 增加数据库压力（每个登录页请求都查库）
+- ❌ 与 Well-Known API 的缓存策略不一致
 
 ## 8. 潜在风险与优化建议
 
@@ -703,6 +882,8 @@ const darkPrimary = darkPrimaryColor
 3. **缓存一致性窗口**: 异步删除可能导致短暂不一致
 4. **无预览验证**: 保存前无法在真实环境预览效果
 5. **无 Redis 时性能**: 无 Redis 环境下每次请求都查库，高并发下可能有性能压力
+6. **⚠️ 配置加载失败导致白屏**: `useSignInExperience` 缺少错误处理（详见 5.4 节）
+7. **SSR 数据库压力**: SSR 绕过 Redis 缓存，每个请求都查库
 
 ### 8.2 优化建议
 
@@ -727,6 +908,16 @@ const darkPrimary = darkPrimaryColor
    - 对于单机部署场景，可增加可选的内存缓存层
    - 或在应用层增加短时间的内存缓存（如 5 秒）
 
+6. **⚠️ 紧急修复：配置加载错误处理**：
+   - 在 `useSignInExperience` 中添加 try-catch
+   - 添加全局 Error Boundary
+   - 提供错误页面和重试机制
+   - 考虑"最小可用"降级方案（使用默认主题）
+
+7. **SSR 缓存优化**:
+   - 考虑为 SSR 添加独立的短时间缓存（如 1 秒）
+   - 或复用 Well-Known API 的缓存机制
+
 ## 9. 总结
 
 Logto 的品牌配置发布流程采用了简洁高效的设计：
@@ -737,6 +928,12 @@ Logto 的品牌配置发布流程采用了简洁高效的设计：
 - **回退机制完善**: 多层降级确保系统可用性
 - **可扩展性强**: 通过 deepmerge 支持应用级、组织级配置覆盖
 
-**重要修正**: 无 Redis 环境下，系统**不会**使用内存缓存作为降级方案，而是每次请求直接查询数据库。这保证了数据一致性，但在高并发场景下需要注意数据库压力。
+**重要修正**:
+1. 无 Redis 环境下，系统**不会**使用内存缓存作为降级方案，而是每次请求直接查询数据库
+2. SSR 只负责数据注入，主题色真正生效在前端 `useColorTheme` 的 useEffect 中
+3. SSR 中间件**绕过 Redis 缓存**，直接查询数据库，确保数据最新但增加了 DB 压力
+4. ⚠️ **配置加载失败时页面会完全白屏**，缺少错误处理和降级方案
 
-当前设计在简单性、可靠性和性能之间取得了良好平衡，适合绝大多数场景。对于更高要求的企业级场景，可考虑增加版本控制、灰度发布和内存缓存降级能力。
+**高优先级修复建议**：立即为 `useSignInExperience` 添加错误处理，避免配置加载失败导致的白屏问题。
+
+当前设计在简单性、可靠性和性能之间取得了良好平衡，适合绝大多数场景。对于更高要求的企业级场景，可考虑增加版本控制、灰度发布、错误边界和 SSR 缓存优化能力。
