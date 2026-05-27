@@ -50,9 +50,17 @@ export const sign = (signingKey: string, payload: Record<string, unknown>) => {
 
 ---
 
-## 二、POST 重试的真相：配置与实际行为的落差
+## 二、POST 重试的真相：`retries` 字段的三层矛盾与最终结论
 
-### 2.1 `retries` 配置的来源与生命周期
+### 2.1 `retries` 字段的完整生命周期
+
+`retries` 字段在三个层级上存在表述差异，最终导致其对 POST Webhook 完全无效：
+
+| 层级 | 描述 | 实际效果 |
+|------|------|---------|
+| **Schema 注释** | `@deprecated` + "Now the retry times is fixed to 3" | 仅文档说明，无强制约束 |
+| **运行时代码** | `retry: { limit: retries ?? 3 }` | 仅设置重试次数上限，未启用 POST 重试 |
+| **Ky 默认行为** | `methods` 不含 POST | **整个重试机制对 POST 禁用** |
 
 **Schema 定义**: `packages/schemas/src/foundations/jsonb-types/hooks.ts:100-114`
 
@@ -72,9 +80,9 @@ export const hookConfigGuard = z.object({
 
 **配置来源**:
 - 存储在 `hooks.config` JSONB 字段中
-- 用户通过 Console UI 或 Management API 设置
-- 值域: `0-3`，默认为 `3`
-- **状态**: 已标记 `@deprecated`，注释明确说明"现在固定为 3"
+- Console 端保存时硬编码 `retries: 3`（见 `packages/console/src/pages/WebhookDetails/utils.ts:45`）
+- 值域: `0-3`，创建时默认值为 `3`
+- **状态**: 已标记 `@deprecated`，但代码中仍在读取使用
 
 ### 2.2 实际发送代码
 
@@ -138,7 +146,7 @@ Ky 的默认退避算法（仅在 GET/PUT 等 retriable methods 生效）：
 delay(attempt) = 0.3 × 2^(attempt - 1) × 1000  ms
 ```
 
-### 3.2 退避时间线（假设 POST 能重试）
+### 3.2 退避时间线（假设 POST 能重试，仅供参考）
 
 | 阶段 | 时间点 | 事件 |
 |------|--------|------|
@@ -262,41 +270,74 @@ void trySafe(
               └─ 失败 → 写 Error 日志（无重试，无影响）
 ```
 
-### 5.3 retries 配置运行时真相
+### 5.3 retries 配置运行时真相（与 2.1 统一结论）
 
-**三级配置链条**:
+`retries` 字段在三个层级上的表述差异，最终导致其对 POST Webhook 完全无效：
 
-| 层级 | 配置 | 实际效果 |
-|------|------|---------|
-| 1. Schema 层 | `retries` (0-3, deprecated) | 保留兼容，注释说明"固定为 3" |
-| 2. 代码层 | `retry: { limit: retries ?? 3 }` | 仅设置 limit，不覆盖 methods |
-| 3. Ky 默认层 | `methods: ['get', 'put', 'head', 'delete', 'options', 'trace']` | **POST 不在其中** |
+| 层级 | 描述 | 对 POST Webhook 的实际效果 |
+|------|------|--------------------------|
+| **Schema 注释** | `@deprecated` + "Now the retry times is fixed to 3" | 仅文档说明，无实际效果 |
+| **运行时代码** | `retry: { limit: retries ?? 3 }` | 仅设置重试次数上限，但因 methods 不含 POST 而无法启用 |
+| **Ky 默认行为** | `methods: ['get', 'put', 'head', 'delete', 'options', 'trace']` | **整个重试机制对 POST 禁用** |
 
-**最终结论**: `retries` 配置对 POST Webhook **完全无效**。
+**最终结论**: `retries` 配置对 POST Webhook **完全无效**。详细分析见第 2.1 节。
 
-### 5.4 失败后的恢复路径：两种重发机制对比
+### 5.4 失败后的恢复路径：两种机制对比
 
-Logto 提供两种不同的重发机制，行为差异巨大：
+Logto 提供两种不同的发送机制，行为差异巨大。**两种路径共享同一个 `sendWebhookRequest` 函数，但上层包装逻辑完全不同**：
 
-| 维度 | 重新触发业务事件 | 测试发送 API |
+| 维度 | 真实业务事件触发 | 测试发送 API |
 |------|----------------|-------------|
-| **触发方式** | 重新执行业务操作（重新登录/重新创建角色） | 调用 `POST /hooks/:id/test` |
-| **代码位置** | 业务流程 + 中间件收集 + 异步触发 | `packages/core/src/libraries/hook/index.ts:218-251` |
+| **触发方式** | 业务操作自动触发（登录/创建角色等） | 调用 `POST /hooks/:id/test` |
+| **代码路径** | `sendWebhooks()` → `sendWebhook()` → `sendWebhookRequest()` | 直接调用 `sendWebhookRequest()` |
 | **Payload** | 真实业务数据 | `generateHookTestPayload()` 生成的 Mock 数据 |
 | **发送模式** | 异步 Fire-and-Forget | 同步等待响应 |
 | **失败处理** | 写 Error 日志，静默失败 | 抛出 HTTP 422 错误给调用方 |
-| **是否写审计日志** | ✅ 写 | ❌ 不写 |
+| **是否写审计日志** | ✅ 写（成功+失败都写） | ❌ 不写 |
 | **并发控制** | ✅ pMap 10 并发 | ❌ 直接 Promise.all |
+| **共同调用点** | `sendWebhook` 函数（`packages/core/src/libraries/hook/index.ts:46-87`） | `triggerTestHook` 函数（`packages/core/src/libraries/hook/index.ts:218-251`） |
 
-**测试发送的同步行为** (`triggerTestHook`):
+**真实业务触发的完整路径**（包含日志记录）：
+```typescript
+const sendWebhook = async (hook: Hook, payload: ..., consoleLog: ConsoleLog) => {
+  const { id, config, signingKey } = hook;
+  
+  const json = { ...payload, hookId: id };
+  const logEntry = new LogEntry(`TriggerHook.${payload.event}`);
+  logEntry.append({ hookId: id, hookRequest: { body: json } });
+
+  try {
+    const response = await sendWebhookRequest({
+      hookConfig: config,
+      payload: json,
+      signingKey,
+    });
+    logEntry.append({ response: await parseResponse(response) });
+  } catch (error: unknown) {
+    logEntry.append({
+      result: LogResult.Error,
+      response: conditional(error instanceof HTTPError && ...),
+      error: String(normalizeError(error)),
+    });
+  }
+
+  await insertLog({  // ✅ 无论成功失败都写审计日志
+    id: generateStandardId(),
+    key: logEntry.key,
+    payload: logEntry.payload,
+  });
+};
+```
+
+**测试发送的路径**（直接调用，跳过日志记录）：
 ```typescript
 const triggerTestHook = async (hookId: string, events: HookEvent[], config: HookConfig) => {
   const { signingKey } = await findHookById(hookId);
   try {
-    await Promise.all(  // 【同步等待】所有请求完成
+    await Promise.all(  // 同步等待所有请求完成
       events.map(async (event) => {
         const testPayload = generateHookTestPayload(hookId, event);
-        await sendWebhookRequest({  // 直接调用，不经过 sendWebhooks
+        await sendWebhookRequest({  // 直接调用，跳过 sendWebhook 的日志逻辑
           hookConfig: config,
           payload: testPayload,
           signingKey,
@@ -304,7 +345,7 @@ const triggerTestHook = async (hookId: string, events: HookEvent[], config: Hook
       })
     );
   } catch (error: unknown) {
-    // 【抛出错误】给调用方，HTTP 422
+    // ❌ 不写审计日志，直接抛出错误
     if (error instanceof HTTPError) {
       throw new RequestError(
         { status: 422, code: 'hook.endpoint_responded_with_error' },
@@ -318,39 +359,65 @@ const triggerTestHook = async (hookId: string, events: HookEvent[], config: Hook
 
 ### 5.5 恢复路径总结
 
-| 场景 | 是否可重发 | Payload 真实性 | 对调用方影响 |
-|------|:----------:|:--------------:|------------|
-| **真实业务事件触发** | ❌ 失败即终局（无重试） | ✅ 真实数据 | ❌ 无影响（后台异步） |
-| **测试发送 API** | ✅ 可手动重复调用 | ❌ Mock 数据 | ✅ 失败会返回 422 错误 |
-| **重新执行业务操作** | ✅ 可触发新的 Webhook | ✅ 新的真实数据 | ✅ 会产生实际业务影响 |
+| 场景 | 是否可重发 | Payload 真实性 | 对调用方影响 | 写审计日志 | 重试机制 |
+|------|:----------:|:--------------:|------------|:----------:|---------|
+| **真实业务事件触发** | ❌ 失败即终局（无重试） | ✅ 真实数据 | ❌ 无影响（后台异步） | ✅ | ❌ 无 |
+| **测试发送 API** | ✅ 可手动重复调用 | ❌ Mock 数据 | ✅ 失败会返回 422 错误 | ❌ | ❌ 无 |
+| **重新执行业务操作** | ✅ 可触发新的 Webhook | ✅ 新的真实数据 | ✅ 会产生实际业务影响 | ✅ | ❌ 无 |
+
+**关键结论**：Logto Webhook **没有任何重试机制**。所有失败都是终局，没有自动重试。唯一的恢复方式是重新执行业务操作（会产生新的业务影响）或使用测试 API 验证连通性（Payload 不真实）。
 
 ---
 
 ## 六、失败处理与审计
 
-### 6.1 审计日志
+### 6.1 审计日志覆盖范围（统一结论）
 
 **核心代码**: `packages/core/src/libraries/hook/index.ts:46-87`
 
-每次 Webhook 触发都会写入 `logs` 表：
+审计日志的记录逻辑仅在 `sendWebhook` 函数中实现，因此**只有真实业务触发的 Webhook 才会写入 `logs` 表**（无论成功或失败）：
 
 ```typescript
-logEntry.append({
-  hookId: id,
-  hookRequest: { body: json },      // 请求 payload
-  result: LogResult.Success | Error, // 成功或失败
-  response: { statusCode, body },   // 响应状态和内容
-  error: String(normalizeError(error)), // 错误信息
-});
+const sendWebhook = async (...) => {
+  const logEntry = new LogEntry(`TriggerHook.${payload.event}`);
+  logEntry.append({ hookId: id, hookRequest: { body: json } });
+
+  try {
+    const response = await sendWebhookRequest(...);
+    logEntry.append({ response: await parseResponse(response) });
+  } catch (error: unknown) {
+    logEntry.append({
+      result: LogResult.Error,
+      response: conditional(error instanceof HTTPError && ...),
+      error: String(normalizeError(error)),
+    });
+  }
+
+  await insertLog({  // ✅ 无论成功失败都写审计日志
+    id: generateStandardId(),
+    key: logEntry.key,
+    payload: logEntry.payload,
+  });
+};
 ```
 
 **日志 Key 格式**: `TriggerHook.<EventName>`
 
-### 6.2 无死信队列
+**审计日志覆盖范围总结**:
+
+| 触发方式 | 成功时写日志 | 失败时写日志 | 说明 |
+|---------|:------------:|:------------:|------|
+| **真实业务事件触发** | ✅ | ✅ | 经过 `sendWebhook` 函数 |
+| **测试发送 API** | ❌ | ❌ | 直接调用 `sendWebhookRequest`，跳过日志逻辑 |
+
+### 6.2 无死信队列（DLQ）
 
 - 当前实现**没有内置死信队列（DLQ）**
 - 失败的 Webhook 不会自动重新入队
-- 只能通过管理后台手动"重新发送测试"来触发
+- 没有"重新发送失败 Webhook"的管理功能
+- 唯一的恢复方式：
+  1. 重新执行业务操作来触发新的 Webhook（Payload 会变化，且会产生新的业务影响）
+  2. 使用测试发送 API 验证连通性（Payload 是 Mock 数据，不写日志）
 - 依赖运维人员监控日志告警
 
 ---
@@ -379,16 +446,16 @@ function verifyLogtoWebhook(rawBody, signatureHeader, signingKey) {
 1. **必须使用原始请求体**：不能用 `JSON.parse()` 后再 `stringify()`，键顺序可能不同
 2. **时间安全比较**：使用 `timingSafeEqual` 防止时序攻击
 3. **重放防护**：可选校验 `createdAt` 时间戳（如 5 分钟内有效）
-4. **幂等处理**：由于一次投递可能重复（网络层面），建议用 `hookId + event + createdAt` 作为幂等键
+4. **幂等处理**：由于网络层面可能重复投递，建议用 `hookId + event + createdAt` 作为幂等键
 
 ---
 
-## 八、总结
+## 八、总结（统一结论）
 
 | 维度 | 实际情况 |
 |------|---------|
 | **签名算法** | HMAC-SHA256，签名覆盖完整 JSON payload |
-| **retries 配置** | 已弃用（@deprecated），名义上固定为 3 |
+| **retries 字段** | 三层矛盾：Schema 标记 @deprecated、代码设置 limit=3、Ky 禁用 POST 重试 → **对 POST 完全无效** |
 | **POST 5xx 重试** | ❌ 不重试（ky 默认 methods 不含 POST） |
 | **POST 网络错误重试** | ❌ 不重试（仅 retriable methods 生效） |
 | **POST 超时重试** | ❌ 不重试（`retryOnTimeout` 默认为 false） |
@@ -396,9 +463,11 @@ function verifyLogtoWebhook(rawBody, signatureHeader, signingKey) {
 | **并发控制** | p-map，最大 10 并发 |
 | **触发模式** | Fire-and-Forget，`void trySafe()` 异步触发 |
 | **失败传播** | Hook 失败完全隔离，不影响主请求 |
-| **真实业务触发** | 异步 Fire-and-Forget，失败写日志 |
-| **测试发送 API** | 同步等待，失败返回 422，Payload 是 Mock 数据 |
+| **真实业务触发** | 异步 Fire-and-Forget，经过 `sendWebhook` 函数，**成功失败都写审计日志** |
+| **测试发送 API** | 同步等待，直接调用 `sendWebhookRequest`，**不写审计日志**，失败返回 422，Payload 是 Mock 数据 |
+| **审计日志覆盖** | 仅真实业务触发写入日志，测试发送不写入 |
 | **死信队列** | 无，依赖审计日志人工排查 |
+| **恢复能力** | 无自动重试，失败即终局；仅能重新执行业务或用测试 API 验证 |
 
 ---
 
@@ -417,3 +486,4 @@ function verifyLogtoWebhook(rawBody, signatureHeader, signingKey) {
 | Management API 中间件 | `packages/core/src/middleware/koa-management-api-hooks.ts` | 22-65 |
 | Experience 交互中间件 | `packages/core/src/routes/experience/middleware/koa-experience-interaction-hooks.ts` | 28-119 |
 | 测试发送 API 路由 | `packages/core/src/routes/hook.ts` | 218-237 |
+| Console 端保存逻辑 | `packages/console/src/pages/WebhookDetails/utils.ts` | 26-48 |
