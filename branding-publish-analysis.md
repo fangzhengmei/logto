@@ -210,6 +210,60 @@ memoize(run, [type, cacheKey], getExpiresIn?) {
 - 缓存失败时**优雅降级**：直接返回查询结果
 - 支持自定义过期时间
 
+### 4.2.3 品牌配置相关的缓存键
+
+**代码证据** (`packages/core/src/queries/sign-in-experience.ts` L18-L27):
+```typescript
+const updateDefaultSignInExperience = wellKnownCache.mutate(
+  async (set: Partial<CreateSignInExperience>) =>
+    updateSignInExperience({ set, where: { id }, jsonbMode: 'replace' }),
+  ['sie']  // 缓存键
+);
+
+const findDefaultSignInExperience = wellKnownCache.memoize(
+  async () => findSignInExperienceById(id),
+  ['sie']  // 缓存键
+);
+```
+
+**WellKnownCache 中与品牌配置相关的缓存键列表**:
+
+| 缓存键 | 对应方法 | 作用 | 品牌相关数据 |
+|--------|----------|------|--------------|
+| `sie` | `findDefaultSignInExperience` | 缓存默认 SIE 配置 | ✅ 包含品牌色、Logo、Favicon 等核心配置 |
+| `is-development-tenant` | `getIsDevelopmentTenant` | 缓存租户类型 | ❌ 与品牌无关 |
+| `connectors-well-known` | `findAllConnectorsWellKnown` | 缓存连接器元数据 | ❌ 与品牌无关 |
+
+### 4.2.4 SSR 场景下的缓存命中分析
+
+**代码证据** (`packages/core/src/libraries/sign-in-experience/index.ts` L207-L221):
+```typescript
+const [
+  signInExperience,      // ✅ findDefaultSignInExperience() → 有 memoize 缓存
+  logtoConnectors,       // ❌ getLogtoConnectors() → 调用 findAllConnectors()，无缓存
+  isDevelopmentTenant,   // ✅ getIsDevelopmentTenant() → 有 memoize 缓存
+  organizationOverride,  // ❌ getOrganizationOverride() → 调用 organizations.findById()，无缓存
+  appSignInExperience,   // ❌ findApplicationSignInExperience() → 无缓存
+  customProfileFields,   // ❌ findAllCustomProfileFields() → 无缓存
+] = await Promise.all([...]);
+```
+
+**缓存命中情况汇总**（SSR 调用 `getFullSignInExperience` 时）:
+
+| 子查询 | 有缓存？ | 缓存类型 | 说明 |
+|--------|----------|----------|------|
+| `findDefaultSignInExperience()` | ✅ 是 | `wellKnownCache.memoize(['sie'])` | 品牌配置核心数据，30分钟过期 |
+| `getIsDevelopmentTenant()` | ✅ 是 | `wellKnownCache.memoize(['is-development-tenant'])` | 租户类型，永不过期 |
+| `getLogtoConnectors()` | ❌ 否 | — | 调用的是 `findAllConnectors()`（非 `findAllConnectorsWellKnown()`） |
+| `getOrganizationOverride()` | ❌ 否 | — | 每次都查 `organizations` 表 |
+| `findApplicationSignInExperience()` | ❌ 否 | — | 每次都查 `application_sign_in_experiences` 表 |
+| `findAllCustomProfileFields()` | ❌ 否 | — | 每次都查 `custom_profile_fields` 表 |
+
+**重要澄清**：
+- ✅ **品牌配置核心数据（颜色、Logo 等）有缓存**：`findDefaultSignInExperience` 使用 `memoize` 缓存
+- ❌ **`getFullSignInExperience` 聚合层没有整体缓存**：每次调用都需要执行多个数据库查询
+- ❌ **连接器等动态数据没有缓存**：连接器查询每次都访问数据库
+
 ### 4.3 缓存更新流程时序
 
 ```
@@ -290,7 +344,7 @@ return async (ctx, next) => {
     return;
   }
 
-  // 3. 查询数据库获取最新配置（⚠️ 注意：这里绕过了 Redis 缓存！）
+  // 3. 获取完整配置（内部的基础 SIE 数据会使用 Redis 缓存）
   const [signInExperience] = await Promise.all([
     libraries.signInExperiences.getFullSignInExperience({ ... }),
     // ...
@@ -301,7 +355,11 @@ return async (ctx, next) => {
 };
 ```
 
-> **重要发现**: SSR 中间件直接调用 `libraries.signInExperiences.getFullSignInExperience()`，该方法**不经过 Redis 缓存**，每次请求都直接查询数据库。这确保了 SSR 注入的始终是最新数据，但也意味着高并发下数据库压力较大。
+> **重要澄清**: SSR 中间件调用 `libraries.signInExperiences.getFullSignInExperience()`，该方法的缓存行为如下：
+> > - ✅ `findDefaultSignInExperience()`（基础 SIE 配置）：使用 `wellKnownCache.memoize` 装饰，缓存键 `['sie']`，有 Redis 缓存
+> > - ❌ `getLogtoConnectors()`、`getActiveSsoConnectors()`、`getOrganizationOverride()` 等聚合操作：没有缓存
+> >
+> > 因此，核心品牌配置（颜色、Logo 等）是有缓存的，但连接器等动态数据每次都查询数据库。
 
 **SSR 与前端渲染的清晰界限**:
 
@@ -324,7 +382,7 @@ return async (ctx, next) => {
   5ms ─ Koa 中间件链执行 (await next())
         ↓
  10ms ─ koa-experience-ssr 开始执行
-        ├─ 直接查询 sign_in_experiences 表（绕过 Redis 缓存）
+        ├─ 调用 getFullSignInExperience()（基础 SIE 数据使用 Redis 缓存）
         └─ 替换 HTML 中的 ssrPlaceholder
         ↓
  50ms ─ HTML 响应发送到浏览器
@@ -864,14 +922,19 @@ const darkPrimary = darkPrimaryColor
 - ✅ 支持暗色模式自动切换
 - ⚠️ **重要修正**：并非"SSR 时直接注入"，而是前端通过 useEffect 注入，因此首屏可能有极短的默认色闪烁
 
-### 7.5 SSR 绕过 Redis 缓存
+### 7.5 getFullSignInExperience 的分层缓存策略
 
-**设计决策**：SSR 中间件直接查询数据库，不经过 Redis 缓存
+**设计决策**：`getFullSignInExperience` 采用分层缓存，仅基础配置使用 memoize 缓存
 
-- ✅ 确保 SSR 注入的始终是最新数据
-- ✅ 避免缓存不一致导致的 SSR/CSR 水合不匹配
-- ❌ 增加数据库压力（每个登录页请求都查库）
-- ❌ 与 Well-Known API 的缓存策略不一致
+**缓存分层情况**（代码证据：`packages/core/src/libraries/sign-in-experience/index.ts`）：
+- ✅ `findDefaultSignInExperience()`（品牌色、Logo 等基础配置）：使用 `wellKnownCache.memoize(['sie'])`
+- ✅ `getIsDevelopmentTenant()`：使用 `wellKnownCache.memoize(['is-development-tenant'])`
+- ❌ `getLogtoConnectors()`、`getActiveSsoConnectors()`、`getOrganizationOverride()` 等：无缓存
+
+- ✅ 核心品牌配置有缓存，性能有基本保障
+- ✅ 动态数据（连接器、组织覆盖等）保持实时性
+- ❌ 聚合层没有缓存，每次请求仍需多次数据库查询
+- ❌ 连接器数据查询可能成为性能瓶颈
 
 ## 8. 潜在风险与优化建议
 
@@ -883,7 +946,7 @@ const darkPrimary = darkPrimaryColor
 4. **无预览验证**: 保存前无法在真实环境预览效果
 5. **无 Redis 时性能**: 无 Redis 环境下每次请求都查库，高并发下可能有性能压力
 6. **⚠️ 配置加载失败导致白屏**: `useSignInExperience` 缺少错误处理（详见 5.4 节）
-7. **SSR 数据库压力**: SSR 绕过 Redis 缓存，每个请求都查库
+7. **getFullSignInExperience 聚合层无缓存**: 仅基础配置有缓存，连接器等动态数据每次都查库
 
 ### 8.2 优化建议
 
@@ -914,9 +977,9 @@ const darkPrimary = darkPrimaryColor
    - 提供错误页面和重试机制
    - 考虑"最小可用"降级方案（使用默认主题）
 
-7. **SSR 缓存优化**:
-   - 考虑为 SSR 添加独立的短时间缓存（如 1 秒）
-   - 或复用 Well-Known API 的缓存机制
+7. **getFullSignInExperience 聚合层缓存优化**:
+   - 考虑为 `getFullSignInExperience` 添加 memoize 缓存（按 appId + organizationId 作为键）
+   - 或为连接器查询添加独立的缓存机制
 
 ## 9. 总结
 
@@ -931,9 +994,9 @@ Logto 的品牌配置发布流程采用了简洁高效的设计：
 **重要修正**:
 1. 无 Redis 环境下，系统**不会**使用内存缓存作为降级方案，而是每次请求直接查询数据库
 2. SSR 只负责数据注入，主题色真正生效在前端 `useColorTheme` 的 useEffect 中
-3. SSR 中间件**绕过 Redis 缓存**，直接查询数据库，确保数据最新但增加了 DB 压力
-4. ⚠️ **配置加载失败时页面会完全白屏**，缺少错误处理和降级方案
+3. `getFullSignInExperience` 采用**分层缓存策略**：基础 SIE 配置（品牌色、Logo 等）有 `memoize` 缓存，但连接器、组织覆盖等动态数据无缓存
+4. ⚠️ **配置加载失败时页面会完全白屏**：`useSignInExperience` 缺少 `try-catch` 错误处理，且应用无全局 Error Boundary
 
 **高优先级修复建议**：立即为 `useSignInExperience` 添加错误处理，避免配置加载失败导致的白屏问题。
 
-当前设计在简单性、可靠性和性能之间取得了良好平衡，适合绝大多数场景。对于更高要求的企业级场景，可考虑增加版本控制、灰度发布、错误边界和 SSR 缓存优化能力。
+当前设计在简单性、可靠性和性能之间取得了良好平衡，适合绝大多数场景。对于更高要求的企业级场景，可考虑增加版本控制、灰度发布、错误边界和 getFullSignInExperience 聚合层缓存优化能力。
