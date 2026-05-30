@@ -1,10 +1,13 @@
-# 第三方应用接入：回调地址校验与签名密钥滚动源码关联分析
+# 第三方应用接入：回调地址校验与签名密钥滚动 — 源码关联分析
 
-## 一、回调地址合法性校验
+> 本文档将所有结论按「源码直接事实」与「基于事实的推断」分层呈现。
+> 每条推断均标注其所依据的事实编号，便于溯源核对。
 
-### 1.1 注册阶段：redirect URI 写入校验
+---
 
-应用创建/更新时，`redirectUris` 和 `postLogoutRedirectUris` 通过 Zod guard 做格式校验：
+## 一、回调地址校验 — 源码直接事实
+
+### 事实 A1：注册阶段 redirect URI 格式校验
 
 **源码位置**：`packages/schemas/src/foundations/jsonb-types/oidc-module.ts:48-56`
 
@@ -18,53 +21,41 @@ export const oidcClientMetadataGuard = z.object({
     .string()
     .refine((url) => validateRedirectUrl(url, 'web') || validateRedirectUrl(url, 'mobile'))
     .array(),
-  // ...
 });
 ```
 
-每条 URI 必须通过 `validateRedirectUrl()` 的 `web` 或 `mobile` 校验之一。
+每条 URI 必须通过 `validateRedirectUrl()` 的 `web` 或 `mobile` 校验之一。校验在应用创建/更新时通过 Zod guard 执行。
 
-### 1.2 validateRedirectUrl 格式校验详解
+### 事实 A2：validateRedirectUrl 精确匹配路径规则
 
 **源码位置**：`packages/toolkit/core-kit/src/utils/url.ts:3-47`
 
-#### 精确匹配路径（无通配符）
-
-1. 检查 URL 是否包含 dot-segment（`/./`、`/../`、`/%2e`、`/%2e%2e`），如有则拒绝，防止路径遍历攻击。
+1. 检查 URL 是否包含 dot-segment（`/./`、`/../`、`/%2e`、`/%2e%2e`），如有则拒绝。
 2. 使用 `new URL(url)` 解析，提取 `protocol`。
-3. **Web 类型**：协议必须是 `http:` 或 `https:`（`webRedirectUriProtocolRegEx = /^https?:$/`）。
-4. **Mobile 类型**：协议不能是 http/https，须符合自定义 scheme 规则 `^(?!http(s)?:)[a-z][\d+_a-z-]*(\.[\d+_a-z-]+)*:$`（如 `com.example://`、`io.logto://`）。
+3. **Web 类型**：协议必须是 `http:` 或 `https:`（`webRedirectUriProtocolRegEx = /^https?:$/`，定义于 `packages/toolkit/core-kit/src/regex.ts`）。
+4. **Mobile 类型**：协议不能是 http/https，须符合自定义 scheme 规则 `^(?!http(s)?:)[a-z][\d+_a-z-]*(\.[\d+_a-z-]+)*:$`。
 
-#### 通配符匹配路径（含 `*`）
+### 事实 A3：validateRedirectUrl 通配符匹配路径规则
 
-当 `type === 'web'` 且 URL 包含 `*` 时，进入 `validateWildcardWebRedirectUrl()` 分支，执行以下 5 步校验：
+**源码位置**：`packages/toolkit/core-kit/src/utils/url.ts`，`validateWildcardWebRedirectUrl()`
 
-| 步骤 | 函数 | 规则 | 示例 |
-|------|------|------|------|
-| 1 | `hasWildcardInScheme` | 协议部分不允许出现 `*` | ❌ `ht*ps://example.com` |
-| 2 | `hasWildcardInQueryOrHash` | 查询参数和 hash 部分不允许出现 `*` | ❌ `https://example.com?x=*` |
-| 3 | `isAuthorityAllowedForWildcardWebRedirect` | authority 部分校验（见下） | — |
-| 4 | `hasDotSegmentsInAbsoluteUrlPath` | 路径不允许 dot-segment | ❌ `https://*.com/../admin` |
-| 5 | `isUrlProtocolAllowedAfterWildcardReplacement` | 将 `*` 替换为 `wildcard` 后须为合法 http/https URL | ❌ `ws://*.com/cb` |
+当 `type === 'web'` 且 URL 包含 `*` 时进入，执行 5 步校验：
 
-**authority 部分详细规则**（`isAuthorityAllowedForWildcardWebRedirect`，`url.ts:89-110`）：
+| 步骤 | 函数 | 规则 |
+|------|------|------|
+| 1 | `hasWildcardInScheme` | 协议部分不允许出现 `*` |
+| 2 | `hasWildcardInQueryOrHash` | 查询参数和 hash 部分不允许出现 `*` |
+| 3 | `isAuthorityAllowedForWildcardWebRedirect` | authority 部分校验（见下） |
+| 4 | `hasDotSegmentsInAbsoluteUrlPath` | 路径不允许 dot-segment |
+| 5 | `isUrlProtocolAllowedAfterWildcardReplacement` | 将 `*` 替换为 `wildcard` 后须为合法 http/https URL |
 
-- 不允许包含 `@`（禁止 userinfo 部分）。
+`isAuthorityAllowedForWildcardWebRedirect`（`url.ts:89-110`）：
+- 不允许包含 `@`（禁止 userinfo）。
 - 不允许 IPv6 地址字面量（`[` 开头）。
-- hostname 中含 `*` 时，**必须包含至少一个 `.`**，防止过于宽泛的模式（如 `https://*/callback` 被拒绝）。
-- 端口号部分不允许包含 `*`（如 `https://example.com:*` 被拒绝）。
+- hostname 中含 `*` 时，**必须包含至少一个 `.`**（`https://*/callback` 被拒绝）。
+- 端口号部分不允许包含 `*`。
 
-**有效通配符示例**：
-- `https://*.example.com/callback` ✅
-- `https://pr-*-myapp.vercel.app/callback` ✅（主机名多段通配）
-- `https://example.com/callback/*` ✅（路径通配，oidc-provider 原生支持）
-
-**无效通配符示例**：
-- `https://*/callback` ❌（hostname 无 dot）
-- `https://example.com:*/*` ❌（端口通配）
-- `https://example.com/callback?x=*` ❌（query 通配）
-
-### 1.3 运行时校验：oidc-provider 的 redirect_uri 匹配
+### 事实 A4：oidc-provider 启用通配符 redirect_uri 匹配
 
 **源码位置**：`packages/core/src/oidc/init.ts:166`
 
@@ -75,111 +66,50 @@ const oidc = new Provider(envSet.oidc.issuer, {
 });
 ```
 
-Logto 在初始化 `oidc-provider` 时显式启用 `allowWildcardRedirectUris: true`，这使得 oidc-provider 在授权流程中校验 `redirect_uri` 时支持通配符模式匹配。
+oidc-provider 在授权流程中校验 `redirect_uri` 时支持通配符模式匹配。`*` 匹配任意非空路径段（不含 `/`），通配仅出现在 URI 的路径和主机名部分（已由 A3 保证）。
 
-oidc-provider 内部对通配符 redirect_uri 的匹配逻辑：
-- `*` 匹配任意非空路径段（不含 `/`）。
-- 通配仅出现在 URI 的路径和主机名部分（已由注册时校验保证）。
-
-### 1.4 回调地址变更的生效机制
-
-**源码位置**：`packages/core/src/routes/applications/application.ts:337-458`
-
-**关键发现**：回调地址变更**不依赖**租户缓存失效机制。
-
-当通过 `PATCH /applications/:id` 更新应用的 `oidcClientMetadata.redirectUris` 时：
-1. 直接调用 `queries.applications.updateApplicationById(id, rest, 'replace')` 写入数据库。
-2. **没有**调用 `tenant.invalidateCache()` 触发租户实例重建。
-
-#### Client 元数据的动态读取机制
+### 事实 A5：Client 元数据由 oidc-provider 实时从数据库读取
 
 **源码位置**：`packages/core/src/oidc/adapter.ts:128-203`
 
 ```ts
-export default function postgresAdapter(
-  envSet: EnvSet,
-  queries: Queries,
-  modelName: string
-) {
-  if (modelName === 'Client') {
-    return {
-      // ...
-      find: async (id) => {
-        // ...
-        const application = await tryThat(
-          findApplicationById(id),
-          new errors.InvalidClient(`invalid client ${id}`)
-        );
-        return transpileClient(application);
-      },
-      // ...
-    };
-  }
-  // ...
+if (modelName === 'Client') {
+  return {
+    find: async (id) => {
+      const application = await tryThat(
+        findApplicationById(id),
+        new errors.InvalidClient(`invalid client ${id}`)
+      );
+      return transpileClient(application);
+    },
+    // ...
+  };
 }
 ```
 
-oidc-provider 通过 `postgresAdapter` 的 `find` 方法获取 Client 元数据：
-- **每次**需要校验 `redirect_uri`、检查 CORS origin、获取客户端配置时，都会从数据库**实时读取**应用数据。
-- 因此，`redirectUris`、`corsAllowedOrigins` 等应用级配置变更**即时生效**，无需等待租户缓存失效。
+oidc-provider 每次需要 Client 元数据（校验 `redirect_uri`、获取 `corsAllowedOrigins` 等）时，通过 `postgresAdapter.find()` 从数据库实时读取，**不做本地缓存**。
 
-#### 生效时机对比
+### 事实 A6：应用 PATCH 路由不触发租户缓存失效
 
-| 配置类型 | 触发缓存失效 | 生效方式 | 生效延迟 |
-|---------|-------------|---------|---------|
-| **redirectUris** | ❌ 不触发 | oidc-provider 实时读取 | 下一次数据库查询 |
-| **corsAllowedOrigins** | ❌ 不触发 | oidc-provider 实时读取 | 下一次数据库查询 |
-| **签名密钥** | ✅ 触发 `tenant.invalidateCache()` | 重建租户实例重新加载 | 下一次请求（需重建） |
-| **OIDC Session TTL** | ✅ 触发 `tenant.invalidateCache()` | 重建租户实例重新加载 | 下一次请求（需重建） |
+**源码位置**：`packages/core/src/routes/applications/application.ts:337-458`
 
-### 1.5 CORS Origin 匹配与 redirect_uri 校验的粒度差异
+`PATCH /applications/:id` 处理函数中，更新 `oidcClientMetadata.redirectUris` 等字段时：
+1. 直接调用 `queries.applications.updateApplicationById(id, rest, 'replace')` 写入数据库。
+2. **没有**调用 `tenant.invalidateCache()`。
 
-#### CORS Origin 校验：仅匹配 origin 级别的粒度
+### 事实 A7：CORS 校验入口与 isOriginAllowed 签名
 
-**源码位置**：`packages/core/src/oidc/utils.ts:121-149`
-
-CORS 校验的核心函数 `isOriginAllowed()` 接收参数为 `origin` 字符串（如 `https://example.com:8080`），仅包含：
-- **协议**（`https:`）
-- **主机名**（`example.com`）
-- **端口号**（`:8080`，如显式指定）
-
-**不包含**：路径、查询参数、哈希片段
-
-匹配规则：
-1. `corsAllowedOrigins` 列表：精确字符串匹配 origin。
-2. redirectUris 精确匹配：从完整 redirect URI 中**提取** `URL.origin` 后比对。
-3. redirectUris 通配符匹配：通过 `matchesOriginAgainstRedirectUriPattern()` 做主机名模式匹配，但**完全忽略路径部分**。
+**源码位置**：`packages/core/src/oidc/init.ts:302-304` 与 `packages/core/src/oidc/utils.ts:121-149`
 
 ```ts
-// 示例：注册的 redirect URI = https://*.example.com/callback
-// CORS 校验只检查这部分: https://*.example.com
-// 路径 /callback 在 CORS 校验中被完全忽略！
+// init.ts — 注册回调
+clientBasedCORS: (ctx, origin, client) =>
+  ctx.request.origin === origin ||
+  isOriginAllowed(origin, client.metadata(), client.redirectUris),
 ```
 
-#### redirect_uri 授权校验：完整 URL 级别的粒度
-
-在 oidc-provider 的 `/authorize` 端点，`redirect_uri` 参数校验是**完整 URL 匹配**：
-- 必须与注册的某条 redirect URI 完全一致（或通配符模式匹配）。
-- 路径部分必须完全匹配。
-- 查询参数在 OIDC 授权流程中也参与校验。
-
-#### 粒度差异总结
-
-| 维度 | CORS Origin 校验 | redirect_uri 授权校验 |
-|-----|-----------------|---------------------|
-| **匹配单位** | origin（协议+主机+端口） | 完整 URL（含路径） |
-| **路径参与** | ❌ 完全忽略路径 | ✅ 路径必须精确匹配 |
-| **通配范围** | 仅主机名支持通配 | 主机名和路径都支持通配 |
-| **使用场景** | 浏览器跨域请求预检 | OIDC 授权重定向安全校验 |
-| **安全目的** | 防止 CSRF / XSS 跨域 | 防止授权码被窃取重放 |
-
-**重要注意**：不要误认为 CORS 校验通过就意味着 redirect_uri 也合法。CORS 通过只表示"该来源允许发请求"，而 redirect_uri 校验是 OIDC 协议层面的"该回跳地址已登记"的授权确认，两者安全目标不同。
-
-### 1.6 CORS Origin 校验与 redirect URI 的关联
-
-**源码位置**：`packages/core/src/oidc/utils.ts:121-149`
-
 ```ts
+// utils.ts — 函数签名
 export const isOriginAllowed = (
   origin: string,
   { corsAllowedOrigins = [] }: CustomClientMetadata,
@@ -187,66 +117,51 @@ export const isOriginAllowed = (
 ) => { ... };
 ```
 
-在 `clientBasedCORS` 回调中使用（`init.ts:302-304`）：
+`isOriginAllowed` 接收的第一个参数 `origin` 是浏览器 CORS 语义的 origin（协议+主机+端口），**不含路径**。匹配优先级：
+1. `corsAllowedOrigins` 列表精确匹配。
+2. 对不含 `*` 的 redirectUri，提取 `URL.origin` 后精确比对。
+3. 对含 `*` 的 redirectUri，调用 `matchesOriginAgainstRedirectUriPattern()` 做主机名模式匹配。
 
-```ts
-clientBasedCORS: (ctx, origin, client) =>
-  ctx.request.origin === origin ||
-  isOriginAllowed(origin, client.metadata(), client.redirectUris),
-```
-
-**匹配优先级**：
-
-1. **精确 CORS 白名单**：检查 `corsAllowedOrigins`（CustomClientMetadata）中是否包含该 origin（精确匹配）。
-2. **精确 redirect URI 提取 origin**：对于不含 `*` 的 redirectUri，提取其 `URL.origin` 进行精确比对。
-3. **通配符 redirect URI 模式匹配**：对于含 `*` 的 redirectUri，调用 `matchesOriginAgainstRedirectUriPattern()` 做模式匹配。
-
-### 1.5 通配符主机名匹配的运行时逻辑
+### 事实 A8：CORS 通配符匹配完全忽略路径
 
 **源码位置**：`packages/core/src/oidc/utils.ts:171-253`
 
-#### 核心函数链
+CORS 通配符匹配函数链：
 
 ```
 isOriginAllowed
   → matchesOriginAgainstRedirectUriPattern
-    → parseRedirectUriOriginPattern  (解析模式 URI 的协议、主机名模式、端口)
-    → matchHostnamePattern           (逐标签比对主机名)
-      → matchHostnameLabel           (单标签通配匹配)
+    → parseRedirectUriOriginPattern   (解析协议、主机名模式、端口)
+    → matchHostnamePattern            (逐标签比对主机名)
+      → matchHostnameLabel            (单标签通配匹配)
 ```
 
-#### `matchHostnameLabel`（`utils.ts:173-186`）
+`matchesOriginAgainstRedirectUriPattern`（`utils.ts:230-253`）：
+- 比较**协议**（必须一致）。
+- 比较**端口**（含默认端口推断，必须一致）。
+- 调用 `matchHostnamePattern` 比较**主机名**。
+- **不读取、不比较、不传递路径信息**。
 
+`parseRedirectUriOriginPattern`（`utils.ts:201-228`）：
+- 从通配符 redirect URI 中只提取协议、主机名模式、端口。
+- 路径部分在解析时被丢弃。
+
+`matchHostnameLabel`（`utils.ts:173-186`）：
 - 不含 `*` 的标签：精确字符串比对。
-- 含 `*` 的标签：将 `*` 替换为正则 `[^.]+`（匹配一个或多个非点号字符），大小写不敏感。
-- **关键约束**：`*` 不匹配空标签。例如 `*.example.com` 匹配 `pr-123.example.com` 但不匹配 `example.com`（测试用例 `utils.test.ts:233-244`）。
+- 含 `*` 的标签：将 `*` 替换为正则 `[^.]+`，大小写不敏感。
+- `*` 不匹配空标签（测试用例 `utils.test.ts:233-244`：`*.example.com` 匹配 `pr-123.example.com` 但不匹配 `example.com`）。
 
-#### `matchHostnamePattern`（`utils.ts:188-199`）
-
-- 将 pattern 和实际 hostname 按 `.` 分割为标签数组。
-- **标签数量必须完全一致**才能匹配（`patternLabels.length !== actualLabels.length` 直接返回 false）。
+`matchHostnamePattern`（`utils.ts:188-199`）：
+- 按 `.` 分割标签，**标签数量必须完全一致**。
 - 逐标签调用 `matchHostnameLabel`。
-
-#### `parseRedirectUriOriginPattern`（`utils.ts:201-228`）
-
-- 解析通配符 redirect URI 的协议、主机名模式和端口。
-- 先将 `*` 替换为 `wildcard` 验证 URL 基本合法性。
-- 不允许 authority 包含 `@` 或 `[`（IPv6）。
-- 正确处理默认端口（http=80，https=443）。
-
-#### `matchesOriginAgainstRedirectUriPattern`（`utils.ts:230-253`）
-
-- 协议必须完全一致。
-- 有效端口（含默认端口推断）必须一致。
-- 调用 `matchHostnamePattern` 进行主机名模式匹配。
 
 ---
 
-## 二、签名密钥滚动机制
+## 二、签名密钥轮换 — 源码直接事实
 
-### 2.1 密钥状态模型
+### 事实 B1：密钥三态模型与约束
 
-**源码位置**：`packages/schemas/src/types/logto-config/index.ts:48-52`
+**源码位置**：`packages/schemas/src/types/logto-config/index.ts:48-52` 与 `packages/schemas/src/utils/oidc-private-key.ts:38-65`
 
 ```ts
 export enum OidcSigningKeyStatus {
@@ -256,140 +171,46 @@ export enum OidcSigningKeyStatus {
 }
 ```
 
-三条密钥构成一个完整的状态机：
-
-```
-Next ──(激活)──→ Current ──(降级)──→ Previous ──(删除)──→ 丢弃
-```
-
-**约束**（`packages/schemas/src/utils/oidc-private-key.ts:38-65`，`normalizeOidcPrivateKeys`）：
-
+`normalizeOidcPrivateKeys()` 约束：
 - `Current`：**恰好 1 把**。
 - `Next`：**最多 1 把**。
 - `Previous`：**最多 1 把**。
 - 合计最多 3 把密钥。
 
-**旧版兼容**（无 `status` 字段的 legacy 密钥）：
-- 第一个（索引 0）→ `Current`。
-- 第二个（索引 1）→ `Previous`。
+旧版兼容（无 `status` 字段）：索引 0 → Current，索引 1 → Previous。
 
-### 2.2 排序规则
+### 事实 B2：即时轮换流程（rotationGracePeriod = 0）
 
-**源码位置**：`packages/schemas/src/utils/oidc-private-key.ts:12-22`
+**源码位置**：`packages/core/src/libraries/oidc-private-key.ts:84-109` 与 `packages/schemas/src/utils/oidc-private-key.ts:128-146`
 
 ```ts
-const oidcPrivateKeyStatusOrder: Record<OidcSigningKeyStatus, number> = {
-  [OidcSigningKeyStatus.Next]: 0,
-  [OidcSigningKeyStatus.Current]: 1,
-  [OidcSigningKeyStatus.Previous]: 2,
+export const getImmediatelyRotatedOidcPrivateKeys = (
+  privateKeys, newPrivateKey
+): OidcPrivateKey[] => {
+  const normalizedPrivateKeys = normalizeOidcPrivateKeys(privateKeys);
+  if (normalizedPrivateKeys.some(({ status }) => status === OidcSigningKeyStatus.Next)) {
+    throw new Error(
+      'Immediate OIDC private key rotation is not allowed when a Next key exists'
+    );
+  }
+  // ...
 };
-
-const oidcProviderPrivateKeyOrder: Record<OidcSigningKeyStatus, number> = {
-  [OidcSigningKeyStatus.Current]: 0,
-  [OidcSigningKeyStatus.Next]: 1,
-  [OidcSigningKeyStatus.Previous]: 2,
-};
-```
-
-- **业务存储序**（`oidcPrivateKeyStatusOrder`）：`Next → Current → Previous`。
-- **oidc-provider 消费序**（`oidcProviderPrivateKeyOrder`）：`Current → Next → Previous`。
-
-`getOidcProviderPrivateKeys()` 使用 oidc-provider 序返回密钥列表，确保当前签名密钥排在首位，JWKS 端点和 JWT 签名都优先使用 `Current`。
-
-### 2.3 密钥颁发流程
-
-**源码位置**：`packages/core/src/utils/jwks.ts` 和 `packages/core/src/env-set/oidc.ts`
-
-```
-数据库存储 (OidcPrivateKey.value = PEM)
-  → crypto.createPrivateKey(PEM)
-  → crypto.createPublicKey(privateKey)
-  → exportJWK(key)  // 从 node-oidc-provider 移植的 kid 计算算法
-```
-
-**kid 计算**（`jwks.ts:40-44`）：
-
-```ts
-const calculateKid = (jwk: JWK) => {
-  const components = getCalculateKidComponents(jwk); // 按 kty 提取关键组件
-  return createHash('sha256').update(JSON.stringify(components)).digest().toString('base64url');
-};
-```
-
-kid 由密钥的密码学参数（RSA 的 n/e、EC 的 crv/x/y、OKP 的 crv/x）的 SHA-256 哈希决定，与 status 无关。
-
-**OIDC Provider 消费**（`env-set/oidc.ts:14-42`）：
-
-```ts
-const privateKeys = getOidcProviderPrivateKeys(configs[...PrivateKeys])
-  .map(({ value }) => crypto.createPrivateKey(value));
-const publicKeys = privateKeys.map((key) => crypto.createPublicKey(key));
-const privateJwks = await Promise.all(privateKeys.map(async (key) => exportJWK(key)));
-const publicJwks = await Promise.all(publicKeys.map(async (key) => exportJWK(key)));
-```
-
-oidc-provider 初始化时接收 `jwks: { keys: privateJwks }`，同时 `publicJwks` 用于构建本地 JWKS 验证集。
-
-**签名算法选择**（`env-set/oidc.ts:31`）：
-
-```ts
-const jwkSigningAlg = conditional(currentPrivateJwk.kty === 'EC' && 'ES384');
-```
-
-- EC 密钥 → ES384。
-- RSA 密钥 → 使用 oidc-provider 默认值（PS256/RS256 等）。
-
-### 2.4 两种轮换模式
-
-#### 即时轮换（rotationGracePeriod = 0）
-
-**源码位置**：`packages/core/src/libraries/oidc-private-key.ts:84-109` 和 `packages/schemas/src/utils/oidc-private-key.ts:128-146`
-
-```
-调用: POST /api/configs/oidc/private-keys/rotate  (body 无 rotationGracePeriod 或为 0)
 ```
 
 流程：
 1. 事务中锁定 `PrivateKeys` 行（`SELECT ... FOR UPDATE`）。
-2. 检查不存在 `Next` 状态密钥（否则抛 422 错误）。
-3. `getImmediatelyRotatedOidcPrivateKeys()`：
-   - 新密钥 → `Current`。
-   - 原 `Current` → `Previous`。
-   - 原 `Previous` → **丢弃**。
+2. **检查不存在 Next 状态密钥**，否则抛异常。
+3. 新密钥 → Current，原 Current → Previous，原 Previous → **丢弃**。
 4. 写入数据库。
-5. `tenant.invalidateCache()` → 设置 `tenantCacheExpiresAt = now` → 下次请求重建租户实例。
+5. `tenant.invalidateCache()` → 设置 `tenantCacheExpiresAt = now`。
 
-#### 分阶段轮换（rotationGracePeriod > 0）
+### 事实 B3：分阶段轮换流程（rotationGracePeriod > 0）
 
-**源码位置**：`packages/core/src/libraries/oidc-private-key.ts:112-145` 和 `packages/schemas/src/utils/oidc-private-key.ts:154-169`
-
-```
-调用: POST /api/configs/oidc/private-keys/rotate  (body.rotationGracePeriod > 0)
-环境默认值: PRIVATE_KEY_ROTATION_GRACE_PERIOD 环境变量（秒），默认 0
-```
-
-流程：
-1. 事务中同时锁定 `PrivateKeys` 和 `SigningKeyRotationState` 行。
-2. `getStagedRotatedOidcPrivateKeys()`：
-   - 新密钥 → `Next`（预发布，不立即签名）。
-   - 原 `Current` → 保持 `Current`（继续签名）。
-   - 原 `Previous` → 保持 `Previous`。
-3. `getRotationStateForStagedRotation()`：
-   - `tenantCacheExpiresAt = now`（立即使租户缓存失效，让 JWKS 包含 Next 公钥）。
-   - `signingKeyRotationAt = now + rotationGracePeriod * 1000`（计划激活时间）。
-4. 写入数据库（密钥 + 轮换状态）。
-5. 同步到 wellKnownCache。
-
-### 2.5 灰度切换期间再次轮换：待生效密钥的覆盖规则
-
-#### 分阶段轮换的重入行为
-
-**源码位置**：`packages/schemas/src/utils/oidc-private-key.ts:154-169` 和 `packages/core/src/libraries/oidc-private-key.ts:112-145`
+**源码位置**：`packages/core/src/libraries/oidc-private-key.ts:112-145` 与 `packages/schemas/src/utils/oidc-private-key.ts:154-169`
 
 ```ts
 export const getStagedRotatedOidcPrivateKeys = (
-  privateKeys: LogtoOidcConfigType['oidc.privateKeys'],
-  newPrivateKey: OidcPrivateKey
+  privateKeys, newPrivateKey
 ): OidcPrivateKey[] => {
   const normalizedPrivateKeys = normalizeOidcPrivateKeys(privateKeys);
   const currentKey = getCurrentOidcPrivateKey(normalizedPrivateKeys);
@@ -405,70 +226,22 @@ export const getStagedRotatedOidcPrivateKeys = (
 };
 ```
 
-**关键行为**：`getStagedRotatedOidcPrivateKeys()` **不检查**是否已存在 Next 密钥。
+流程：
+1. 事务中锁定 `PrivateKeys` + `SigningKeyRotationState` 行。
+2. 新密钥 → Next，原 Current 保持 Current，原 Previous 保持 Previous。
+3. `signingKeyRotationAt = now + rotationGracePeriod * 1000`。
+4. `tenantCacheExpiresAt = now`。
+5. 写入数据库，同步 wellKnownCache。
 
-如果灰度切换期间（已有 Next 密钥但尚未激活）再次发起分阶段轮换：
-- **新的 Next 密钥覆盖旧的 Next 密钥**：旧的 Next 密钥被直接丢弃，不会降级为 Previous 或进入其他状态。
-- **Current 和 Previous 保持不变**：正在签名的 Current 密钥和旧的 Previous 密钥不受影响。
-- **激活时间被重置**：`signingKeyRotationAt` 被设置为 `now + rotationGracePeriod`，以新的轮换请求时间为准重新计算激活时间。
+### 事实 B4：getStagedRotatedOidcPrivateKeys 不检查已有 Next 密钥
 
-```
-T0: 发起分阶段轮换 (grace = 4h)
-    → [Next=KeyA, Current=KeyB, Previous=KeyC]
-    → signingKeyRotationAt = T0 + 4h
+**源码位置**：`packages/schemas/src/utils/oidc-private-key.ts:154-169`
 
-T1 (T1 < T0+4h): 再次发起分阶段轮换 (grace = 2h)
-    → [Next=KeyD, Current=KeyB, Previous=KeyC]  ← KeyA 被丢弃！
-    → signingKeyRotationAt = T1 + 2h            ← 激活时间重置
+函数体内**没有**检查 `normalizedPrivateKeys` 中是否已存在 `Next` 状态密钥。它只取 `currentKey` 和 `previousKey`，然后用新密钥覆盖 Next 位置。
 
-T1+2h: 激活
-    → [Current=KeyD, Previous=KeyB]            ← KeyC 被丢弃
-    → KeyA 从未用于签名，也未出现在 Previous
-```
+对比 B2：`getImmediatelyRotatedOidcPrivateKeys` **显式检查**并拒绝已有 Next 的场景。
 
-#### 即时轮换的重入行为
-
-**源码位置**：`packages/schemas/src/utils/oidc-private-key.ts:134-146`
-
-```ts
-export const getImmediatelyRotatedOidcPrivateKeys = (
-  privateKeys: LogtoOidcConfigType['oidc.privateKeys'],
-  newPrivateKey: OidcPrivateKey
-): OidcPrivateKey[] => {
-  const normalizedPrivateKeys = normalizeOidcPrivateKeys(privateKeys);
-  if (normalizedPrivateKeys.some(({ status }) => status === OidcSigningKeyStatus.Next)) {
-    throw new Error(
-      'Immediate OIDC private key rotation is not allowed when a Next key exists'
-    );
-  }
-  // ...
-};
-```
-
-如果灰度切换期间（已有 Next 密钥）发起**即时**轮换：
-- **直接报错 422**：`oidc.invalid_request`
-- 原因：即时轮换的语义是"立即切换到新密钥"，如果存在 Next 密钥意味着有尚未完成的分阶段轮换，两者语义冲突。
-
-#### 重入行为总结表
-
-| 轮换类型 | 已有 Next 时的行为 | Next 密钥去向 | 激活时间 |
-|---------|------------------|-------------|---------|
-| **分阶段 → 分阶段** | ✅ 允许，新 Next 覆盖旧 Next | 旧 Next 被丢弃 | 以新请求时间重置 |
-| **分阶段 → 即时** | ❌ 拒绝，抛 422 错误 | — | — |
-| **即时 → 分阶段** | ✅ 无 Next，正常添加 | — | now + gracePeriod |
-| **即时 → 即时** | ✅ 无 Next，正常轮换 | — | 立即生效 |
-
-#### 被覆盖的 Next 密钥的安全边界
-
-被丢弃的旧 Next 密钥：
-- **从未用于签名**：因为它始终处于 Next 状态，而签名始终使用 Current 状态密钥。
-- **公钥曾在 JWKS 中发布**：在旧 Next 存在的时间窗口内，JWKS 端点返回过它的公钥。
-- **无法用于验证**：由于它从未签名过任何 token，被丢弃后不会影响现有 token 的验证。
-- **无旧 token 验证风险**：因为它从未签发过 token。
-
----
-
-### 2.6 SigningKeyRotationState 数据结构
+### 事实 B5：SigningKeyRotationState 数据结构
 
 **源码位置**：`packages/schemas/src/types/logto-config/index.ts:159-163`
 
@@ -481,14 +254,10 @@ export const signingKeyRotationStateGuard = z.object({
 
 | 字段 | 类型 | 含义 |
 |------|------|------|
-| `tenantCacheExpiresAt` | `number?` | 租户实例缓存失效的时间戳，早于此时间创建的租户实例需重建 |
+| `tenantCacheExpiresAt` | `number?` | 缓存失效时间戳，早于此时间创建的租户实例需重建 |
 | `signingKeyRotationAt` | `number?` | 计划的 Next→Current 激活时间戳 |
 
----
-
-## 三、灰度切换时旧凭据的处理
-
-### 3.1 租户健康检查与缓存失效
+### 事实 B6：租户健康检查逻辑
 
 **源码位置**：`packages/core/src/tenants/signing-key-rotation-state.ts:51-63`
 
@@ -498,7 +267,8 @@ export const isTenantHealthy = (
   signingKeyRotationState?: SigningKeyRotationState
 ) => {
   const { tenantCacheExpiresAt, signingKeyRotationAt } = signingKeyRotationState ?? {};
-  const cacheInvalidated = tenantCacheExpiresAt !== undefined && createdAt <= tenantCacheExpiresAt;
+  const cacheInvalidated =
+    tenantCacheExpiresAt !== undefined && createdAt <= tenantCacheExpiresAt;
   const stagedActivationDue =
     signingKeyRotationAt !== undefined &&
     signingKeyRotationAt <= Date.now() &&
@@ -508,42 +278,11 @@ export const isTenantHealthy = (
 };
 ```
 
-租户实例被判定为「不健康」（需重建）的两个条件：
+租户实例不健康（需重建）的两个独立条件：
+1. `cacheInvalidated`：租户创建时间 ≤ `tenantCacheExpiresAt`。
+2. `stagedActivationDue`：当前时间 ≥ `signingKeyRotationAt`，且租户创建时间 < `signingKeyRotationAt`。
 
-1. **缓存失效**：租户创建时间 ≤ `tenantCacheExpiresAt`。
-2. **计划激活到期**：当前时间 ≥ `signingKeyRotationAt`，且租户创建时间 < `signingKeyRotationAt`。
-
-### 3.2 分阶段激活的完整时序
-
-```
-T0: 调用 rotate API (rotationGracePeriod = 14400, 即 4 小时)
-    ├─ 新密钥设为 Next，Current/Previous 不变
-    ├─ signingKeyRotationAt = T0 + 4h
-    ├─ tenantCacheExpiresAt = T0
-    └─ JWKS 端点已包含 Next 公钥（第三方可预缓存）
-
-T0 ~ T0+4h: 过渡期
-    ├─ 旧 Current 密钥继续签名所有 token
-    ├─ Next 公钥出现在 JWKS 中，第三方应用可提前获取并缓存
-    ├─ 仍持有旧 Previous 公钥签发的 token 的客户端可通过 JWKS 验证
-    └─ 租户实例在 T0 后首次请求时重建（cacheInvalidated）
-
-T0+4h: 激活时间到达
-    ├─ isTenantHealthy() 返回 false (stagedActivationDue = true)
-    ├─ 租户实例重建前，EnvSet.load() 调用 promoteScheduledSigningKeyRotation()
-    │   ├─ 事务中锁定 PrivateKeys + RotationState
-    │   ├─ 检查 signingKeyRotationAt <= Date.now()
-    │   ├─ rotateOidcPrivateKeyStatuses(): Next → Current, Current → Previous
-    │   └─ 旧 Previous 被丢弃
-    └─ 重建后的 oidc-provider 使用新 Current 签名
-
-T0+4h 之后:
-    ├─ 新 Current 密钥签名所有新 token
-    ├─ 旧 Current（现 Previous）公钥仍在 JWKS 中
-    └─ 在旧 Current 签名的 token TTL 内，第三方仍可验证
-```
-
-### 3.3 promoteScheduledSigningKeyRotation
+### 事实 B7：密钥激活 promoteScheduledSigningKeyRotation
 
 **源码位置**：`packages/core/src/libraries/logto-config.ts:208-229`
 
@@ -570,108 +309,262 @@ const promoteScheduledSigningKeyRotation = async () => {
 };
 ```
 
-关键设计：
-- 在 `EnvSet.load()` 中、加载 OIDC 配置之前调用（`env-set/index.ts:103`）。
-- 使用 `SELECT ... FOR UPDATE` 保证并发安全。
-- 如果没有待激活的 Next 密钥，跳过写入（幂等）。
+在 `EnvSet.load()` 中、加载 OIDC 配置之前调用（`env-set/index.ts:103`）。使用 `SELECT ... FOR UPDATE` 保证并发安全。如果没有 Next 密钥则跳过（幂等）。
 
-### 3.4 旧凭据的处理范围
+`rotateOidcPrivateKeyStatuses`（`packages/schemas/src/utils/oidc-private-key.ts:177-197`）：Next → Current，Current → Previous，旧 Previous 丢弃。若无 Next 密钥则返回原数组引用（`===` 判断跳过写入）。
 
-| 凭据类型 | 过渡期行为 | 激活后行为 | 完全失效时间 |
-|----------|-----------|-----------|-------------|
-| **Current 签发的 ID Token** | 正常验证 | Previous 公钥仍在 JWKS，可验证 | token 自然过期 + Previous 被手动删除 |
-| **Current 签发的 Access Token (JWT)** | 正常验证 | 同上 | 同上 |
-| **Previous 签发的 token** | Previous 公钥在 JWKS，可验证 | Previous 被丢弃后不再可验证 | 激活时刻（即时轮换）或 Previous 被删除 |
-| **Next 公钥** | 出现在 JWKS，供预缓存 | 升级为 Current，用于签名 | — |
-| **Cookie Keys** | 不受签名密钥轮换影响 | 同上 | — |
-| **client_secret** | 不受签名密钥轮换影响 | 同上 | — |
+### 事实 B8：密钥颁发与 kid 计算
 
-### 3.5 Previous 密钥的删除
+**源码位置**：`packages/core/src/utils/jwks.ts:40-44`
+
+```ts
+const calculateKid = (jwk: JWK) => {
+  const components = getCalculateKidComponents(jwk);
+  return createHash('sha256').update(JSON.stringify(components)).digest().toString('base64url');
+};
+```
+
+kid 由密钥密码学参数的 SHA-256 哈希决定，与 status 字段无关。
+
+OIDC Provider 消费（`env-set/oidc.ts:14-42`）：所有状态（Next/Current/Previous）的私钥均导出为 JWK 并传给 oidc-provider 的 `jwks` 配置项，Current 排首位（`oidcProviderPrivateKeyOrder`）。
+
+### 事实 B9：Previous 密钥的删除约束
 
 **源码位置**：`packages/core/src/libraries/oidc-private-key.ts:50-82`
 
 ```ts
-async deletePrivateSigningKey(keyId: string): Promise<OidcPrivateKey[]> {
-  // ...
-  if (privateKeys.length <= 1) {
-    throw new RequestError({ code: 'oidc.key_required', status: 422 });
-  }
-  if (deletingKey.status !== OidcSigningKeyStatus.Previous) {
-    throw new RequestError({ code: 'oidc.only_previous_key_can_be_deleted', status: 422 });
-  }
-  // ...
+if (privateKeys.length <= 1) {
+  throw new RequestError({ code: 'oidc.key_required', status: 422 });
+}
+if (deletingKey.status !== OidcSigningKeyStatus.Previous) {
+  throw new RequestError({ code: 'oidc.only_previous_key_can_be_deleted', status: 422 });
 }
 ```
 
-- 只允许删除 `Previous` 状态的密钥。
-- 至少保留一把密钥（不允许删除到 0 把）。
-- 删除后调用 `tenant.invalidateCache()` 刷新租户实例。
+只允许删除 Previous 状态密钥，至少保留 1 把。删除后调用 `tenant.invalidateCache()`。
+
+### 事实 B10：签名密钥轮换触发租户缓存失效
+
+**源码位置**：`packages/core/src/libraries/oidc-private-key.ts:84-145`
+
+- 即时轮换：B2 步骤 5 调用 `tenant.invalidateCache()`。
+- 分阶段轮换：B3 步骤 4 设置 `tenantCacheExpiresAt = now`，并通过 `syncSigningKeyRotationStateCache` 同步到 wellKnownCache。
 
 ---
 
-## 四、回调地址校验与签名密钥的关联
+## 三、第三方应用特有约束 — 源码直接事实
 
-### 4.1 第三方应用的特有处理
+### 事实 C1：第三方应用识别与 scope 限制
 
-**源码位置**：`packages/core/src/oidc/resource.ts:124-129`
+**源码位置**：`packages/core/src/oidc/resource.ts:124-129` 与 `packages/core/src/oidc/adapter.ts:99-126`
 
 ```ts
-export const isThirdPartyApplication = async ({ applications }: Queries, applicationId: string) => {
+export const isThirdPartyApplication = async ({ applications }, applicationId) => {
   const application = await trySafe(async () => applications.findApplicationById(applicationId));
   return application?.isThirdParty ?? false;
 };
 ```
 
-第三方应用在 OIDC 流程中的特殊约束（`adapter.ts:99-126`）：
+第三方客户端在 OIDC 流程中的约束：
+- OP scope 限制为 `openid`、`offline_access` 和应用级别启用的 user scope。
+- `filterResourceScopesForTheThirdPartyApplication()` 过滤出应用明确授权的 API resource scope 和 organization scope。
+- `allowTokenExchange` 对第三方应用始终无效。
 
-- **Scope 限制**：第三方客户端的 OP scope 被限制为 `openid`、`offline_access` 和应用级别启用的 user scope。
-- **资源 Scope 过滤**：`filterResourceScopesForTheThirdPartyApplication()` 进一步过滤出应用明确授权的 API resource scope 和 organization scope。
-- **Token Exchange 禁止**：`allowTokenExchange` 仅对第一方应用生效，第三方应用始终不允许。
+---
 
-### 4.2 缓存失效机制的界限：应用配置 vs 租户配置
+## 四、基于事实的推断
 
-回调地址与签名密钥轮换在逻辑上分属 OIDC 协议的不同层面，两者的缓存失效机制有明确界限：
+### 推断 1：回调地址变更不依赖租户缓存失效机制
 
-| 维度 | 回调地址 / 应用元数据变更 | 签名密钥 / 租户 OIDC 配置 |
-|-----|------------------------|------------------------|
-| **配置级别** | 应用级（每个应用独立 | 租户级（全局） |
-| **读取方式** | oidc-provider 每次从数据库实时读取 | 租户初始化时加载，缓存到内存 |
-| **缓存失效触发** | ❌ 不触发 `tenant.invalidateCache() | ✅ 触发 `tenant.invalidateCache()` |
-| **生效延迟** | 几乎即时（下一次数据库查询 | 需等待租户实例重建（下一次请求） |
-| **影响范围** | 单个应用 | 租户下所有应用 |
+**推断内容**：回调地址（redirectUris / corsAllowedOrigins）变更后即时生效，不需要等待租户实例重建。
 
-#### 协同机制
+**事实依据**：
+- **A5**：oidc-provider 通过 `postgresAdapter.find()` 每次从数据库实时读取 Client 元数据，不做本地缓存。
+- **A6**：`PATCH /applications/:id` 路由不调用 `tenant.invalidateCache()`。
+- 对比 **B10**：签名密钥轮换才触发 `tenant.invalidateCache()`。
 
-1. **JWKS 端点一致性**：通配符回调地址支持多子域名部署（如 `https://*.tenant.app/callback`），而这些子域名共享同一个 JWKS 端点。分阶段密钥轮换确保 JWKS 端点在过渡期同时包含新旧公钥，避免因 DNS/CDN 缓存导致的验证失败。
+**生效机制差异总结**：
 
-2. **CORS 与 JWKS 的协调**：通配符回调地址的 origin 校验（`isOriginAllowed`）确保只有合法来源的跨域请求可以访问 OIDC 端点；而 JWKS 中 Next 公钥的提前发布确保第三方在密钥切换前已完成公钥缓存预热。
+| 配置类型 | 触发缓存失效 | 生效方式 | 生效延迟 |
+|---------|-------------|---------|---------|
+| redirectUris | ❌（依据 A6） | 数据库实时读取（依据 A5） | 下一次数据库查询 |
+| corsAllowedOrigins | ❌（依据 A6） | 数据库实时读取（依据 A5） | 下一次数据库查询 |
+| 签名密钥 | ✅（依据 B10） | 重建租户实例重新加载 | 下一次请求（需重建） |
 
-3. **Client 元数据动态读取**：由于 oidc-provider 每次从数据库读取 Client 元数据，意味着：
-   - 回调地址更新后，新的授权请求立即使用新地址校验
-   - 但密钥轮换后签发的 token 仍使用旧密钥签名，直到租户实例重建
-   - 两者独立生效，互不依赖
+---
+
+### 推断 2：CORS origin 校验与 redirect_uri 授权校验的匹配粒度不同
+
+**推断内容**：CORS 校验仅匹配 origin 级别（协议+主机+端口），不涉及路径；redirect_uri 授权校验是完整 URL 级别（含路径），两者不应混淆。
+
+**事实依据**：
+- **A7**：`isOriginAllowed` 的第一个参数 `origin` 由浏览器 CORS 机制提供，按规范只含协议+主机+端口，不含路径。
+- **A8**：`matchesOriginAgainstRedirectUriPattern` 只比较协议、端口、主机名，`parseRedirectUriOriginPattern` 在解析时丢弃路径部分。
+- **A4**：oidc-provider 的 redirect_uri 校验（由 `allowWildcardRedirectUris: true` 启用）在授权端点对完整 URL 做匹配，路径参与校验。
+
+**粒度差异对照表**：
+
+| 维度 | CORS Origin 校验 | redirect_uri 授权校验 |
+|-----|-----------------|---------------------|
+| 匹配单位 | origin（协议+主机+端口） | 完整 URL（含路径） |
+| 路径参与 | ❌ 完全忽略（依据 A8） | ✅ 必须精确匹配（依据 A4） |
+| 通配范围 | 仅主机名支持通配（依据 A8） | 主机名和路径都支持通配（依据 A3+A4） |
+| 使用场景 | 浏览器跨域请求预检 | OIDC 授权重定向安全校验 |
+| 安全目的 | 防止 CSRF/XSS 跨域 | 防止授权码被窃取重放 |
+
+**具体示例**：注册 redirect URI = `https://*.example.com/callback`
+- CORS 校验只检查 `https://*.example.com`（协议+通配主机名），路径 `/callback` 被忽略（依据 A8）。
+- redirect_uri 授权校验要求完整 URL 匹配，`/callback` 必须一致（依据 A4）。
+- 因此 `https://pr-1.example.com/other-path` 能通过 CORS 校验但**不能**通过 redirect_uri 授权校验。
+
+**安全含义**：CORS 通过只表示"该来源允许发跨域请求"，redirect_uri 校验是"该回跳地址已登记"的授权确认，两者安全目标不同，不能互相替代。
+
+---
+
+### 推断 3：灰度切换期间再次分阶段轮换会覆盖旧 Next 密钥
+
+**推断内容**：灰度切换期间（已有 Next 密钥尚未激活），再次发起分阶段轮换时，新的 Next 密钥直接替换旧的 Next 密钥，旧 Next 密钥被丢弃且从未用于签名。
+
+**事实依据**：
+- **B4**：`getStagedRotatedOidcPrivateKeys` 不检查是否已存在 Next 密钥，只取 `currentKey` 和 `previousKey`，然后返回 `[newKey→Next, currentKey→Current, previousKey→Previous]`，旧的 Next 密钥不在此返回数组中。
+- **B1**：`normalizeOidcPrivateKeys` 约束 Next 最多 1 把，因此写入数据库时旧的 Next 必然被覆盖。
+- **B3**：`signingKeyRotationAt` 被重置为 `now + rotationGracePeriod`，以新请求时间为准。
+
+**时序示例**：
+
+```
+T0: 发起分阶段轮换 (grace = 4h)
+    → [Next=KeyA, Current=KeyB, Previous=KeyC]
+    → signingKeyRotationAt = T0 + 4h
+
+T1 (T1 < T0+4h): 再次发起分阶段轮换 (grace = 2h)
+    → [Next=KeyD, Current=KeyB, Previous=KeyC]   ← KeyA 被丢弃（依据 B4）
+    → signingKeyRotationAt = T1 + 2h              ← 激活时间重置（依据 B3）
+
+T1+2h: 激活
+    → [Current=KeyD, Previous=KeyB]               ← KeyC 被丢弃
+    → KeyA 从未用于签名
+```
+
+---
+
+### 推断 4：灰度切换期间不能发起即时轮换
+
+**推断内容**：灰度切换期间（已有 Next 密钥），发起即时轮换会被拒绝。
+
+**事实依据**：
+- **B2**：`getImmediatelyRotatedOidcPrivateKeys` 显式检查 `some(({ status }) => status === OidcSigningKeyStatus.Next)`，若存在则抛异常。
+
+**重入行为总结**：
+
+| 轮换类型 | 已有 Next 时的行为 | 事实依据 |
+|---------|------------------|---------|
+| 分阶段 → 分阶段 | ✅ 允许，新 Next 覆盖旧 Next | B4 |
+| 分阶段 → 即时 | ❌ 拒绝，抛 422 | B2 |
+| 即时 → 分阶段 | ✅ 无 Next，正常添加 | B3 |
+| 即时 → 即时 | ✅ 无 Next，正常轮换 | B2 |
+
+---
+
+### 推断 5：被覆盖的 Next 密钥不会造成安全风险
+
+**推断内容**：被覆盖丢弃的旧 Next 密钥不影响 token 验证安全。
+
+**事实依据**：
+- **B8**：oidc-provider 签名时按 `oidcProviderPrivateKeyOrder` 排序，Current 排首位并优先使用。Next 状态密钥不会被用于签名。
+- **B1**：密钥状态模型中 Next 的含义是"待生效"，签名始终使用 Current。
+- 因此旧 Next 密钥从未签发过 token，被丢弃后不存在需要用它验证的 token。
+
+但需注意：旧 Next 密钥的公钥曾出现在 JWKS 端点（B3 步骤 4 设置 `tenantCacheExpiresAt = now` 导致租户重建，Next 公钥被导出到 JWKS）。这只是增加了 JWKS 中曾出现但从未用于验证的公钥记录，不构成安全风险。
+
+---
+
+### 推断 6：回调地址变更与签名密钥轮换的缓存失效界限
+
+**推断内容**：回调地址变更是应用级配置，即时生效，不触发租户缓存失效；签名密钥轮换是租户级配置，需通过租户缓存失效触发重建才能生效。两者独立、互不依赖。
+
+**事实依据**：
+- **A5 + A6**：回调地址通过数据库实时读取生效，不触发缓存失效。
+- **B10**：签名密钥轮换显式触发 `tenant.invalidateCache()`。
+- **B6**：`isTenantHealthy` 的两个判定条件（`cacheInvalidated`、`stagedActivationDue`）都与签名密钥轮换状态相关，与回调地址无关。
+
+**界限对照**：
+
+| 维度 | 回调地址 / 应用元数据 | 签名密钥 / 租户 OIDC 配置 |
+|-----|----------------------|--------------------------|
+| 配置级别 | 应用级（每个应用独立） | 租户级（全局） |
+| 读取方式 | 数据库实时读取（A5） | 租户初始化时加载到内存（B8） |
+| 缓存失效触发 | ❌ 不触发（A6） | ✅ 触发（B10） |
+| 生效延迟 | 几乎即时 | 需等待租户实例重建 |
+| 影响范围 | 单个应用 | 租户下所有应用 |
+
+---
+
+### 推断 7：分阶段轮换过渡期的安全窗口设计
+
+**推断内容**：分阶段轮换的过渡期确保第三方应用在密钥切换前完成公钥预热，且旧密钥签发的 token 在切换后仍可验证。
+
+**事实依据**：
+- **B3**：分阶段轮换时 `tenantCacheExpiresAt = now`，立即触发租户重建，JWKS 端点将包含 Next 公钥（B8 将所有状态密钥导出到 JWKS）。
+- **B7**：激活时 `rotateOidcPrivateKeyStatuses` 将 Next→Current、Current→Previous，旧 Previous 丢弃。
+- **B8**：激活后 Previous 公钥仍在 JWKS 中，旧 Current 签发的 token 在其 TTL 内仍可验证。
+
+**完整时序**：
+
+```
+T0: 发起分阶段轮换 (grace = 4h)
+    ├─ 新密钥设为 Next，Current/Previous 不变（B3）
+    ├─ signingKeyRotationAt = T0 + 4h（B3）
+    ├─ tenantCacheExpiresAt = T0（B3）
+    └─ JWKS 包含 Next 公钥（B8 + B3 触发重建）
+
+T0 ~ T0+4h: 过渡期
+    ├─ Current 密钥继续签名所有 token（B8 排序保证）
+    ├─ Next 公钥在 JWKS 中，第三方可预缓存
+    └─ Previous 公钥仍在 JWKS，旧 token 可验证
+
+T0+4h: 激活
+    ├─ isTenantHealthy() 返回 false（B6: stagedActivationDue）
+    ├─ promoteScheduledSigningKeyRotation() 执行状态晋升（B7）
+    └─ 重建后的 oidc-provider 使用新 Current 签名
+
+T0+4h 之后:
+    ├─ 新 Current 签发所有新 token
+    ├─ 旧 Current（现 Previous）公钥仍在 JWKS
+    └─ 旧 token 在 TTL 内仍可通过 Previous 公钥验证
+```
+
+---
+
+### 推断 8：JWKS 端点与通配符回调地址的协同关系
+
+**推断内容**：通配符回调地址支持多子域名部署，这些子域名共享同一个 JWKS 端点。分阶段轮换确保 JWKS 在过渡期同时包含新旧公钥，避免因 DNS/CDN 缓存导致验证失败。
+
+**事实依据**：
+- **A3**：通配符回调地址如 `https://*.tenant.app/callback` 允许任意子域名发起授权。
+- **B3 + B8**：JWKS 端点是租户级全局端点，分阶段轮换时 JWKS 同时包含 Next 和 Current 公钥。
+- **B6**：租户缓存失效和密钥激活的判定逻辑确保 JWKS 端点内容随状态变化及时更新。
 
 ---
 
 ## 五、关键文件索引
 
-| 文件 | 职责 |
-|------|------|
-| `packages/toolkit/core-kit/src/utils/url.ts` | redirect URI 格式校验（精确 + 通配符） |
-| `packages/toolkit/core-kit/src/regex.ts` | 协议正则定义（web: `https?:`，mobile: 自定义 scheme） |
-| `packages/schemas/src/foundations/jsonb-types/oidc-module.ts` | OIDC 客户端元数据 guard、CustomClientMetadata 定义 |
-| `packages/schemas/src/types/logto-config/index.ts` | OidcSigningKeyStatus 枚举、SigningKeyRotationState 类型 |
-| `packages/schemas/src/utils/oidc-private-key.ts` | 密钥归一化、排序、轮换状态转换纯函数 |
-| `packages/core/src/oidc/utils.ts` | isOriginAllowed、通配符主机名匹配运行时逻辑 |
-| `packages/core/src/oidc/init.ts` | oidc-provider 初始化（allowWildcardRedirectUris、clientBasedCORS） |
-| `packages/core/src/oidc/adapter.ts` | Client 适配器（第三方 scope 限制、redirectUris 透传） |
-| `packages/core/src/oidc/resource.ts` | 第三方应用识别与资源 scope 过滤 |
-| `packages/core/src/utils/jwks.ts` | JWK 导出与 kid 计算 |
-| `packages/core/src/env-set/oidc.ts` | OIDC 配置加载（密钥→JWKS→签名算法） |
-| `packages/core/src/libraries/oidc-private-key.ts` | OidcPrivateKeyLibrary（删除 Previous、轮换密钥事务） |
-| `packages/core/src/libraries/logto-config.ts` | promoteScheduledSigningKeyRotation、getRedactedOidcKeyResponse |
-| `packages/core/src/queries/logto-config.ts` | 数据库查询（锁定行、读写 RotationState） |
-| `packages/core/src/tenants/signing-key-rotation-state.ts` | isTenantHealthy、缓存同步 |
-| `packages/core/src/tenants/Tenant.ts` | 租户生命周期（invalidateCache、scheduleSigningKeyRotation、checkHealth） |
-| `packages/core/src/routes/logto-config/index.ts` | 管理 API 路由（rotate、delete 端点） |
-| `packages/shared/src/node/env/GlobalValues.ts` | privateKeyRotationGracePeriod 环境变量 |
+| 文件 | 事实编号 | 职责 |
+|------|---------|------|
+| `packages/toolkit/core-kit/src/utils/url.ts` | A2, A3 | redirect URI 格式校验（精确 + 通配符） |
+| `packages/toolkit/core-kit/src/regex.ts` | A2 | 协议正则定义 |
+| `packages/schemas/src/foundations/jsonb-types/oidc-module.ts` | A1 | OIDC 客户端元数据 guard |
+| `packages/core/src/oidc/utils.ts` | A7, A8 | isOriginAllowed、通配符主机名匹配 |
+| `packages/core/src/oidc/init.ts` | A4, A7 | oidc-provider 初始化、clientBasedCORS 注册 |
+| `packages/core/src/oidc/adapter.ts` | A5, C1 | Client 适配器（实时读取 + 第三方 scope 限制） |
+| `packages/core/src/routes/applications/application.ts` | A6 | 应用 PATCH 路由（不触发缓存失效） |
+| `packages/schemas/src/types/logto-config/index.ts` | B1, B5 | OidcSigningKeyStatus 枚举、SigningKeyRotationState 类型 |
+| `packages/schemas/src/utils/oidc-private-key.ts` | B1, B2, B3, B4, B7 | 密钥归一化、排序、轮换状态转换纯函数 |
+| `packages/core/src/utils/jwks.ts` | B8 | JWK 导出与 kid 计算 |
+| `packages/core/src/env-set/oidc.ts` | B8 | OIDC 配置加载（密钥→JWKS→签名算法） |
+| `packages/core/src/libraries/oidc-private-key.ts` | B2, B3, B9, B10 | OidcPrivateKeyLibrary（轮换/删除事务） |
+| `packages/core/src/libraries/logto-config.ts` | B7 | promoteScheduledSigningKeyRotation |
+| `packages/core/src/queries/logto-config.ts` | B7 | 数据库查询（锁定行、读写 RotationState） |
+| `packages/core/src/tenants/signing-key-rotation-state.ts` | B6 | isTenantHealthy |
+| `packages/core/src/tenants/Tenant.ts` | B10 | 租户生命周期（invalidateCache） |
+| `packages/core/src/oidc/resource.ts` | C1 | 第三方应用识别与资源 scope 过滤 |
