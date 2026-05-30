@@ -2,40 +2,86 @@
 
 ## 概述
 
-Logto 后台管理接口（Management API）采用多层级的访问控制架构，通过租户上下文注入、多层权限守卫、双层缓存机制、越权拒绝和审计日志五个核心模块的协同工作，实现安全、高效的访问控制。
+Logto 后台管理接口（Management API）采用多层级的访问控制架构，通过租户上下文注入、多层权限守卫、双层缓存机制、越权拒绝和三类观测面（审计日志 / Management Hooks / AppInsights）的协同工作，实现安全、高效的访问控制。
 
-## 一、分层架构总览
+## 一、managementRouter 中间件体系
+
+### 1.1 全局固定中间件（三层）
+
+managementRouter 在 `packages/core/src/routes/init.ts:76-79` 挂载了三个全局中间件，**所有**挂载在 managementRouter 下的路由均会依次经过：
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                     客户端请求                                   │
-└───────────────────────────────┬─────────────────────────────────┘
-                                │
-┌───────────────────────────────▼─────────────────────────────────┐
-│  第一层：租户上下文注入 (Tenant Context Injection)               │
-│  - 租户识别与实例创建 (Tenant.create)                           │
-│  - 数据库连接池初始化                                           │
-│  - 依赖注入（Queries/Libraries/Caches）                        │
-└───────────────────────────────┬─────────────────────────────────┘
-                                │
-          ┌─────────────────────┴──────────────────────┐
-          │                                            │
-┌─────────▼──────────┐                     ┌──────────▼──────────┐
-│  Management API    │                     │  OIDC /token 端点    │
-│  路由树             │                     │                      │
-├────────────────────┤                     ├──────────────────────┤
-│ 2a. koaAuth        │                     │ 2b. koaAuditLog      │
-│     JWT验证+scope  │                     │     审计日志上下文    │
-│ 3a. koaTenantGuard │                     │ 3b. koaTokenUsageGuard│
-│     租户暂停检查    │                     │     Token用量守卫     │
-│ 4a. koaQuotaGuard  │                     │                      │
-│     配额限制检查    │                     │                      │
-│ 5a. koaGuard       │                     │                      │
-│     输入输出验证    │                     │                      │
-└────────────────────┘                     └──────────────────────┘
+managementRouter.use(koaAuth(...))           // 第 1 层：JWT 认证 + all scope 检查
+managementRouter.use(koaTenantGuard(...))     // 第 2 层：租户暂停状态检查（云环境）
+managementRouter.use(koaManagementApiHooks(...))  // 第 3 层：Hook 上下文注入 + 触发
 ```
 
-**关键区分**：管理 API 和 OIDC /token 端点是两条独立的守卫链路。管理 API 走 `koaAuth → koaTenantGuard → koaQuotaGuard → koaGuard`；OIDC /token 端点走 `koaAuditLog → koaTokenUsageGuard`，并且 Token 用量守卫仅挂载在云环境。
+关键特性：
+- 这三层中间件是 **固定顺序**，业务路由无法跳过或重排
+- `koaManagementApiHooks` 在 `try/finally` 中运行，**即使请求失败也会触发 exception hooks**
+- `koaAuth` 和 `koaTenantGuard` 拒绝请求时抛出 `RequestError`，错误会上抛至 `koaErrorHandler`
+
+### 1.2 按需接入的守卫（各业务路由自行决定）
+
+各业务路由在全局中间件之后，**按需**接入以下守卫，不同路由的守卫组合不同：
+
+| 守卫 | 接入方式 | 典型路由 | 作用 |
+|------|---------|---------|------|
+| `koaGuard` | 几乎所有路由 | 所有 CRUD 端点 | 请求参数/响应体的 Zod 验证 |
+| `koaQuotaGuard` | 写操作路由 | `POST /organizations` 等 | 资源配额限制 |
+| `koaReportSubscriptionUpdates` | 写操作路由 | `POST/PUT/DELETE /organizations` 等 | 变更后上报 Cloud |
+| `koaPagination` | 列表查询路由 | `GET /roles` 等 | 分页参数 |
+| `koaRoleRlsErrorHandler` | 特定路由组 | `/roles(/.*)?` | RLS 错误处理 |
+| `SchemaRouter middlewares` | SchemaRouter 子路由 | organizations 等 | 按 scope/method 精细控制 |
+
+**示例对比**：
+
+```
+POST /roles 的中间件链：
+  koaAuth → koaTenantGuard → koaManagementApiHooks  [全局固定]
+  → koaGuard({ body, status, response })             [按需：参数验证]
+  → quota.guardTenantUsageByKey('userRolesLimit')    [按需：配额检查（业务代码内调用）]
+
+POST /organizations 的中间件链：
+  koaAuth → koaTenantGuard → koaManagementApiHooks   [全局固定]
+  → SchemaRouter middlewares:
+    → koaQuotaGuard({ key: 'organizationsLimit' })   [按需：配额守卫（middleware 级别）]
+    → koaReportSubscriptionUpdates(...)               [按需：变更上报]
+  → koaGuard(...)                                     [按需：参数验证]
+```
+
+**关键差异**：配额守卫有两种接入方式：
+1. **middleware 级别**（如 `koaQuotaGuard`）：在 `koaGuard` 之前执行，失败返回 403
+2. **业务代码内调用**（如 `quota.guardTenantUsageByKey()`）：在 `koaGuard` 之后执行，更灵活但位置不固定
+
+### 1.3 完整中间件执行顺序
+
+```
+请求进入 managementRouter
+  │
+  ├─ koaAuth                          ← 全局固定
+  │   ├─ JWT 无效 → 401 RequestError
+  │   ├─ 缺少 all scope → 403 RequestError
+  │   └─ 通过 → ctx.auth = { type, id, scopes }
+  │
+  ├─ koaTenantGuard                   ← 全局固定
+  │   ├─ OSS → 直接跳过
+  │   ├─ 租户暂停 → 403 RequestError
+  │   └─ 通过 → next()
+  │
+  ├─ koaManagementApiHooks            ← 全局固定
+  │   ├─ 注入 ctx.appendDataHookContext
+  │   ├─ 注入 ctx.appendExceptionHookContext
+  │   ├─ try { await next() }
+  │   │   ├─ [按需守卫: koaQuotaGuard 等]
+  │   │   ├─ [按需守卫: koaGuard]
+  │   │   └─ [业务逻辑]
+  │   ├─ 成功: 触发 data hooks + 注册的自动 hooks
+  │   └─ finally: 触发 exception hooks
+  │
+  └─ 错误上抛至 koaErrorHandler        ← Tenant 级 Koa app
+      └─ 所有 RequestError → AppInsights + HTTP 响应
+```
 
 ## 二、租户上下文注入机制
 
@@ -66,304 +112,117 @@ export default abstract class TenantContext {
 
 1. **租户识别**: 通过请求域名或路径提取租户 ID
 2. **数据库连接**: `getTenantDatabaseDsn(id)` 获取租户数据库 DSN
-3. **环境初始化**: `EnvSet` 加载配置（包括 OIDC issuer、JWKS、admin URL 等）
+3. **环境初始化**: `EnvSet` 加载配置
 4. **依赖实例化**（在 `Tenant` 构造函数中一次性完成）:
    - `Queries`: 数据库查询层
    - `LogtoConfigLibrary`: 配置读写
    - `CloudConnectionLibrary`: Cloud API 客户端
    - `ConnectorLibrary`: 连接器管理
    - `SubscriptionLibrary`: 订阅与配额（含 Redis 缓存）
-   - `Libraries`: 聚合所有业务库（含 quota）
+   - `Libraries`: 聚合所有业务库（含 quota、hooks）
    - `BasicSentinel`: 安全哨兵
 
-```typescript
-// Tenant 构造函数中组装 tenantContext 对象
-const tenantContext: TenantContext = {
-  id,
-  provider,
-  wellKnownCache: this.wellKnownCache,
-  queries,
-  logtoConfigs,
-  cloudConnection,
-  connectors,
-  libraries,
-  envSet,
-  sentinel,
-  invalidateCache: this.invalidateCache.bind(this),
-  scheduleSigningKeyRotation: this.scheduleSigningKeyRotation.bind(this),
-};
-```
+### 2.3 缓存失效：invalidateCache 的实际触发点
 
-### 2.3 路由挂载与上下文传递
-
-**文件位置**: `packages/core/src/routes/init.ts`
-
-租户上下文通过 `initApis` 函数传递给所有路由。管理 API 路由（`managementRouter`）在挂载时即注入三层全局中间件：
-
-```typescript
-const managementRouter: ManagementApiRouter = new Router();
-managementRouter.use(koaAuth(tenant.envSet, getManagementApiResourceIndicator(tenant.id)));
-managementRouter.use(koaTenantGuard(tenant.id, tenant.queries));
-managementRouter.use(koaManagementApiHooks(tenant.libraries.hooks));
-```
-
-**OIDC 路由**在 `packages/core/src/oidc/init.ts` 中独立挂载，中间件链不同：
-
-```typescript
-// packages/core/src/oidc/init.ts
-oidc.use(koaAuditLog(queries));
-// ...
-if (EnvSet.values.isCloud) {
-  oidc.use(koaTokenUsageGuard(subscription));
-}
-```
-
-### 2.4 缓存失效：invalidateCache 的实际触发点
-
-`invalidateCache()` 不是权限判定路径上的常规步骤，而是在签名密钥轮换等配置变更后触发的运维操作：
-
-**文件位置**: `packages/core/src/tenants/Tenant.ts:313`
-
-```typescript
-public async invalidateCache() {
-  const tenantCacheExpiresAt = Date.now();
-  const signingKeyRotationState =
-    await this.queries.logtoConfigs.setTenantCacheExpiresAt(tenantCacheExpiresAt);
-  await syncSigningKeyRotationStateCache(this.wellKnownCache, signingKeyRotationState);
-}
-```
-
-调用点在 `packages/core/src/routes/logto-config/index.ts` 中的三个路由处理器内：
-- 更新 OIDC 签名密钥配置时
-- 轮换签名密钥时
-
-它操作的是 `WellKnownCache`（存储 SIE、connectors、signing-key-rotation-state 等），**不是** `TenantSubscriptionCache`。订阅缓存有自己独立的 TTL 驱动失效机制。
+`invalidateCache()` 操作的是 `WellKnownCache`（SIE、connectors、signing-key-rotation-state 等），**不是** `TenantSubscriptionCache`。调用点在 `packages/core/src/routes/logto-config/index.ts` 中的三个路由处理器内（签名密钥轮换时）。订阅缓存有自己独立的 TTL 驱动失效机制。
 
 ## 三、权限守卫分层判定
 
-### 3.1 第一层：认证守卫 (koaAuth)
+### 3.1 全局第 1 层：认证守卫 (koaAuth)
 
 **文件位置**: `packages/core/src/middleware/koa-auth/index.ts`
 
-**核心职责**:
-- 提取 Bearer Token
-- 验证 JWT 签名（使用本地 JWKS + 可选的 admin tenant JWKS）
-- 检查受众（audience）匹配 Management API Resource Indicator
-- 验证 Scope 包含 `all`
+- 提取 Bearer Token → JWT 签名验证 → audience 检查 → `all` scope 检查
+- 通过后注入 `ctx.auth = { type: sub === clientId ? 'app' : 'user', id: sub, scopes: new Set(scopes) }`
+- 非生产环境支持 `development-user-id` header 跳过验证
+- 跨租户代理：获取当前租户 JWKS + admin 租户 JWKS
 
-**判定逻辑**:
-
-```typescript
-const { sub, clientId, scopes } = await verifyBearerTokenFromRequest(
-  envSet,
-  ctx.request,
-  audience
-);
-
-assertThat(
-  scopes.includes(PredefinedScope.All),
-  new RequestError({ code: 'auth.forbidden', status: 403 })
-);
-
-ctx.auth = {
-  type: sub === clientId ? 'app' : 'user',  // M2M 应用 vs 人类用户
-  id: sub,
-  scopes: new Set(scopes),
-};
-```
-
-**Token 验证流程**:
-1. 从 Authorization header 提取 Bearer Token
-2. 非生产环境支持 `development-user-id` header 跳过验证
-3. 获取 JWKS：当前租户公钥 + admin 租户公钥（跨租户代理场景）
-4. 使用 `jose.jwtVerify` 验证签名、签发者、受众
-5. 检查 `sub` 声明存在
-6. 验证 `all` scope 存在 → 否则 403
-
-### 3.2 第二层：租户状态守卫 (koaTenantGuard)
+### 3.2 全局第 2 层：租户状态守卫 (koaTenantGuard)
 
 **文件位置**: `packages/core/src/middleware/koa-tenant-guard.ts`
 
-**核心职责**:
-- 检查租户是否被暂停（`isSuspended`）
-- 仅在云环境（`isCloud`）生效，OSS 直接跳过
+- 仅云环境生效，OSS 直接跳过
+- 查询 `tenants.findTenantMetadataById(tenantId).isSuspended`
+
+### 3.3 全局第 3 层：Management API Hooks 中间件
+
+**文件位置**: `packages/core/src/middleware/koa-management-api-hooks.ts`
+
+此中间件不拒绝请求，而是注入 Hook 上下文并在请求完成后触发 hooks：
 
 ```typescript
-if (!isCloud) {
-  return next();
-}
-const { isSuspended } = await tenants.findTenantMetadataById(tenantId);
-if (isSuspended) {
-  throw new RequestError('subscription.tenant_suspended', 403);
+ctx.appendDataHookContext = hooksContextManager.appendDataHookContext.bind(...);
+ctx.appendExceptionHookContext = hooksContextManager.appendExceptionHookContext.bind(...);
+
+try {
+  await next();
+  // 成功后：自动追加注册的 hook + 触发 data hooks
+  const registeredDataHookContext = hooksContextManager.getRegisteredHookEventContext(ctx);
+  if (registeredDataHookContext) hooksContextManager.appendDataHookContext(...);
+  if (hooksContextManager.dataHookContextArray.length > 0) {
+    void trySafe(hooks.triggerDataHooks(consoleLog, hooksContextManager));
+  }
+} finally {
+  // 无论成功失败：触发 exception hooks
+  if (hooksContextManager.exceptionHookContextArray.length > 0) {
+    void trySafe(hooks.triggerExceptionHooks(consoleLog, hooksContextManager));
+  }
 }
 ```
 
-### 3.3 第三层：配额守卫 (koaQuotaGuard + QuotaLibrary)
+**自动 Hook 注册表**（`packages/schemas/src/foundations/jsonb-types/hooks.ts`）：
 
-**文件位置**: 
+| 路由 | 触发事件 |
+|------|---------|
+| `POST /users` | `User.Created` |
+| `PATCH /users/:userId` | `User.Data.Updated` |
+| `PATCH /users/:userId/is-suspended` | `User.SuspensionStatus.Updated` |
+| `POST /roles` | `Role.Created` |
+| `DELETE /roles/:id` | `Role.Deleted` |
+| `POST /organizations` | `Organization.Created` |
+| `DELETE /organizations/:id` | `Organization.Deleted` |
+| ... | ... |
+
+自动 Hook 仅在请求成功时触发（`await next()` 之后），失败时不触发 data hooks，但可能触发 exception hooks（如果业务代码主动调用了 `appendExceptionHookContext`）。
+
+### 3.4 按需守卫：配额守卫 (koaQuotaGuard + QuotaLibrary)
+
+**文件位置**:
 - 中间件: `packages/core/src/middleware/koa-quota-guard.ts`
 - 核心逻辑: `packages/core/src/libraries/quota.ts`
 
-**两层配额检查**:
-
-配额守卫执行**双重检查**：先查系统限制（硬上限），再查订阅配额（软上限）。
-
-```typescript
-guardTenantUsageByKey = async (key, { entityId, consumeUsageCount = 1 } = {}) => {
-  if (!isCloud) return;                    // OSS 跳过
-  if (this.tenantId === adminTenantId) return;  // admin 租户豁免
-
-  const subscriptionData = await this.subscription.getSubscriptionData();  // 命中 Redis 缓存
-  const tenantUsageQuery = new TenantUsageQuery(this.tenantId, this.queries, this.connectorLibrary);
-
-  if (isSystemUsageKey(key)) {
-    await this.assertSystemLimit({ key, entityId, subscriptionData, tenantUsageQuery, consumeUsageCount });
-  }
-  if (isQuotaUsageKey(key)) {
-    await this.assertQuotaLimit({ key, entityId, subscriptionData, tenantUsageQuery, consumeUsageCount });
-  }
-};
-```
-
-**系统限制 vs 订阅配额**:
+**双重检查**：系统限制（硬上限）+ 订阅配额（软上限）
 
 | 维度 | 系统限制 (SystemLimit) | 订阅配额 (SubscriptionQuota) |
 |------|----------------------|---------------------------|
-| 来源 | 订阅数据中的 `systemLimit` 字段 | 订阅数据中的 `quota` 字段 |
+| 来源 | 订阅数据的 `systemLimit` 字段 | 订阅数据的 `quota` 字段 |
 | 性质 | 硬上限（不可突破） | 软上限（付费计划可突破，仅上报） |
 | 错误码 | `system_limit.limit_exceeded` | `subscription.limit_exceeded` |
 | 付费计划豁免 | 不豁免 | Pro/Enterprise 豁免（仅上报 Cloud） |
 | 类型 | 数值型 | 数值型 + 布尔型（功能开关） |
 
-**布尔型配额示例**（功能开关类）:
+配额守卫的两种接入方式：
 
-```typescript
-if (isBooleanQuotaUsageKey(key)) {
-  assertThat(limit, new RequestError({ code: 'subscription.limit_exceeded', status: 403, data: { key } }));
-  return;
-}
-```
+1. **middleware 级别**（SchemaRouter 的 `middlewares` 配置）：在 `koaGuard` 之前执行
+2. **业务代码内调用**（`quota.guardTenantUsageByKey()`）：更灵活，可在业务逻辑中决定何时检查
 
-**数值型配额示例**:
+**TenantUsageQuery 的请求级缓存**：`QuotaLibrary` 内部使用请求级 `Map` 避免同一请求中对同一 key+entityId 重复查询数据库。
 
-```typescript
-if (isNumericQuotaUsageKey(key)) {
-  const usage = await tenantUsageQuery.get(key, entityId);
-  assertThat(
-    usage + consumeUsageCount <= limit,
-    new RequestError({ code: 'subscription.limit_exceeded', status: 403, data: { key, limit, usage } })
-  );
-}
-```
-
-**TenantUsageQuery 的请求级缓存**:
-
-`TenantUsageQuery` 是一个请求级别的内存缓存，避免同一请求中对同一 key+entityId 重复查询数据库：
-
-```typescript
-class TenantUsageQuery {
-  private readonly cache = new Map<string, number>();
-
-  get = async (key, entityId) => {
-    const cacheKey = entityId ? `${key}:${entityId}` : key;
-    const cached = this.cache.get(cacheKey);
-    if (cached !== undefined) return cached;
-    const usage = await this.getTenantUsage(key, entityId);
-    this.cache.set(cacheKey, usage);
-    return usage;
-  };
-}
-```
-
-**SchemaRouter 中的应用** (组织路由示例):
-
-```typescript
-const router = new SchemaRouter(Organizations, organizations, {
-  middlewares: [
-    {
-      middleware: koaQuotaGuard({ key: 'organizationsLimit', quota }),
-      scope: 'native',
-      method: ['post', 'put'],       // 仅在创建/替换时检查
-      status: [403],
-    },
-    {
-      middleware: koaReportSubscriptionUpdates({ key: 'organizationsLimit', quota }),
-      scope: 'native',
-      method: ['post', 'put', 'delete'],  // 变更后上报 Cloud
-    },
-  ],
-});
-```
-
-### 3.4 第四层：Token 用量守卫 (koaTokenUsageGuard)
+### 3.5 按需守卫：Token 用量守卫 (koaTokenUsageGuard)
 
 **文件位置**: `packages/core/src/middleware/koa-token-usage-guard.ts`
 
-**挂载位置**: 仅在 OIDC `/token` 端点、仅云环境生效。
+**不在 managementRouter 上**，仅挂载在 OIDC `/token` 端点、仅云环境生效。
 
-```typescript
-// packages/core/src/oidc/init.ts
-if (EnvSet.values.isCloud) {
-  oidc.use(koaTokenUsageGuard(subscription));
-}
-```
-
-**判定逻辑**:
-
-```typescript
-if (path !== '/token') return next();
-if (subscriptionLibrary.tenantId === adminTenantId) return next();  // admin 租户豁免
-
-const { planId, isEnterprisePlan, currentPeriodEnd, currentPeriodStart, quota: { tokenLimit } }
-  = await subscriptionLibrary.getSubscriptionData();  // 命中 Redis 缓存
-
-// 付费计划直接放行
-if (isReportablePlan(planId, isEnterprisePlan)) {
-  await next();
-  return;
-}
-
-// 免费计划：检查 token 用量
-const tokenUsage = await subscriptionLibrary.getTenantTokenUsage({
-  from: new Date(currentPeriodStart),
-  to: new Date(currentPeriodEnd),
-});
-
-assertThat(
-  tokenLimit === null || tokenUsage.totalUsage < tokenLimit,
-  new RequestError({ code: 'auth.exceed_token_limit', status: 429 })
-);
-```
-
-**异常容错**：非 `RequestError` 的意外错误不会阻断请求，仅上报 App Insights：
-
-```typescript
-catch (error: unknown) {
-  if (error instanceof RequestError) throw error;
-  void appInsights.trackException(error, buildAppInsightsTelemetry(ctx));
-}
-```
-
-### 3.5 第五层：输入输出守卫 (koaGuard)
+### 3.6 按需守卫：输入输出守卫 (koaGuard)
 
 **文件位置**: `packages/core/src/middleware/koa-guard.ts`
 
-使用 Zod schema 对请求的 query、body、params、files 进行验证，并对响应体和状态码进行断言。这不是权限层面的守卫，但它是请求进入业务逻辑前的最后一道验证。
-
-### 3.6 SchemaRouter 中间件系统
-
-**文件位置**: `packages/core/src/utils/SchemaRouter.ts`
-
-SchemaRouter 提供灵活的中间件配置系统，支持：
-- 按作用域应用（`native` = CRUD 路由，`relation` = 关联路由）
-- 按 HTTP 方法过滤
-- 自动收集中间件声明的额外状态码
+使用 Zod schema 验证请求 query/body/params/files，断言响应体和状态码。这不是权限层面的守卫，但它是请求进入业务逻辑前的常见拒绝点。
 
 ## 四、缓存机制
 
 ### 4.1 双层缓存架构
-
-访问控制涉及两层独立的缓存系统，服务于不同的守卫层：
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -379,7 +238,7 @@ SchemaRouter 提供灵活的中间件配置系统，支持：
 │       ▼              │       ▼                              │
 │  TenantSubscription  │  TenantSubscription                  │
 │  Cache (Redis)       │  Cache (Redis) ← 同一实例            │
-│       │              │       │                              │
+│                      │       │                              │
 │                      │       ▼                              │
 │                      │  TtlCache (进程内)                    │
 │                      │  tokenUsageCache                     │
@@ -391,40 +250,21 @@ SchemaRouter 提供灵活的中间件配置系统，支持：
 
 **文件位置**: `packages/core/src/caches/base-cache.ts`
 
-```typescript
-export abstract class BaseCache<CacheMapT extends Record<string, unknown>> {
-  constructor(
-    public tenantId: string,
-    protected cacheStore: CacheStore   // Redis 后端
-  ) {}
-
-  // 默认过期时间：30 分钟 (1800 秒)
-  async set(type, key, value, expire?) {
-    return this.cacheStore.set(this.cacheKey(type, key), JSON.stringify(value), expire);
-  }
-
-  // 装饰器：成功后删除缓存（Write-Through 失效）
-  mutate(run, ...types) { /* ... */ }
-
-  // 装饰器：结果缓存 + 防缓存击穿
-  memoize(run, [type, cacheKey], getExpiresIn?) { /* ... */ }
-}
-```
-
-**缓存键格式**: `{tenantId}:{type}:{key}`
-
-`memoize` 的并发控制机制：通过 `promiseCache`（`Map<unknown, Promise>`）确保同一 key 同时只有一个正在执行的查询，防止缓存击穿。
+- 缓存键格式: `{tenantId}:{type}:{key}`
+- 默认过期时间: 30 分钟（1800 秒）
+- `memoize`: 结果缓存 + `promiseCache` 防缓存击穿
+- `mutate`: 成功后删除缓存
 
 ### 4.3 订阅数据缓存 (TenantSubscriptionCache + Redis)
 
-**文件位置**: 
+**文件位置**:
 - 缓存类: `packages/core/src/caches/tenant-subscription.ts`
 - 库逻辑: `packages/core/src/libraries/subscription.ts`
 
-**TTL 计算方法**：TTL 不是固定值，而是基于 `currentPeriodEnd` 动态计算：
+**TTL 计算方法**：基于 `currentPeriodEnd` 动态计算：
 
 ```typescript
-const maxSubscriptionCacheTtl = 24 * 60 * 60;  // 最大 24 小时（秒）
+const maxSubscriptionCacheTtl = 24 * 60 * 60;  // 最大 24 小时
 
 const getSubscriptionCacheExpiration = (currentPeriodEnd: string) => {
   const expiration = Math.floor((new Date(currentPeriodEnd).getTime() - Date.now()) / 1000);
@@ -432,401 +272,310 @@ const getSubscriptionCacheExpiration = (currentPeriodEnd: string) => {
 };
 ```
 
-**TTL 计算逻辑**:
-- 取 `currentPeriodEnd - now`（秒）作为基础过期时间
-- 下限为 0（订阅期已结束则立即过期）
-- 上限为 24 小时（86400 秒）
-- 这意味着：如果订阅期还剩 2 小时，缓存 TTL 就是 2 小时；如果还剩 30 天，TTL 为 24 小时
-
-**缓存创建方式**:
-
-```typescript
-this.getSubscriptionData = this.subscriptionCache.memoize(
-  async () => getTenantSubscription(this.cloudConnection),  // 从 Cloud API 获取
-  [SubscriptionRedisCacheKey.Subscription],                  // 缓存类型
-  ({ currentPeriodEnd }) => getSubscriptionCacheExpiration(currentPeriodEnd)  // 动态 TTL
-);
-```
-
-**缓存失效策略**:
-
-订阅缓存**没有显式的 `mutate` 或 `delete` 调用**。其失效完全依赖 Redis TTL 过期：
-
-1. **TTL 到期自动失效**: Redis 在 TTL 过期后自动删除 key
-2. **currentPeriodEnd 驱动**: 当订阅周期结束时缓存恰好过期，下一个请求重新从 Cloud API 拉取最新订阅数据
-3. **Cloud 侧变更传播**: 如果 Cloud 侧更新了订阅数据（如升级计划），需要等待当前缓存 TTL 到期后才能生效（最长 24 小时）
-4. **memoize 防击穿**: 在缓存失效瞬间，通过 `promiseCache` 保证只有一个请求去 Cloud API 获取数据
+**缓存失效策略**：**没有显式的 `mutate` 或 `delete` 调用**，完全依赖 Redis TTL 过期：
+1. TTL 到期自动失效
+2. `currentPeriodEnd` 驱动：订阅周期结束时缓存恰好过期
+3. Cloud 侧变更传播：最长需等 24 小时
+4. `memoize` 防击穿
 
 ### 4.4 Token 用量缓存 (TtlCache + 进程内存)
 
 **文件位置**: `packages/core/src/libraries/subscription.ts`
 
-这是一个**进程内**的 TTL 缓存（`@logto/shared` 的 `TtlCache`），不走 Redis：
-
-```typescript
-const tokenUsageCacheTtl = 60 * 60 * 1000;  // 1 小时（毫秒）
-
-private readonly tokenUsageCache = new TtlCache<string, TokenUsageCounts>(tokenUsageCacheTtl);
-```
-
-**TTL 计算方法**：同样基于时间窗口动态计算：
-
-```typescript
-const getTokenUsageCacheTtl = (to: Date) => {
-  const expiration = Math.floor(to.getTime() - Date.now());
-  return Math.min(expiration, tokenUsageCacheTtl);  // 最大 1 小时
-};
-```
-
-**缓存键格式**: `{tenantId}:{from_date}:{to_date}:token-usage`
-
-**与权限判断的联系**:
-
-```
-koaTokenUsageGuard 调用链：
-
-1. subscriptionLibrary.getSubscriptionData()
-   → 命中 Redis 缓存 → 获取 { currentPeriodStart, currentPeriodEnd, quota: { tokenLimit } }
-
-2. subscriptionLibrary.getTenantTokenUsage({ from: currentPeriodStart, to: currentPeriodEnd })
-   → 先查 TtlCache（进程内，最长1小时）
-   → 未命中则查数据库 dailyTokenUsage 表
-   → 写入 TtlCache，TTL = min(当前周期剩余时间, 1小时)
-
-3. 比较 tokenUsage.totalUsage < tokenLimit
-   → 超限则 429
-```
-
-**关键设计**：token 用量缓存的 TTL 与 `currentPeriodEnd` 挂钩，确保在订阅周期结束时缓存恰好失效，避免使用过期周期的用量数据。
+- 进程内 TtlCache（不走 Redis），最大 1 小时
+- TTL 同样与 `currentPeriodEnd` 挂钩
+- 缓存键: `{tenantId}:{from_date}:{to_date}:token-usage`
 
 ### 4.5 currentPeriodEnd 在权限判断中的核心角色
-
-`currentPeriodEnd` 是连接两层缓存的枢纽：
 
 | 作用 | 关联缓存 | 影响 |
 |------|---------|------|
 | 订阅缓存 TTL | Redis TenantSubscriptionCache | 缓存精确在周期结束时过期 |
-| Token 用量查询窗口 | 进程内 TtlCache | 确定查询 token 用量的时间范围 |
+| Token 用量查询窗口 | 进程内 TtlCache | 确定查询时间范围 |
 | Token 用量缓存 TTL | 进程内 TtlCache | 用量缓存也在周期结束时失效 |
-| 付费计划判断 | 两者共用 | Pro/Enterprise 直接放行，跳过用量检查 |
-
-**数据流**:
+| 付费计划判断 | 两者共用 | Pro/Enterprise 直接放行 |
 
 ```
 Cloud API → Subscription (含 currentPeriodEnd)
-                │
                 ├─→ Redis 缓存 (TTL = min(周期剩余秒数, 24h))
-                │
-                └─→ Token 用量查询窗口 (from: currentPeriodStart, to: currentPeriodEnd)
-                         │
+                └─→ Token 用量查询窗口 (from/to)
                          └─→ TtlCache (TTL = min(周期剩余毫秒数, 1h))
-                                  │
-                                  └─→ tokenUsage.totalUsage vs tokenLimit → 429 or pass
+                                  └─→ tokenUsage vs tokenLimit → 429 or pass
 ```
 
-### 4.6 WellKnownCache（非权限相关，供参考）
-
-**文件位置**: `packages/core/src/caches/well-known.ts`
-
-存储 SIE、connectors、signing-key-rotation-state 等公开数据。默认过期 30 分钟。通过 `Tenant.invalidateCache()` 主动失效（签名密钥轮换时调用）。
-
-## 五、越权拒绝路径
+## 五、越权拒绝路径与三类观测面
 
 ### 5.1 错误类型与状态码
 
-| 层级 | 错误场景 | 错误码 | HTTP 状态码 | 所在文件 |
-|------|---------|--------|------------|---------|
-| 认证守卫 | Token 无效/过期 | `auth.unauthorized` | 401 | `koa-auth/index.ts` |
-| 认证守卫 | Token 缺少 sub | `auth.jwt_sub_missing` | 401 | `koa-auth/index.ts` |
-| 认证守卫 | 缺少 all scope | `auth.forbidden` | 403 | `koa-auth/index.ts` |
-| 租户守卫 | 租户被暂停 | `subscription.tenant_suspended` | 403 | `koa-tenant-guard.ts` |
-| 配额守卫 | 系统限制超限 | `system_limit.limit_exceeded` | 403 | `libraries/quota.ts` |
-| 配额守卫 | 订阅配额超限 | `subscription.limit_exceeded` | 403 | `libraries/quota.ts` |
-| Token用量守卫 | Token用量超限 | `auth.exceed_token_limit` | 429 | `koa-token-usage-guard.ts` |
-| 输入守卫 | 参数验证失败 | `guard.invalid_input` | 400 | `koa-guard.ts` |
+| 拒绝点 | 错误码 | HTTP 状态码 | 拒绝位置 |
+|--------|--------|------------|---------|
+| JWT 无效/过期 | `auth.unauthorized` | 401 | 全局: koaAuth |
+| 缺少 all scope | `auth.forbidden` | 403 | 全局: koaAuth |
+| Token 缺少 sub | `auth.jwt_sub_missing` | 401 | 全局: koaAuth |
+| 租户暂停 | `subscription.tenant_suspended` | 403 | 全局: koaTenantGuard |
+| 系统限制超限 | `system_limit.limit_exceeded` | 403 | 按需: QuotaLibrary |
+| 订阅配额超限 | `subscription.limit_exceeded` | 403 | 按需: QuotaLibrary |
+| Token 用量超限 | `auth.exceed_token_limit` | 429 | 按需: koaTokenUsageGuard |
+| 参数验证失败 | `guard.invalid_input` | 400 | 按需: koaGuard |
+| 响应状态码不符 | StatusCodeError (500) | - | 按需: koaGuard |
 
-### 5.2 RequestError 类
+### 5.2 三类观测面概述
 
-**文件位置**: `packages/core/src/errors/RequestError/index.ts`
+| 观测面 | 触发机制 | 数据存储 | 覆盖范围 |
+|--------|---------|---------|---------|
+| **Audit Log** | `koaAuditLog` 中间件 + `ctx.createLog()` | 数据库 `logs` 表 | 仅身份认证路由 |
+| **Management Hooks** | `koaManagementApiHooks` 中间件 | 外部 Webhook URL | managementRouter + userRouter |
+| **AppInsights** | `koaErrorHandler` + 各中间件主动上报 | Azure AppInsights | 所有路由 |
+
+### 5.3 各拒绝场景的观测面触发详情
+
+#### 场景 A：全局守卫拒绝（koaAuth 401/403、koaTenantGuard 403）
+
+```
+请求 → koaAuth (拒绝) → 抛出 RequestError
+     → koaTenantGuard (跳过，因为 koaAuth 已抛出)
+     → koaManagementApiHooks (catch 块)
+         → data hooks: 不触发 (entries 为空)
+         → exception hooks: 不触发 (无 appendExceptionHookContext 调用)
+     → koaErrorHandler
+         → AppInsights: ✅ 追踪 (所有异常)
+         → Audit Log: ❌ 不触发 (managementRouter 未挂载 koaAuditLog)
+         → Management Hooks (data): ❌ 不触发 (next() 未执行)
+         → Management Hooks (exception): ❌ 不触发 (无主动 appendExceptionHookContext)
+```
+
+**结论**：全局守卫拒绝仅在 AppInsights 中留痕。
+
+#### 场景 B：按需守卫拒绝（koaQuotaGuard 403、koaGuard 400）
+
+```
+请求 → koaAuth (通过)
+     → koaTenantGuard (通过)
+     → koaManagementApiHooks (try 块)
+         → koaQuotaGuard (拒绝) → 抛出 RequestError
+         或
+         → koaGuard (参数验证失败) → 抛出 RequestError
+     → koaManagementApiHooks (catch 块, 重新抛出)
+         → data hooks: ❌ 不触发 (next() 未完成)
+         → exception hooks: ❌ 不触发 (无主动 appendExceptionHookContext)
+     → koaErrorHandler
+         → AppInsights: ✅ 追踪
+         → Audit Log: ❌ 不触发
+         → Management Hooks (data): ❌ 不触发
+         → Management Hooks (exception): ❌ 不触发
+```
+
+**结论**：按需守卫拒绝同样仅在 AppInsights 中留痕。
+
+#### 场景 C：业务逻辑拒绝（如角色名重复 422、配额检查 403）
+
+```
+请求 → koaAuth (通过)
+     → koaTenantGuard (通过)
+     → koaManagementApiHooks (try 块)
+         → koaGuard (通过)
+         → 业务代码: quota.guardTenantUsageByKey() → 403
+         或 业务代码: assertThat(nameNotInUse) → 422
+         → 抛出 RequestError
+     → koaManagementApiHooks (catch 块, 重新抛出)
+         → data hooks: ❌ 不触发
+         → exception hooks: ❌ 不触发 (业务代码通常不调用 appendExceptionHookContext)
+     → koaErrorHandler
+         → AppInsights: ✅ 追踪
+         → Audit Log: ❌ 不触发
+         → Management Hooks: ❌ 不触发
+```
+
+**结论**：业务逻辑拒绝仅在 AppInsights 中留痕。
+
+#### 场景 D：业务成功
+
+```
+请求 → koaAuth (通过)
+     → koaTenantGuard (通过)
+     → koaManagementApiHooks (try 块)
+         → koaGuard (通过)
+         → 业务代码: 成功
+             → 可能调用 ctx.appendDataHookContext('User.Created', {...})
+         → await next() 返回
+     → koaManagementApiHooks (成功路径)
+         → 自动追加注册的 hook (如 POST /users → User.Created)
+         → data hooks: ✅ 触发 (业务主动 + 自动注册)
+         → finally: exception hooks: 不触发 (无 exception 上下文)
+     → koaErrorHandler (不介入)
+         → AppInsights: ❌ 无异常可追踪
+         → Audit Log: ❌ 不触发
+         → Management Hooks (data): ✅ 触发
+```
+
+**结论**：业务成功时仅 Management Hooks 触发。
+
+#### 场景 E：OIDC /token 路由拒绝
+
+```
+请求 → koaAuditLog (注入 createLog)
+     → koaTokenUsageGuard (拒绝: 429)
+     → koaAuditLog (catch 块)
+         → entries: 取决于是否已调用 createLog
+         → 如果有 entries → ✅ 追加 LogResult.Error
+         → 如果无 entries → ❌ 无日志
+     → koaErrorHandler / koaOidcErrorHandler
+         → AppInsights: ✅ 追踪
+         → Audit Log: ⚠️ 取决于事件监听器是否已调用 createLog
+```
+
+**注意**：OIDC 路由中 `createLog` 主要在事件监听器中调用（如 `grant.success`、`grant.error`），而非在守卫层。如果 Token 用量守卫在事件监听器触发之前就拒绝了请求，则不会有审计日志。
+
+#### 场景 F：koaGuard 响应状态码断言失败
+
+**文件位置**: `packages/core/src/middleware/koa-guard.ts:191-209`
 
 ```typescript
-export default class RequestError extends Error {
-  code: LogtoErrorCode;
-  status: number;
-  expose: boolean;   // 是否向客户端暴露错误详情
-  data: unknown;     // 附加数据（如 { key, limit, usage }）
-}
-```
-
-- 支持 i18n：`toBody(i18next)` 生成客户端友好的国际化错误信息
-- `data` 字段携带结构化上下文（如配额超限时包含 key、limit、usage）
-
-### 5.3 错误处理流程
-
-1. **守卫抛出 RequestError**: 各层守卫检查失败时抛出
-2. **koa-error-handler 统一捕获**: 转换为标准 HTTP 响应
-3. **审计日志记录**: 如果当前路由启用了 `koaAuditLog`，catch 块自动将错误标记到日志条目
-4. **国际化响应**: `toBody()` 方法生成客户端错误信息
-
-### 5.4 特殊容错：Token 用量守卫
-
-`koaTokenUsageGuard` 对非 `RequestError` 的意外错误采用**容错策略**，不阻断请求：
-
-```typescript
-catch (error: unknown) {
-  if (error instanceof RequestError) throw error;
-  void appInsights.trackException(error, buildAppInsightsTelemetry(ctx));
-}
-// 继续执行 next()
-```
-
-## 六、审计系统关联
-
-### 6.1 审计日志的实际挂载位置
-
-**重要纠正**：`koaAuditLog` 并未在 Management API 路由（`managementRouter`）上全局挂载。
-
-审计日志中间件的实际挂载位置：
-
-| 路由 | 挂载方式 | 文件位置 |
-|------|---------|---------|
-| OIDC 路由 | `oidc.use(koaAuditLog(queries))` | `packages/core/src/oidc/init.ts:422` |
-| Experience 路由 | `experienceRouter.use(koaAuditLog(tenant.queries))` | `packages/core/src/routes/init.ts:72` |
-| Interaction 路由 | `interactionRouter` 子路由级别挂载 | `packages/core/src/routes/interaction/index.ts:59` |
-| SAML 匿名路由 | 子路由级别挂载 | `packages/core/src/routes/saml-application/anonymous.ts` |
-| Authn 路由 | 子路由级别挂载 | `packages/core/src/routes/authn.ts:186` |
-| **Management API** | **未挂载** | — |
-| **User API** | **未挂载** | — |
-
-**结论**：管理 API 的 CRUD 操作（如创建应用、修改角色等）**不会自动产生审计日志**。审计日志仅覆盖身份认证流程（登录、Token 交换、SAML 回调等）。
-
-### 6.2 审计日志的触发条件
-
-审计日志需要**两个条件同时满足**：
-
-1. **中间件挂载**: 路由或其父级使用了 `koaAuditLog(queries)`
-2. **业务代码主动调用**: `ctx.createLog(key)` 创建日志条目
-
-如果仅挂载了中间件但业务代码未调用 `createLog`，则不会产生任何日志记录。
-
-### 6.3 LogKey 体系
-
-**文件位置**: `packages/schemas/src/types/log/index.ts`
-
-```
-LogKey (所有日志键)
-├── AuditLogKey (面向用户的审计日志)
-│   ├── InteractionLogKey   → "Interaction.SignIn.Update" 等
-│   ├── TokenLogKey         → "ExchangeTokenBy.AuthorizationCode" 等
-│   ├── SamlLogKey          → "SamlApplication.Callback" 等
-│   ├── JwtCustomizerLogKey → "JwtCustomizer.*" 等
-│   └── "Unknown"           → 兜底键
-└── WebhookLogKey (内部 Webhook 日志，非审计)
-```
-
-**Token 审计日志**通过 OIDC 事件监听器触发：
-
-```typescript
-// packages/core/src/event-listeners/grant.ts
-provider.addListener('grant.success', grantListener);
-provider.addListener('grant.error', grantListener);
-provider.addListener('grant.revoked', grantRevocationListener);
-
-export const grantListener = (ctx, error?) => {
-  const log = ctx.createLog(`${token.Type.ExchangeTokenBy}.${getExchangeByType(params?.grant_type)}`);
-  log.append({
-    result: error && LogResult.Error,
-    tokenTypes,
-    scope,
-    error: error && stringifyError(error),
-  });
+const assertStatusCode = (value: number) => {
+  if (Array.isArray(status) ? status.includes(value) : status === value) return;
+  if (EnvSet.values.isProduction) {
+    consoleLog.warn('Unexpected status code:', value, 'expected:', status);
+    void appInsights.trackException(new StatusCodeError(status, value), ...);
+    return;  // 生产环境仅告警，不抛出
+  }
+  throw new StatusCodeError(status, value);  // 非生产环境抛出
 };
 ```
 
-### 6.4 审计日志的异常路径
+**结论**：koaGuard 的状态码断言失败在生产环境仅上报 AppInsights，不影响请求。
 
-**正常路径**:
+### 5.4 观测面触发矩阵
 
-```
-koaAuditLog 中间件 → next() → 业务代码 createLog → log.append() → finally 写入
-```
+| 拒绝场景 | Audit Log | Management Hooks (data) | Management Hooks (exception) | AppInsights |
+|---------|-----------|------------------------|-----------------------------|-------------|
+| koaAuth 401/403 | ❌ | ❌ | ❌ | ✅ |
+| koaTenantGuard 403 | ❌ | ❌ | ❌ | ✅ |
+| koaQuotaGuard 403 | ❌ | ❌ | ❌ | ✅ |
+| koaGuard 400 | ❌ | ❌ | ❌ | ✅ |
+| QuotaLibrary 业务内 403 | ❌ | ❌ | ❌ | ✅ |
+| 业务逻辑 422 | ❌ | ❌ | ❌ | ✅ |
+| Token 用量 429 | ⚠️ 取决于 | N/A | N/A | ✅ |
+| koaGuard 状态码断言 | ❌ | ❌ | ❌ | ✅(生产) / 抛出(非生产) |
+| 业务成功 | ❌ | ✅ | ❌ | ❌ |
+| OIDC Token 交换成功 | ✅ | N/A | N/A | ❌ |
 
-**异常路径 1：守卫拦截（如 koaAuth 403）**
+### 5.5 Audit Log 与 Management Hooks 的设计边界
 
-当审计日志中间件挂载在守卫之前时（如 OIDC 路由），守卫抛出的错误会被 `koaAuditLog` 的 catch 块捕获：
+**Audit Log** (`koaAuditLog`)：
+- 覆盖：OIDC / Experience / Interaction / SAML / Authn 路由
+- 内容：身份认证事件（登录、Token 交换、MFA 等）
+- 存储：数据库 `logs` 表
+- 触发方式：业务代码主动 `ctx.createLog(key)`
+
+**Management Hooks** (`koaManagementApiHooks`)：
+- 覆盖：managementRouter + userRouter
+- 内容：数据变更事件（用户创建、角色删除等）+ 异常事件
+- 存储：外部 Webhook URL
+- 触发方式：业务代码主动 `ctx.appendDataHookContext()` + 自动注册表
+
+**两者互不重叠**：审计日志和 Management Hooks 服务于不同的观测需求，覆盖不同的路由集合。
+
+### 5.6 AppInsights 的统一覆盖
+
+`koaErrorHandler` 在 Tenant 级 Koa app 上全局挂载（`packages/core/src/tenants/Tenant.ts:125`），是**所有异常的最终兜底观测面**：
 
 ```typescript
+// packages/core/src/middleware/koa-error-handler.ts
 try {
-  await next();  // koaAuth → koaTokenUsageGuard → 业务逻辑
+  await next();
 } catch (error: unknown) {
-  for (const entry of entries) {
-    entry.append({
-      result: LogResult.Error,
-      error: error instanceof RequestError
-        ? pick(error, 'message', 'code', 'data')
-        : { message: String(error) },
-    });
-  }
-  throw error;  // 重新抛出，由上游错误处理器处理
-} finally {
-  // 写入日志（包含错误信息）
+  // 所有异常都上报 AppInsights
+  void appInsights.trackException(error, buildAppInsightsTelemetry(ctx));
+  // ... 处理 HTTP 响应
 }
 ```
 
-但此时如果业务代码尚未调用 `createLog`，则 `entries` 数组为空，不会写入任何日志。
+此外，以下位置也会主动上报 AppInsights：
+- `koa-guard.ts`: 响应状态码断言失败（生产环境）
+- `koa-token-usage-guard.ts`: 非预期的意外错误（不阻断请求时）
+- `koa-oidc-error-handler.ts`: OIDC 错误
+- OIDC 事件监听器 `server_error`
 
-**异常路径 2：Management API 守卫拦截**
+## 六、关键决策点
 
-由于 Management API 未挂载 `koaAuditLog`，所有被 `koaAuth`、`koaTenantGuard`、`koaQuotaGuard` 拦截的请求**不会产生审计日志**。这些拒绝记录仅存在于服务端 console 日志和 App Insights 遥测中。
+### 6.1 Scope 设计决策
 
-**异常路径 3：koaGuard 验证失败**
-
-`koaGuard` 抛出的 `guard.invalid_input` 错误在 `koaAuditLog` 的 catch 块中会被记录（如果审计中间件已挂载），但由于是输入验证失败，通常没有业务日志条目需要追加。
-
-### 6.5 审计日志写入机制
-
-**文件位置**: `packages/core/src/middleware/koa-audit-log.ts`
-
-```typescript
-finally {
-  const basePayload = removeUndefinedKeys({
-    ip,
-    userAgent: userAgentValue,
-    ...conditional(userAgentParsed && { userAgentParsed }),
-    ...conditional(signInContext && { signInContext }),
-  });
-
-  await Promise.all(
-    entries.map(async ({ payload }) => {
-      return insertLog({
-        id: generateStandardId(),
-        key: payload.key,
-        payload: { ...basePayload, ...payload },
-      });
-    })
-  );
-}
-```
-
-**写入特点**:
-- 在 `finally` 块中执行，确保无论成功失败都会写入
-- 自动注入请求 IP、User Agent、登录上下文
-- 敏感数据自动脱敏（`password`、`secret` 字段替换为 `******`）
-- 使用 `Promise.all` 并行写入多条日志
-- `await` 等待写入完成，日志写入失败不影响错误传播
-
-### 6.6 审计日志查询
-
-**文件位置**: `packages/core/src/routes/log.ts`
-
-Management API 提供日志查询端点（`GET /api/logs`、`GET /api/logs/:id`），但这是管理接口本身的 CRUD 功能，不是访问控制流程的一部分。查询的日志范围包括：
-
-```typescript
-const includeKeyPrefix: AuditLogPrefix[] = [
-  token.Type.ExchangeTokenBy,
-  token.Type.RevokeToken,
-  token.Type.RevokeGrants,
-  interaction.prefix,
-  jwtCustomizer.prefix,
-  saml.prefix,
-  LogKeyUnknown,
-];
-```
-
-## 七、关键决策点
-
-### 7.1 Scope 设计决策
-
-**决策**: 管理 API 使用单一 `all` scope 而非细粒度 scope
-
-**代码位置**: `packages/schemas/src/seeds/management-api.ts`
-
-```typescript
-scopes: [
-  {
-    name: PredefinedScope.All,
-    description: 'Default scope for Management API, allows all permissions.',
-  },
-],
-```
+**决策**: 管理 API 使用单一 `all` scope
 
 **权衡**:
-- ✅ 简化权限模型，降低实现复杂度
-- ✅ 与 RBAC 系统解耦（角色 → scope → 访问权）
-- ⚠️ 粒度较粗，无法在 API 层面做细粒度资源权限控制
-- ⚠️ 实际的细粒度控制由 Cloud 侧的角色分配和配额限制实现
+- ✅ 简化权限模型
+- ⚠️ 粒度较粗，细粒度控制由 Cloud 侧角色分配和配额限制实现
 
-### 7.2 中间件顺序决策
+### 6.2 配额守卫两种接入方式的权衡
 
-**决策**: 认证守卫 → 租户守卫 → 配额守卫 → 业务守卫
+**middleware 级别**（如 `koaQuotaGuard`）：
+- 在 `koaGuard` 之前执行，更早拒绝
+- 拒绝时不会触发 data hooks（因为 next() 未完成）
+- 配额检查与路由声明一体化，易于文档化
 
-**理由**:
-1. 先验证身份（"你是谁"）— 无 Token 则一切免谈
-2. 再验证租户状态（"你的租户是否正常"）— 暂停租户直接拒绝
-3. 再验证配额（"你是否有足够资源"）— 配额检查需要订阅数据，依赖 Redis 缓存
-4. 最后验证业务权限 — 输入输出格式等
+**业务代码内调用**（如 `quota.guardTenantUsageByKey()`）：
+- 更灵活，可根据业务逻辑决定何时检查
+- 可传 `consumeUsageCount` 和 `entityId`
+- 位置不固定，需要阅读业务代码才能了解配额检查逻辑
 
-### 7.3 订阅缓存 TTL 决策
+### 6.3 Management Hooks 仅触发成功路径
 
-**决策**: 基于 `currentPeriodEnd` 动态计算 TTL，上限 24 小时
-
-**理由**:
-- 在订阅周期结束时缓存自然失效，无需额外的失效推送机制
-- 24 小时上限防止长期订阅的缓存数据过旧
-- 权衡：Cloud 侧的订阅变更最长需要 24 小时才能生效
-
-### 7.4 Token 用量缓存决策
-
-**决策**: 两级缓存（Redis 订阅数据 + 进程内 TtlCache 用量数据）
+**决策**: data hooks 仅在 `await next()` 成功完成后触发
 
 **理由**:
-- 订阅数据变化不频繁 → Redis 缓存，跨请求共享
-- Token 用量每个请求都需要查询 → 进程内缓存，避免数据库压力
-- 两层缓存的 TTL 都与 `currentPeriodEnd` 挂钩，确保周期切换时数据一致
+- 避免部分失败的请求触发不完整的 Webhook
+- 注册的自动 Hook 也仅在成功后追加
+- Exception hooks 通过 `finally` 块保证触发，但需要业务代码主动调用 `appendExceptionHookContext`
 
-### 7.5 审计日志覆盖范围决策
+### 6.4 审计日志与 Management Hooks 互不覆盖
 
-**决策**: 仅在身份认证流程路由上挂载审计日志，管理 API CRUD 操作不记录审计日志
+**决策**: Audit Log 覆盖认证流程，Management Hooks 覆盖管理操作
 
 **权衡**:
-- ✅ 减少日志写入量，降低存储和查询成本
-- ✅ 聚焦安全审计（谁登录了、谁的 Token 被换了）
-- ⚠️ 管理操作（如删除用户、修改角色）无法通过审计日志追溯
-- ⚠️ 如果需要管理操作审计，需要通过 Cloud 侧的 Webhook 机制实现
+- ✅ 职责清晰，避免重复记录
+- ⚠️ 管理操作（如删除用户）无审计日志记录
+- ⚠️ 认证流程（如 Token 交换）无 Management Hooks 触发
 
-### 7.6 Token 用量守卫容错决策
+### 6.5 订阅缓存 TTL 决策
 
-**决策**: Token 用量守卫的意外错误不阻断请求
+**决策**: 基于 `currentPeriodEnd` 动态计算，上限 24 小时
 
-**理由**:
-- Token 发放是核心功能，不应因配额检查的意外故障而中断
-- 错误上报到 App Insights 以便运维发现
-- 仅对明确的 `RequestError`（如 429 超限）阻断请求
+**理由**: 周期结束时缓存自然失效，无需失效推送。权衡：Cloud 侧变更最长需 24 小时生效。
 
-## 八、代码路径索引
+### 6.6 Token 用量守卫容错决策
+
+**决策**: 意外错误不阻断请求，仅上报 AppInsights
+
+**理由**: Token 发放是核心功能，不应因配额检查意外故障中断。仅明确的 429 阻断。
+
+## 七、代码路径索引
 
 | 功能模块 | 文件路径 |
 |---------|---------|
 | 租户上下文定义 | `packages/core/src/tenants/TenantContext.ts` |
 | 租户实例创建 | `packages/core/src/tenants/Tenant.ts` |
-| 路由初始化 | `packages/core/src/routes/init.ts` |
+| 路由初始化（中间件挂载） | `packages/core/src/routes/init.ts` |
 | 认证守卫 | `packages/core/src/middleware/koa-auth/index.ts` |
 | OIDC 认证守卫 | `packages/core/src/middleware/koa-auth/koa-oidc-auth.ts` |
 | 租户守卫 | `packages/core/src/middleware/koa-tenant-guard.ts` |
+| Management API Hooks 中间件 | `packages/core/src/middleware/koa-management-api-hooks.ts` |
+| Hook 上下文管理器 | `packages/core/src/libraries/hook/context-manager.ts` |
+| Hook 核心逻辑（触发 Webhook） | `packages/core/src/libraries/hook/index.ts` |
+| 管理 API Hook 注册表 | `packages/schemas/src/foundations/jsonb-types/hooks.ts` |
 | 配额守卫中间件 | `packages/core/src/middleware/koa-quota-guard.ts` |
 | 配额判定核心 | `packages/core/src/libraries/quota.ts` |
 | Token 用量守卫 | `packages/core/src/middleware/koa-token-usage-guard.ts` |
 | 订阅库（缓存核心） | `packages/core/src/libraries/subscription.ts` |
 | 输入输出守卫 | `packages/core/src/middleware/koa-guard.ts` |
+| 全局错误处理 | `packages/core/src/middleware/koa-error-handler.ts` |
 | 审计日志中间件 | `packages/core/src/middleware/koa-audit-log.ts` |
 | OIDC 事件监听器 | `packages/core/src/event-listeners/index.ts` |
 | Grant 审计日志 | `packages/core/src/event-listeners/grant.ts` |
 | 基础缓存 | `packages/core/src/caches/base-cache.ts` |
 | 订阅缓存 | `packages/core/src/caches/tenant-subscription.ts` |
-| WellKnown 缓存 | `packages/core/src/caches/well-known.ts` |
 | SchemaRouter | `packages/core/src/utils/SchemaRouter.ts` |
 | 错误处理 | `packages/core/src/errors/RequestError/index.ts` |
 | 管理 API Scope 定义 | `packages/schemas/src/seeds/management-api.ts` |
 | 订阅类型定义 | `packages/core/src/utils/subscription/types.ts` |
-| LogKey 类型定义 | `packages/schemas/src/types/log/index.ts` |
 | OIDC 初始化 | `packages/core/src/oidc/init.ts` |
+| 角色路由（配额接入示例） | `packages/core/src/routes/role.ts` |
