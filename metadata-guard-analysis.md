@@ -64,239 +64,385 @@ For data extensibility, we added `customData` field to `ConnectorMetadata` type 
 | `.strip().parse()` 调用 | 未知字段被移除（与默认行为一致） |
 | 嵌套对象中的未知字段 | 遵循各自子 schema 的设置 |
 
-**重要限制**：移除 `.catchall()` 只影响 `connectorMetadataGuard` 本身，不影响通过 `.merge()` 或 `.extend()` 派生的其他 Guard 的未知字段处理策略。
+---
+
+## 2. `.catchall()` 移除在 `configurableConnectorMetadataGuard` 上的继承关系
+
+### 2.1 构造链路与 strip 行为继承
+
+`configurableConnectorMetadataGuard` 的构造链：
+
+```
+connectorMetadataGuard (z.object + .merge, strip 模式)
+  └── .pick({ target, name, logo, logoDark })
+        └── .partial()
+              → configurableConnectorMetadataGuard (strip 模式继承)
+```
+
+**关键推论**：
+
+1. `.pick()` 返回一个新的 `ZodObject`，**继承原对象的 unknownKeys 策略**（即 strip）
+2. `.partial()` 仅将所有字段设为 optional，**不改变 unknownKeys 策略**
+3. 因此 `configurableConnectorMetadataGuard` 的 strip 行为**直接继承自 `connectorMetadataGuard`**，而非自行决定
+
+**但存在一个重要的实际差异**：`configurableConnectorMetadataGuard` 只 pick 了 4 个字段，因此其"白名单"仅为 `{ target?, name?, logo?, logoDark? }`。即使 `connectorMetadataGuard` 的白名单有 14 个字段，经过 `.pick()` 后也只有 4 个字段能通过校验。
+
+### 2.2 `.catchall()` 移除对两个 Guard 的影响对比
+
+| 维度 | `connectorMetadataGuard` | `configurableConnectorMetadataGuard` |
+|-----|-------------------------|-------------------------------------|
+| 构造来源 | `z.object().merge()` | `connectorMetadataGuard.pick().partial()` |
+| 白名单字段数 | 14 | 4 |
+| strip 行为来源 | Zod 默认 | 从 `connectorMetadataGuard` 继承 |
+| 移除 `.catchall()` 的影响 | 未知字段从保留变为移除 | **无独立影响** —— `.pick()` 已经排除了除 4 字段外的所有键，无论有无 `.catchall()`，结果都只有这 4 个字段 |
+
+**核心结论**：`.catchall()` 的移除对 `configurableConnectorMetadataGuard` **没有实际影响**。`.pick()` 操作在 Zod 中是先于 catchall 执行的字段过滤，只保留声明的 4 个字段。移除 `.catchall()` 改变的是 `connectorMetadataGuard` 自身的未知字段处理策略，而 `.pick()` 后的派生 Guard 天然只包含 pick 的字段。
 
 ---
 
-## 2. 三种结果的具体触发条件
+## 3. `configurableConnectorMetadataGuard` 在 schemas 与 connectors.sql 中的实际落点
 
-### 2.1 结果一：字段被移除（Silently Stripped）
+### 3.1 代码生成链路：SQL → TypeScript → Zod Guard
 
-**触发条件**：
-1. 字段不存在于 `connectorMetadataGuard` 定义的白名单中
-2. 字段不是 `socialConnectorMetadataGuard` 定义的字段
-3. 使用默认的 `parse()` / `safeParse()` 调用（未加 `.strict()` / `.passthrough()`）
+整个链路由 `@logto/shared` 的代码生成器驱动：
 
-**白名单字段清单**：
-
-| 来源 | 字段 |
-|-----|------|
-| 基础 object | `id`, `target`, `name`, `description`, `logo`, `logoDark`, `readme`, `configTemplate`, `formItems`, `customData`, `fromEmail` |
-| social merge | `platform`, `isStandard`, `isTokenStorageSupported` |
-
-**示例**：
-
-```typescript
-const input = {
-  id: 'connector-google',
-  target: 'google',
-  name: { en: 'Google' },
-  description: { en: 'Google social connector' },
-  logo: 'logo.svg',
-  logoDark: null,
-  readme: 'README.md',
-  platform: 'Web',
-  // 未知字段 —— 会被移除
-  unknownField: 'value',
-  fromName: 'Logto Team',  // 未知字段 —— 会被移除
-  extraConfig: { foo: 1 }, // 未知字段 —— 会被移除
-};
-
-const result = connectorMetadataGuard.parse(input);
-// result 中不包含 unknownField, fromName, extraConfig
-// Object.keys(result) 仅包含白名单字段
+```
+connectors.sql
+  └── metadata jsonb /* @use ConfigurableConnectorMetadata */
+        └── @use 注解被 gen/utils.ts:210 解析为 tsType = 'ConfigurableConnectorMetadata'
+              └── gen/schema.ts:80-83 生成 Zod Guard:
+                    metadata: configurableConnectorMetadataGuard.optional()
+                          ↑ camelcase('ConfigurableConnectorMetadata') + 'Guard'
+              └── gen/index.ts:154-155 收集 tsType 并自动添加 import:
+                    import { ConfigurableConnectorMetadata, configurableConnectorMetadataGuard }
+                      from '../foundations/index.js'
 ```
 
-**发生位置**：
-- `connectorResponseGuard`（`packages/schemas/src/types/connector.ts:18`）- `.merge(connectorMetadataGuard)` 继承 strip 行为
-- `connectorFactoryResponseGuard`（`packages/schemas/src/types/connector.ts:35`）- 同上
-- `fullSignInExperienceGuard`（`packages/schemas/src/types/sign-in-experience.ts:60`）- `connectorMetadataGuard.omit({...})` 继承 strip 行为
+**生成结果**（`Connectors.createGuard` 中的 metadata 字段）：
 
-### 2.2 结果二：校验失败报错（Validation Error）
+```typescript
+// 自动生成的 Connectors.createGuard（由 pnpm build 生成）
+const createGuard: Guard<CreateConnector> = z.object({
+  id: z.string(),
+  syncProfile: z.boolean(),
+  enableTokenStorage: z.boolean(),
+  connectorId: z.string(),
+  config: jsonObjectGuard,
+  metadata: configurableConnectorMetadataGuard,  // ← 这里
+  tenantId: z.string().optional(),
+  createdAt: z.date().optional(),
+});
+```
+
+### 3.2 `connectors.sql` 中的元数据类型约束
+
+`packages/schemas/tables/connectors.sql:1-15`：
+
+```sql
+create table connectors (
+  tenant_id varchar(21) not null
+    references tenants (id) on update cascade on delete cascade,
+  id varchar(128) not null,
+  sync_profile boolean not null default FALSE,
+  enable_token_storage boolean not null default FALSE,
+  connector_id varchar(128) not null,
+  config jsonb /* @use JsonObject */ not null default '{}'::jsonb,
+  metadata jsonb /* @use ConfigurableConnectorMetadata */ not null default '{}'::jsonb,
+  created_at timestamptz not null default(now()),
+  primary key (id)
+);
+```
+
+**关键设计决策**：
+- `metadata` 列类型为 `jsonb`，PostgreSQL 层面不限制内容结构
+- `/* @use ConfigurableConnectorMetadata */` 注解是**唯一的类型约束来源**
+- 默认值为 `'{}'::jsonb`（空对象），意味着创建连接器时 metadata 可以为空
+- `config` 列使用 `/* @use JsonObject */`（无结构约束的通用 JSON 对象）
+
+### 3.3 `ConfigurableConnectorMetadata` 的 re-export 路径
+
+```
+@logto/connector-kit
+  └── configurableConnectorMetadataGuard + ConfigurableConnectorMetadata 类型
+        └── @logto/schemas/src/foundations/jsonb-types/index.ts (re-export)
+              └── @logto/schemas/src/foundations/index.ts (re-export)
+                    └── 自动生成的 db-entries 代码 import 此路径
+```
+
+`packages/schemas/src/foundations/jsonb-types/index.ts:20-25`：
+
+```typescript
+export {
+  configurableConnectorMetadataGuard,
+  type ConfigurableConnectorMetadata,
+  jsonGuard,
+  jsonObjectGuard,
+} from '@logto/connector-kit';
+```
+
+**注意**：`configurableConnectorMetadataGuard` 在整个代码库中**仅被两个位置引用**：
+1. 定义处：`packages/toolkit/connector-kit/src/types/metadata.ts:98`
+2. Re-export 处：`packages/schemas/src/foundations/jsonb-types/index.ts:21`
+
+它**不直接**出现在 API 路由代码中。API 路由使用的是自动生成的 `Connectors.createGuard`，其中 metadata 字段通过代码生成链间接引用了 `configurableConnectorMetadataGuard`。
+
+### 3.4 API 路由中的实际使用方式
+
+`packages/core/src/routes/connector/index.ts`：
+
+**创建连接器** (`POST /connectors`)：
+```typescript
+body: Connectors.createGuard
+  .pick({
+    config: true,
+    connectorId: true,
+    metadata: true,  // ← 类型为 configurableConnectorMetadataGuard
+    syncProfile: true,
+    enableTokenStorage: true,
+  })
+  .merge(Connectors.createGuard.pick({ id: true }).partial())
+```
+
+**更新连接器** (`PATCH /connectors/:id`)：
+```typescript
+body: Connectors.createGuard
+  .pick({ config: true, metadata: true, syncProfile: true, enableTokenStorage: true })
+  .partial()  // ← 所有字段可选，metadata 类型仍为 configurableConnectorMetadataGuard
+```
+
+**持久化方式**：
+```typescript
+// 创建时
+await insertConnector({
+  id: insertConnectorId,
+  connectorId,
+  ...cleanDeep({ syncProfile, config, metadata, enableTokenStorage }),
+});
+
+// 更新时
+await updateConnector({
+  set: {
+    config: conditional(config && (cleanDeep(config) as JsonObject)),
+    metadata: conditional(metadata && cleanDeep(metadata)),
+    syncProfile,
+    enableTokenStorage,
+  },
+  where: { id },
+  jsonbMode: 'replace',  // ← 整体替换，非合并
+});
+```
+
+---
+
+## 4. `customData` 语义与管理 API metadata 白名单的持久化边界
+
+### 4.1 两层元数据的架构
+
+外部身份连接器的元数据实际上分为两个独立层：
+
+| 层级 | 来源 | 存储 | Guard | 可写字段 |
+|-----|------|------|-------|---------|
+| **工厂元数据** | 连接器包代码声明 | 内存（`loadConnectorFactories` 缓存） | `connectorMetadataGuard` | 14 个白名单字段（含 `customData`） |
+| **数据库元数据** | 管理 API 写入 | `connectors.metadata` (jsonb) | `configurableConnectorMetadataGuard` | 仅 `target`, `name`, `logo`, `logoDark` |
+
+### 4.2 运行时合并策略
+
+`packages/core/src/libraries/connector.ts:96-103`：
+
+```typescript
+const connector: AllConnector = {
+  ...defaultConnectorMethods,
+  ...rawConnector,
+  metadata: {
+    ...rawMetadata,      // 工厂元数据（14 字段完整）
+    ...metadata,         // 数据库元数据（仅 4 字段，覆盖工厂值）
+  },
+};
+```
+
+**合并规则**：
+- 数据库元数据**覆盖**工厂元数据的同名字段
+- 仅 `target`, `name`, `logo`, `logoDark` 可以被覆盖
+- 工厂元数据的其他字段（`id`, `description`, `readme`, `platform`, `isStandard`, `isTokenStorageSupported`, `customData` 等）**不可通过 API 修改**
+
+### 4.3 `customData` 的持久化边界
+
+**关键问题**：`customData` 在 `connectorMetadataGuard` 白名单中（工厂层），但**不在** `configurableConnectorMetadataGuard` 白名单中（数据库层）。
+
+这意味着：
+
+| 操作 | `customData` 行为 |
+|-----|------------------|
+| 连接器包声明 `customData` | ✅ 工厂元数据中保留，运行时可见 |
+| 管理 API 写入 metadata 中的 `customData` | ❌ 被 `configurableConnectorMetadataGuard` strip 掉，**不会持久化** |
+| `PATCH /connectors/:id` body 含 `{ metadata: { customData: {...} } }` | ❌ `configurableConnectorMetadataGuard` pick 了 4 个字段，`customData` 被移除 |
+| `POST /connectors` body 含 `{ metadata: { customData: {...} } }` | ❌ 同上 |
+| 数据库中手动写入 `customData` | ⚠️ 运行时合并时会被保留（覆盖工厂的 `customData`） |
+
+**持久化边界图**：
+
+```
+连接器包 (代码)                     管理 API (运行时)
+    │                                   │
+    ▼                                   ▼
+connectorMetadataGuard          configurableConnectorMetadataGuard
+  ├─ id: string                   ├─ target?: string
+  ├─ target: string               ├─ name?: I18nPhrases
+  ├─ name: I18nPhrases            ├─ logo?: string
+  ├─ description: I18nPhrases     └─ logoDark?: string | null
+  ├─ logo: string
+  ├─ logoDark: string | null      ← 仅此 4 字段可持久化到 DB
+  ├─ readme: string
+  ├─ configTemplate?: string
+  ├─ formItems?: [...]                ╔═══════════════════════╗
+  ├─ customData?: Record              ║ customData 不可通过    ║
+  ├─ fromEmail?: string               ║ 管理 API 持久化       ║
+  ├─ platform: ConnectorPlatform      ╚═══════════════════════╝
+  ├─ isStandard?: boolean
+  └─ isTokenStorageSupported?: boolean
+         │                                   │
+         ▼                                   ▼
+    内存缓存（启动加载）              DB connectors.metadata
+         │                                   │
+         └───────── 合并 ────────────────────┘
+                       │
+                       ▼
+              运行时 connector.metadata
+              { ...rawMetadata, ...dbMetadata }
+```
+
+### 4.4 `jsonbMode: 'replace'` 的持久化语义
+
+`packages/core/src/routes/connector/index.ts:348-363`：
+
+```typescript
+await updateConnector({
+  set: {
+    config: conditional(config && (cleanDeep(config) as JsonObject)),
+    metadata: conditional(metadata && cleanDeep(metadata)),
+    syncProfile,
+    enableTokenStorage,
+  },
+  where: { id },
+  jsonbMode: 'replace',  // 整体替换
+});
+```
+
+**`replace` 模式的含义**：
+- 当 `metadata` 字段存在于 `set` 中时，**整体替换** DB 中的 `metadata` jsonb 列
+- 不是合并（merge），是覆盖（replace）
+- 如果调用 `PATCH` 时只传了 `{ metadata: { target: 'new' } }`，则 DB 中 `metadata` 变为 `{ target: 'new' }`，之前存储的 `name`/`logo`/`logoDark` 会被清除
+
+**对 customData 的影响**：
+- 即使 DB 中之前存在 `customData`（通过非 API 方式写入），`PATCH` 更新 metadata 时也会被 `replace` 清除
+- `cleanDeep(metadata)` 先移除 undefined 值，再整体写入
+- `configurableConnectorMetadataGuard` 的 strip 行为在 `koaGuard` 中间件阶段就已经生效，传入 handler 的 `metadata` 已经是 strip 后的结果
+
+### 4.5 持久化边界的实际影响
+
+**场景 1：连接器包声明 `customData`**
+
+```typescript
+// 连接器包中声明的元数据
+const metadata = {
+  id: 'connector-email',
+  target: 'email',
+  // ...
+  customData: { fromName: 'Logto', replyTo: 'support@logto.io' },
+};
+
+// 运行时读取：customData 来自工厂，始终存在
+// 管理 API 更新 metadata 时：customData 不在 configurable 白名单中，无法修改
+// DB 中不存储 customData，每次从工厂加载
+```
+
+**场景 2：尝试通过 API 写入 `customData`**
+
+```typescript
+// PATCH /connectors/:id
+{ metadata: { customData: { newKey: 'value' } } }
+
+// koaGuard 阶段：configurableConnectorMetadataGuard strip 掉 customData
+// → ctx.guard.body.metadata = {} (只剩4白名单字段，customData 被移除)
+// → cleanDeep({}) → undefined → conditional(undefined) → 不写入
+// → DB 中的 metadata 列不变
+```
+
+**场景 3：`fullSignInExperienceGuard` 中的 `customData`**
+
+```typescript
+// packages/schemas/src/types/sign-in-experience.ts:60-68
+socialConnectors: connectorMetadataGuard
+  .omit({
+    description: true,
+    configTemplate: true,
+    formItems: true,
+    readme: true,
+    customData: true,  // ← 显式 omit
+  })
+  .array(),
+```
+
+登录体验 API 中 `customData` 被**显式 omit**，即使工厂元数据中有 `customData`，也不会在登录体验响应中暴露。
+
+---
+
+## 5. 三种结果的具体触发条件
+
+### 5.1 结果一：字段被移除（Silently Stripped）
+
+**触发条件**：
+1. 字段不存在于当前 Guard 的白名单中
+2. 使用默认的 `parse()` / `safeParse()` 调用（未加 `.strict()` / `.passthrough()`）
+
+**在不同 Guard 中的白名单**：
+
+| Guard | 白名单字段 |
+|-------|-----------|
+| `connectorMetadataGuard` | `id`, `target`, `name`, `description`, `logo`, `logoDark`, `readme`, `configTemplate`, `formItems`, `customData`, `fromEmail`, `platform`, `isStandard`, `isTokenStorageSupported` |
+| `configurableConnectorMetadataGuard` | `target`, `name`, `logo`, `logoDark` |
+| `fullSignInExperienceGuard.socialConnectors` | `id`, `target`, `name`, `logo`, `logoDark`, `fromEmail`, `platform`, `isStandard`, `isTokenStorageSupported` |
+
+### 5.2 结果二：校验失败报错（Validation Error）
 
 **触发条件**：
 1. 显式调用 `.strict()` 后遇到未知字段
 2. 已知字段的值类型不匹配 schema 定义
 3. 必填字段缺失
 
-**示例 - 类型不匹配**：
-```typescript
-connectorMetadataGuard.parse({
-  id: 'test',
-  target: 'google',
-  name: { en: 'Google' },
-  description: { en: 'Desc' },
-  logo: 'logo.svg',
-  logoDark: null,
-  readme: 'README.md',
-  platform: 'InvalidPlatform', // 不是 ConnectorPlatform 枚举值 —— 报错
-});
-// ZodError: Invalid enum value
-```
+**注意**：当前代码库中没有任何位置对 `connectorMetadataGuard` 或 `configurableConnectorMetadataGuard` 调用 `.strict()`，因此未知字段永远不会触发报错，只会被静默移除。
 
-**示例 - 显式 strict 模式**：
-```typescript
-connectorMetadataGuard.strict().parse({
-  id: 'test',
-  target: 'google',
-  name: { en: 'Google' },
-  description: { en: 'Desc' },
-  logo: 'logo.svg',
-  logoDark: null,
-  readme: 'README.md',
-  platform: 'Web',
-  unknownField: 'value', // strict 模式下 —— 报错
-});
-// ZodError: Unrecognized key(s) in object: 'unknownField'
-```
-
-**发生位置**：
-- 代码中没有显式调用 `.strict()` 的位置
-- 仅在类型不匹配或必填字段缺失时自然触发报错
-
-### 2.3 结果三：进入 `customData` 的扩展字段
+### 5.3 结果三：进入 `customData` 的扩展字段
 
 **触发条件**：
-1. 字段被显式嵌套在 `customData` 对象内
-2. 或通过业务逻辑显式将字段值写入 `customData`
+1. 字段被显式嵌套在 `customData` 对象内（仅对 `connectorMetadataGuard` 有效）
+2. `configurableConnectorMetadataGuard` **不支持** `customData` —— 被 `.pick()` 排除
 
-**设计意图**（来自 CHANGELOG）：
-```
-For data extensibility, we added `customData` field to `ConnectorMetadata` type to store unknown keys. For example, the `fromEmail` field in `connector-logto-email` is not part of the standard metadata, so it should be stored in `customData` in the future.
-```
-
-**示例**：
-```typescript
-const input = {
-  id: 'connector-logto-email',
-  target: 'email',
-  name: { en: 'Logto Email' },
-  description: { en: 'Logto email connector' },
-  logo: 'logo.svg',
-  logoDark: null,
-  readme: 'README.md',
-  // 标准字段 —— 保留
-  fromEmail: 'no-reply@logto.io',
-  // 扩展字段放入 customData —— 保留
-  customData: {
-    fromName: 'Logto Team',
-    enableReplyTo: true,
-    smtpConfig: {
-      host: 'smtp.example.com',
-      port: 587,
-    },
-  },
-};
-
-const result = connectorMetadataGuard.parse(input);
-// result.customData = { fromName: 'Logto Team', enableReplyTo: true, smtpConfig: {...} }
-// 所有 customData 内的字段完整保留
-```
-
-**重要说明**：
-- `fromEmail` 目前仍在白名单中（但已标记 `@deprecated Use customData instead`）
-- 没有自动迁移逻辑 —— 连接器开发者需要手动将扩展字段放入 `customData`
-- `customData` 的 schema 是 `z.record(z.unknown()).optional()`，内部不做任何校验
+**持久化限制**：
+- `customData` 只存在于工厂元数据层（内存），不通过管理 API 持久化
+- 要修改 `customData`，必须更新连接器包的代码并重启服务
 
 ---
 
-## 3. `configurableConnectorMetadataGuard` 的特殊处理
-
-### 3.1 定义与用途
-
-`packages/toolkit/connector-kit/src/types/metadata.ts:98-105`：
-
-```typescript
-export const configurableConnectorMetadataGuard = connectorMetadataGuard
-  .pick({
-    target: true,
-    name: true,
-    logo: true,
-    logoDark: true,
-  })
-  .partial();
-```
-
-**用途**：定义存储在数据库 `connectors` 表 `metadata` 字段中的可配置字段白名单。
-
-### 3.2 行为特性
-
-| 特性 | 说明 |
-|-----|------|
-| 字段来源 | 通过 `.pick()` 从 `connectorMetadataGuard` 提取，继承其行为 |
-| 可选性 | `.partial()` 使所有字段可选 |
-| 未知字段处理 | 继承 strip 行为 —— 数据库中存储的额外字段会被移除 |
-| 允许的字段 | `target`, `name`, `logo`, `logoDark` |
-
-### 3.3 触发位置
-
-`configurableConnectorMetadataGuard` 主要在 API 路由中使用：
-- `POST /connectors` 创建连接器时验证 metadata 输入
-- `PATCH /connectors/:id` 更新连接器时验证 metadata 更新
-- 确保用户只能修改白名单内的字段
-
-### 3.4 与 `connectorMetadataGuard` 的行为差异
-
-| 场景 | `connectorMetadataGuard` | `configurableConnectorMetadataGuard` |
-|-----|-------------------------|-------------------------------------|
-| 必填字段 | `id`, `target`, `name`, `description`, `logo`, `logoDark`, `readme`, `platform` | 无（全部 optional） |
-| 可写入 metadata 字段 | 白名单字段（共14个） | 仅 `target`, `name`, `logo`, `logoDark` |
-| 移除 `.catchall()` 影响 | 所有未知字段被移除 | 所有非4白名单字段被移除 |
-
----
-
-## 4. 关键位置索引与行为汇总
-
-### 4.1 `connectorMetadataGuard` 衍生的 Schema
-
-| 派生 Schema | 文件 | 操作 | 未知字段行为 |
-|------------|------|------|-------------|
-| `connectorResponseGuard` | `packages/schemas/src/types/connector.ts:18` | `.merge(connectorMetadataGuard)` | strip（继承） |
-| `connectorFactoryResponseGuard` | `packages/schemas/src/types/connector.ts:35` | `.merge(connectorMetadataGuard)` | strip（继承） |
-| `fullSignInExperienceGuard.socialConnectors` | `packages/schemas/src/types/sign-in-experience.ts:60` | `.omit({ description, configTemplate, formItems, readme, customData })` | strip（继承，且 customData 被显式 omit） |
-| `configurableConnectorMetadataGuard` | `packages/toolkit/connector-kit/src/types/metadata.ts:98` | `.pick({ target, name, logo, logoDark }).partial()` | strip（继承） |
-
-### 4.2 行为决策树
-
-```
-输入包含未知字段
-    │
-    ├─▶ 字段在 customData 内吗？
-    │    ├─ 是 ──▶ 保留（Result 3: 进入 customData）
-    │    └─ 否 ──▶ 检查是否调用了 .strict()
-    │                      ├─ 是 ──▶ ZodError（Result 2: 校验失败报错）
-    │                      └─ 否 ──▶ 检查是否调用了 .passthrough()
-    │                                        ├─ 是 ──▶ 保留（Result 2 变种）
-    │                                        └─ 否 ──▶ 移除（Result 1: 字段被移除）
-    │
-    └─▶ 字段在白名单内吗？
-         ├─ 是 ──▶ 按类型验证 ──▶ 类型正确 ──▶ 保留
-         │                      └─ 类型错误 ──▶ ZodError（Result 2: 校验失败报错）
-         └─ 否 ──▶ 同上逻辑
-```
-
-### 4.3 版本迁移影响
-
-| 版本 | 行为 | 迁移影响 |
-|-----|------|---------|
-| < 4.0.0 | `.catchall()` 保留所有未知字段 | 连接器可以通过在顶级声明自定义字段来传递配置 |
-| >= 4.0.0 | 默认 strip 模式 | 现有依赖顶级未知字段的连接器需要将自定义字段移入 `customData`，否则这些字段会被静默丢弃 |
-
-**迁移风险**：
-- 如果连接器开发者没有注意到这个 breaking change，其自定义字段会被静默移除
-- 没有警告或报错，调试困难
-- `fromEmail` 作为过渡方案暂时保留在白名单中（已标记 deprecated）
-
----
-
-## 5. 代码位置索引
+## 6. 关键位置索引
 
 | 定义 | 文件路径 | 行号 |
 |-----|---------|------|
 | `connectorMetadataGuard` 定义 | `packages/toolkit/connector-kit/src/types/metadata.ts` | 76-95 |
 | `configurableConnectorMetadataGuard` 定义 | `packages/toolkit/connector-kit/src/types/metadata.ts` | 98-105 |
 | `.catchall()` 移除说明 | `packages/toolkit/connector-kit/CHANGELOG.md` | 191-195 |
+| `connectors.sql` metadata 类型约束 | `packages/schemas/tables/connectors.sql` | 12 |
+| `@use` 注解解析逻辑 | `packages/schemas/src/gen/utils.ts` | 210 |
+| Guard 生成模板 | `packages/schemas/src/gen/schema.ts` | 80-83, 105-109 |
+| tsType import 收集 | `packages/schemas/src/gen/index.ts` | 154-155 |
+| `configurableConnectorMetadataGuard` re-export | `packages/schemas/src/foundations/jsonb-types/index.ts` | 20-25 |
 | `connectorResponseGuard` | `packages/schemas/src/types/connector.ts` | 9-26 |
 | `connectorFactoryResponseGuard` | `packages/schemas/src/types/connector.ts` | 30-35 |
 | `fullSignInExperienceGuard` socialConnectors | `packages/schemas/src/types/sign-in-experience.ts` | 60-68 |
 | `socialConnectorMetadataGuard` | `packages/toolkit/connector-kit/src/types/metadata.ts` | 53-59 |
+| `Guard<T>` 类型定义 | `packages/schemas/src/foundations/schemas.ts` | 10-18 |
+| POST /connectors body guard | `packages/core/src/routes/connector/index.ts` | 68-82 |
+| PATCH /connectors body guard | `packages/core/src/routes/connector/index.ts` | 280-282 |
+| metadata 持久化（replace 模式） | `packages/core/src/routes/connector/index.ts` | 348-363 |
+| 运行时 metadata 合并 | `packages/core/src/libraries/connector.ts` | 96-103 |
+| `transpileLogtoConnector` 响应构造 | `packages/core/src/utils/connectors/index.ts` | 32-58 |
