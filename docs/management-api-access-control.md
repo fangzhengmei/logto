@@ -18,7 +18,7 @@ managementRouter.use(koaManagementApiHooks(...))  // 第 3 层：Hook 上下文�
 
 关键特性：
 - 这三层中间件是 **固定顺序**，业务路由无法跳过或重排
-- `koaManagementApiHooks` 在 `try/finally` 中运行，**即使请求失败也会触发 exception hooks**
+- `koaManagementApiHooks` 在 `try/finally` 中运行，**即使请求失败也会触发 exception hooks（如果有主动注册的异常上下文）**
 - `koaAuth` 和 `koaTenantGuard` 拒绝请求时抛出 `RequestError`，错误会上抛至 `koaErrorHandler`
 
 ### 1.2 按需接入的守卫（各业务路由自行决定）
@@ -77,7 +77,7 @@ POST /organizations 的中间件链：
   │   │   ├─ [按需守卫: koaGuard]
   │   │   └─ [业务逻辑]
   │   ├─ 成功: 触发 data hooks + 注册的自动 hooks
-  │   └─ finally: 触发 exception hooks
+  │   └─ finally: 触发 exception hooks（如果有主动注册的异常上下文）
   │
   └─ 错误上抛至 koaErrorHandler        ← Tenant 级 Koa app
       └─ 所有 RequestError → AppInsights + HTTP 响应
@@ -163,7 +163,7 @@ try {
     void trySafe(hooks.triggerDataHooks(consoleLog, hooksContextManager));
   }
 } finally {
-  // 无论成功失败：触发 exception hooks
+  // 无论成功失败：触发 exception hooks（仅当有主动注册的异常上下文时）
   if (hooksContextManager.exceptionHookContextArray.length > 0) {
     void trySafe(hooks.triggerExceptionHooks(consoleLog, hooksContextManager));
   }
@@ -183,7 +183,7 @@ try {
 | `DELETE /organizations/:id` | `Organization.Deleted` |
 | ... | ... |
 
-自动 Hook 仅在请求成功时触发（`await next()` 之后），失败时不触发 data hooks，但可能触发 exception hooks（如果业务代码主动调用了 `appendExceptionHookContext`）。
+自动 Hook 仅在请求成功时触发（`await next()` 之后），失败时不触发 data hooks。
 
 ### 3.4 按需守卫：配额守卫 (koaQuotaGuard + QuotaLibrary)
 
@@ -305,175 +305,273 @@ Cloud API → Subscription (含 currentPeriodEnd)
 
 ## 五、越权拒绝路径与三类观测面
 
-### 5.1 错误类型与状态码
+### 5.1 Exception Hooks 触发条件详解
 
-| 拒绝点 | 错误码 | HTTP 状态码 | 拒绝位置 |
-|--------|--------|------------|---------|
-| JWT 无效/过期 | `auth.unauthorized` | 401 | 全局: koaAuth |
-| 缺少 all scope | `auth.forbidden` | 403 | 全局: koaAuth |
-| Token 缺少 sub | `auth.jwt_sub_missing` | 401 | 全局: koaAuth |
-| 租户暂停 | `subscription.tenant_suspended` | 403 | 全局: koaTenantGuard |
-| 系统限制超限 | `system_limit.limit_exceeded` | 403 | 按需: QuotaLibrary |
-| 订阅配额超限 | `subscription.limit_exceeded` | 403 | 按需: QuotaLibrary |
-| Token 用量超限 | `auth.exceed_token_limit` | 429 | 按需: koaTokenUsageGuard |
-| 参数验证失败 | `guard.invalid_input` | 400 | 按需: koaGuard |
-| 响应状态码不符 | StatusCodeError (500) | - | 按需: koaGuard |
+**核心结论**：单纯的请求失败不会触发 exception hooks，必须由业务代码**主动调用** `ctx.appendExceptionHookContext()` 才会触发。
 
-### 5.2 三类观测面概述
+#### 两种触发场景对比
 
-| 观测面 | 触发机制 | 数据存储 | 覆盖范围 |
-|--------|---------|---------|---------|
-| **Audit Log** | `koaAuditLog` 中间件 + `ctx.createLog()` | 数据库 `logs` 表 | 仅身份认证路由 |
-| **Management Hooks** | `koaManagementApiHooks` 中间件 | 外部 Webhook URL | managementRouter + userRouter |
-| **AppInsights** | `koaErrorHandler` + 各中间件主动上报 | Azure AppInsights | 所有路由 |
+| 场景 | 是否触发 exception hooks | 说明 |
+|------|------------------------|------|
+| **请求失败但无主动调用** | ❌ 不触发 | 守卫拒绝、业务代码抛出 RequestError 等都不会触发 |
+| **业务代码主动添加异常上下文** | ✅ 触发 | 只有调用了 `ctx.appendExceptionHookContext(event, context)` 才会在 finally 块中触发 |
 
-### 5.3 各拒绝场景的观测面触发详情
+**ExceptionHookEvent 类型**（`packages/schemas/src/foundations/jsonb-types/hooks.ts:51`）：
+```typescript
+export type ExceptionHookEvent = 'Identifier.Lockout';
+```
 
-#### 场景 A：全局守卫拒绝（koaAuth 401/403、koaTenantGuard 403）
+**注意**：目前 ExceptionHookEvent 只有一个类型 `'Identifier.Lockout'`，这是一个故意的设计限制。
 
+#### 实际触发代码（唯一位置）
+
+**文件位置**: `packages/core/src/routes/experience/classes/libraries/sentinel-guard.ts:62-70`
+
+```typescript
+if (decision === SentinelDecision.Blocked) {
+  // 主动添加异常上下文
+  ctx.appendExceptionHookContext('Identifier.Lockout', {
+    ...identifier,
+  });
+  // 然后抛出错误
+  throw new RequestError({
+    code: 'session.verification_blocked_too_many_attempts',
+    // ...
+  });
+}
+```
+
+**触发位置说明**：
+- 这个调用发生在 **Experience 路由**（前端体验 API）中，不是 managementRouter
+- managementRouter 中**没有任何业务代码**调用 `appendExceptionHookContext`
+- 因此，managementRouter 的所有拒绝场景都不会触发 exception hooks
+
+#### managementRouter 中的 exception hooks 现状
+
+虽然 `koaManagementApiHooks` 中间件注入了 `ctx.appendExceptionHookContext` 方法，但：
+
+1. 没有业务代码调用这个方法
+2. 因此 `exceptionHookContextArray` 始终为空
+3. 因此 `finally` 块中的 `triggerExceptionHooks` 永远不会实际发送 Webhook
+
+这是一个设计上的预留机制，目前仅在 Experience 路由中使用（用户锁定时）。
+
+### 5.2 五类拒绝场景的观测面对比
+
+以下分析针对 managementRouter 下的请求（管理 API）。
+
+---
+
+#### 场景 1：认证拒绝（koaAuth 401/403）
+
+**触发条件**：
+- JWT 无效/过期 → `auth.unauthorized` (401)
+- 缺少 all scope → `auth.forbidden` (403)
+- Token 缺少 sub → `auth.jwt_sub_missing` (401)
+
+**执行路径**：
 ```
 请求 → koaAuth (拒绝) → 抛出 RequestError
      → koaTenantGuard (跳过，因为 koaAuth 已抛出)
-     → koaManagementApiHooks (catch 块)
-         → data hooks: 不触发 (entries 为空)
-         → exception hooks: 不触发 (无 appendExceptionHookContext 调用)
+     → koaManagementApiHooks
+         → catch 块接收错误，重新抛出
+         → data hooks: ❌ 不触发
+         → exception hooks: ❌ 不触发（无主动 appendExceptionHookContext 调用）
      → koaErrorHandler
-         → AppInsights: ✅ 追踪 (所有异常)
-         → Audit Log: ❌ 不触发 (managementRouter 未挂载 koaAuditLog)
-         → Management Hooks (data): ❌ 不触发 (next() 未执行)
-         → Management Hooks (exception): ❌ 不触发 (无主动 appendExceptionHookContext)
-```
-
-**结论**：全局守卫拒绝仅在 AppInsights 中留痕。
-
-#### 场景 B：按需守卫拒绝（koaQuotaGuard 403、koaGuard 400）
-
-```
-请求 → koaAuth (通过)
-     → koaTenantGuard (通过)
-     → koaManagementApiHooks (try 块)
-         → koaQuotaGuard (拒绝) → 抛出 RequestError
-         或
-         → koaGuard (参数验证失败) → 抛出 RequestError
-     → koaManagementApiHooks (catch 块, 重新抛出)
-         → data hooks: ❌ 不触发 (next() 未完成)
-         → exception hooks: ❌ 不触发 (无主动 appendExceptionHookContext)
-     → koaErrorHandler
-         → AppInsights: ✅ 追踪
-         → Audit Log: ❌ 不触发
+         → AppInsights: ✅ 追踪（所有异常统一上报）
+         → Audit Log: ❌ 不触发（managementRouter 未挂载 koaAuditLog）
          → Management Hooks (data): ❌ 不触发
          → Management Hooks (exception): ❌ 不触发
 ```
 
-**结论**：按需守卫拒绝同样仅在 AppInsights 中留痕。
+**观测面记录**：
 
-#### 场景 C：业务逻辑拒绝（如角色名重复 422、配额检查 403）
+| 观测面 | 记录状态 | 记录内容 |
+|--------|---------|---------|
+| **Audit Log** | ❌ 无 | managementRouter 未挂载 koaAuditLog |
+| **Management Hooks (data)** | ❌ 无 | next() 未执行完成 |
+| **Management Hooks (exception)** | ❌ 无 | 无主动 appendExceptionHookContext 调用 |
+| **AppInsights** | ✅ 有 | `void appInsights.trackException(error, ...)` |
 
+---
+
+#### 场景 2：租户拒绝（koaTenantGuard 403）
+
+**触发条件**：
+- 租户被暂停 → `subscription.tenant_suspended` (403)
+- 仅云环境生效，OSS 跳过
+
+**执行路径**：
 ```
 请求 → koaAuth (通过)
-     → koaTenantGuard (通过)
-     → koaManagementApiHooks (try 块)
-         → koaGuard (通过)
-         → 业务代码: quota.guardTenantUsageByKey() → 403
-         或 业务代码: assertThat(nameNotInUse) → 422
-         → 抛出 RequestError
-     → koaManagementApiHooks (catch 块, 重新抛出)
+     → koaTenantGuard (拒绝) → 抛出 RequestError
+     → koaManagementApiHooks
+         → catch 块接收错误，重新抛出
          → data hooks: ❌ 不触发
-         → exception hooks: ❌ 不触发 (业务代码通常不调用 appendExceptionHookContext)
+         → exception hooks: ❌ 不触发
      → koaErrorHandler
          → AppInsights: ✅ 追踪
          → Audit Log: ❌ 不触发
          → Management Hooks: ❌ 不触发
 ```
 
-**结论**：业务逻辑拒绝仅在 AppInsights 中留痕。
+**观测面记录**：
 
-#### 场景 D：业务成功
+| 观测面 | 记录状态 | 记录内容 |
+|--------|---------|---------|
+| **Audit Log** | ❌ 无 | managementRouter 未挂载 koaAuditLog |
+| **Management Hooks (data)** | ❌ 无 | next() 未执行完成 |
+| **Management Hooks (exception)** | ❌ 无 | 无主动 appendExceptionHookContext 调用 |
+| **AppInsights** | ✅ 有 | 所有异常统一上报 |
 
+---
+
+#### 场景 3：配额拒绝（QuotaLibrary 403）
+
+**触发条件**：
+- 系统限制超限 → `system_limit.limit_exceeded` (403)
+- 订阅配额超限 → `subscription.limit_exceeded` (403)
+
+**执行路径**（以业务代码内调用为例）：
 ```
 请求 → koaAuth (通过)
      → koaTenantGuard (通过)
      → koaManagementApiHooks (try 块)
          → koaGuard (通过)
-         → 业务代码: 成功
-             → 可能调用 ctx.appendDataHookContext('User.Created', {...})
-         → await next() 返回
-     → koaManagementApiHooks (成功路径)
-         → 自动追加注册的 hook (如 POST /users → User.Created)
-         → data hooks: ✅ 触发 (业务主动 + 自动注册)
-         → finally: exception hooks: 不触发 (无 exception 上下文)
-     → koaErrorHandler (不介入)
-         → AppInsights: ❌ 无异常可追踪
-         → Audit Log: ❌ 不触发
-         → Management Hooks (data): ✅ 触发
-```
-
-**结论**：业务成功时仅 Management Hooks 触发。
-
-#### 场景 E：OIDC /token 路由拒绝
-
-```
-请求 → koaAuditLog (注入 createLog)
-     → koaTokenUsageGuard (拒绝: 429)
-     → koaAuditLog (catch 块)
-         → entries: 取决于是否已调用 createLog
-         → 如果有 entries → ✅ 追加 LogResult.Error
-         → 如果无 entries → ❌ 无日志
-     → koaErrorHandler / koaOidcErrorHandler
+         → 业务代码: quota.guardTenantUsageByKey() → 403
+         → 抛出 RequestError
+     → koaManagementApiHooks (catch 块, 重新抛出)
+         → data hooks: ❌ 不触发
+         → exception hooks: ❌ 不触发（业务代码不调用 appendExceptionHookContext）
+     → koaErrorHandler
          → AppInsights: ✅ 追踪
-         → Audit Log: ⚠️ 取决于事件监听器是否已调用 createLog
+         → Audit Log: ❌ 不触发
+         → Management Hooks: ❌ 不触发
 ```
 
-**注意**：OIDC 路由中 `createLog` 主要在事件监听器中调用（如 `grant.success`、`grant.error`），而非在守卫层。如果 Token 用量守卫在事件监听器触发之前就拒绝了请求，则不会有审计日志。
+**观测面记录**：
 
-#### 场景 F：koaGuard 响应状态码断言失败
+| 观测面 | 记录状态 | 记录内容 |
+|--------|---------|---------|
+| **Audit Log** | ❌ 无 | managementRouter 未挂载 koaAuditLog |
+| **Management Hooks (data)** | ❌ 无 | next() 未执行完成 |
+| **Management Hooks (exception)** | ❌ 无 | 无主动 appendExceptionHookContext 调用 |
+| **AppInsights** | ✅ 有 | 所有异常统一上报 |
 
-**文件位置**: `packages/core/src/middleware/koa-guard.ts:191-209`
+---
 
-```typescript
-const assertStatusCode = (value: number) => {
-  if (Array.isArray(status) ? status.includes(value) : status === value) return;
-  if (EnvSet.values.isProduction) {
-    consoleLog.warn('Unexpected status code:', value, 'expected:', status);
-    void appInsights.trackException(new StatusCodeError(status, value), ...);
-    return;  // 生产环境仅告警，不抛出
-  }
-  throw new StatusCodeError(status, value);  // 非生产环境抛出
-};
+#### 场景 4：参数校验失败（koaGuard 400）
+
+**触发条件**：
+- 请求参数 Zod 验证失败 → `guard.invalid_input` (400)
+
+**执行路径**：
+```
+请求 → koaAuth (通过)
+     → koaTenantGuard (通过)
+     → koaManagementApiHooks (try 块)
+         → koaGuard (参数验证失败) → 抛出 RequestError
+     → koaManagementApiHooks (catch 块, 重新抛出)
+         → data hooks: ❌ 不触发
+         → exception hooks: ❌ 不触发
+     → koaErrorHandler
+         → AppInsights: ✅ 追踪
+         → Audit Log: ❌ 不触发
+         → Management Hooks: ❌ 不触发
 ```
 
-**结论**：koaGuard 的状态码断言失败在生产环境仅上报 AppInsights，不影响请求。
+**观测面记录**：
 
-### 5.4 观测面触发矩阵
+| 观测面 | 记录状态 | 记录内容 |
+|--------|---------|---------|
+| **Audit Log** | ❌ 无 | managementRouter 未挂载 koaAuditLog |
+| **Management Hooks (data)** | ❌ 无 | next() 未执行完成 |
+| **Management Hooks (exception)** | ❌ 无 | 无主动 appendExceptionHookContext 调用 |
+| **AppInsights** | ✅ 有 | 所有异常统一上报 |
+
+---
+
+#### 场景 5：业务异常（如 422 角色名重复等）
+
+**触发条件**：
+- 业务逻辑断言失败 → 如 `role.name_in_use` (422)
+- 资源不存在 → 404
+
+**执行路径**：
+```
+请求 → koaAuth (通过)
+     → koaTenantGuard (通过)
+     → koaManagementApiHooks (try 块)
+         → koaGuard (通过)
+         → 业务代码: assertThat(nameNotInUse) → 422
+         → 抛出 RequestError
+     → koaManagementApiHooks (catch 块, 重新抛出)
+         → data hooks: ❌ 不触发
+         → exception hooks: ❌ 不触发
+     → koaErrorHandler
+         → AppInsights: ✅ 追踪
+         → Audit Log: ❌ 不触发
+         → Management Hooks: ❌ 不触发
+```
+
+**观测面记录**：
+
+| 观测面 | 记录状态 | 记录内容 |
+|--------|---------|---------|
+| **Audit Log** | ❌ 无 | managementRouter 未挂载 koaAuditLog |
+| **Management Hooks (data)** | ❌ 无 | next() 未执行完成 |
+| **Management Hooks (exception)** | ❌ 无 | 无主动 appendExceptionHookContext 调用 |
+| **AppInsights** | ✅ 有 | 所有异常统一上报 |
+
+---
+
+### 5.3 五类场景观测面总览
 
 | 拒绝场景 | Audit Log | Management Hooks (data) | Management Hooks (exception) | AppInsights |
 |---------|-----------|------------------------|-----------------------------|-------------|
-| koaAuth 401/403 | ❌ | ❌ | ❌ | ✅ |
-| koaTenantGuard 403 | ❌ | ❌ | ❌ | ✅ |
-| koaQuotaGuard 403 | ❌ | ❌ | ❌ | ✅ |
-| koaGuard 400 | ❌ | ❌ | ❌ | ✅ |
-| QuotaLibrary 业务内 403 | ❌ | ❌ | ❌ | ✅ |
-| 业务逻辑 422 | ❌ | ❌ | ❌ | ✅ |
-| Token 用量 429 | ⚠️ 取决于 | N/A | N/A | ✅ |
-| koaGuard 状态码断言 | ❌ | ❌ | ❌ | ✅(生产) / 抛出(非生产) |
-| 业务成功 | ❌ | ✅ | ❌ | ❌ |
-| OIDC Token 交换成功 | ✅ | N/A | N/A | ❌ |
+| 认证拒绝（401/403） | ❌ 无 | ❌ 无 | ❌ 无 | ✅ 有 |
+| 租户拒绝（403） | ❌ 无 | ❌ 无 | ❌ 无 | ✅ 有 |
+| 配额拒绝（403） | ❌ 无 | ❌ 无 | ❌ 无 | ✅ 有 |
+| 参数校验失败（400） | ❌ 无 | ❌ 无 | ❌ 无 | ✅ 有 |
+| 业务异常（422/404） | ❌ 无 | ❌ 无 | ❌ 无 | ✅ 有 |
+| **业务成功** | ❌ 无 | ✅ 有（主动+自动注册） | ❌ 无 | ❌ 无 |
 
-### 5.5 Audit Log 与 Management Hooks 的设计边界
+### 5.4 特殊场景：Experience 路由的 Identifier.Lockout
 
-**Audit Log** (`koaAuditLog`)：
-- 覆盖：OIDC / Experience / Interaction / SAML / Authn 路由
-- 内容：身份认证事件（登录、Token 交换、MFA 等）
-- 存储：数据库 `logs` 表
-- 触发方式：业务代码主动 `ctx.createLog(key)`
+**注意**：以下是 Experience 路由（非 managementRouter）中的情况，用于对比说明 exception hooks 的实际工作方式。
 
-**Management Hooks** (`koaManagementApiHooks`)：
-- 覆盖：managementRouter + userRouter
-- 内容：数据变更事件（用户创建、角色删除等）+ 异常事件
-- 存储：外部 Webhook URL
-- 触发方式：业务代码主动 `ctx.appendDataHookContext()` + 自动注册表
+**触发条件**：用户多次验证失败被 Sentinel 锁定
 
-**两者互不重叠**：审计日志和 Management Hooks 服务于不同的观测需求，覆盖不同的路由集合。
+**执行路径**：
+```
+请求 → koaAuditLog (注入 createLog)
+     → koaExperienceInteractionHooks
+         → try { await next() }
+             → 业务代码: withSentinel() 检测到用户锁定
+             → ✅ ctx.appendExceptionHookContext('Identifier.Lockout', { ...identifier })
+             → 抛出 RequestError
+         → catch 块重新抛出
+         → finally:
+             → ✅ exception hooks: 触发（因为有主动注册的异常上下文）
+             → data hooks: ❌ 不触发
+     → koaErrorHandler
+         → AppInsights: ✅ 追踪
+         → Audit Log: ⚠️ 取决于是否已调用 createLog
+```
+
+### 5.5 三类观测面的设计边界与定位
+
+| 观测面 | 定位 | 覆盖范围 | 触发方式 | 数据存储 |
+|--------|------|---------|---------|---------|
+| **Audit Log** | 身份安全审计 | 认证相关路由（OIDC/Experience/Interaction） | `koaAuditLog` 中间件 + 业务代码 `ctx.createLog()` | 数据库 `logs` 表 |
+| **Management Hooks** | 数据变更通知 | managementRouter + userRouter | 主动 `ctx.appendDataHookContext()` + 自动注册 | 外部 Webhook URL |
+| **AppInsights** | 全局异常监控 | 所有路由 | `koaErrorHandler` 统一上报 + 中间件主动上报 | Azure AppInsights |
+
+**关键设计决策**：
+- 管理 API 的拒绝事件不在审计日志中记录（因为未挂载 koaAuditLog）
+- 管理 API 的数据变更成功时会触发 Management Hooks（data hooks）
+- 所有异常（包括所有拒绝场景）都会在 AppInsights 中留痕
+- exception hooks 目前仅在 Experience 路由中使用（用户锁定场景），managementRouter 中预留但未实际使用
 
 ### 5.6 AppInsights 的统一覆盖
 
@@ -491,7 +589,7 @@ try {
 ```
 
 此外，以下位置也会主动上报 AppInsights：
-- `koa-guard.ts`: 响应状态码断言失败（生产环境）
+- `koa-guard.ts`: 响应状态码断言失败（生产环境仅告警，不抛出）
 - `koa-token-usage-guard.ts`: 非预期的意外错误（不阻断请求时）
 - `koa-oidc-error-handler.ts`: OIDC 错误
 - OIDC 事件监听器 `server_error`
@@ -506,7 +604,34 @@ try {
 - ✅ 简化权限模型
 - ⚠️ 粒度较粗，细粒度控制由 Cloud 侧角色分配和配额限制实现
 
-### 6.2 配额守卫两种接入方式的权衡
+### 6.2 Exception Hooks 触发机制决策
+
+**决策**: exception hooks 仅在业务代码主动调用 `appendExceptionHookContext` 时触发
+
+**理由**:
+- 避免所有错误都触发 Webhook 导致噪声过大
+- 目前仅 `Identifier.Lockout` 一个事件类型，按需触发
+- managementRouter 中预留接口但暂不使用，未来可扩展
+
+### 6.3 管理 API 拒绝事件不留审计日志决策
+
+**决策**: managementRouter 不挂载 `koaAuditLog`
+
+**权衡**:
+- ✅ 减少数据库写入压力
+- ✅ 审计日志聚焦于身份认证事件
+- ⚠️ 管理操作拒绝无法通过审计日志追溯，需依赖 AppInsights
+
+### 6.4 AppInsights 作为统一观测面决策
+
+**决策**: 所有异常通过 `koaErrorHandler` 统一上报 AppInsights
+
+**理由**:
+- 保证异常可观测性的底线
+- 与审计日志、Webhook 形成互补
+- 生产环境可快速排查问题
+
+### 6.5 配额守卫两种接入方式的权衡
 
 **middleware 级别**（如 `koaQuotaGuard`）：
 - 在 `koaGuard` 之前执行，更早拒绝
@@ -518,35 +643,11 @@ try {
 - 可传 `consumeUsageCount` 和 `entityId`
 - 位置不固定，需要阅读业务代码才能了解配额检查逻辑
 
-### 6.3 Management Hooks 仅触发成功路径
-
-**决策**: data hooks 仅在 `await next()` 成功完成后触发
-
-**理由**:
-- 避免部分失败的请求触发不完整的 Webhook
-- 注册的自动 Hook 也仅在成功后追加
-- Exception hooks 通过 `finally` 块保证触发，但需要业务代码主动调用 `appendExceptionHookContext`
-
-### 6.4 审计日志与 Management Hooks 互不覆盖
-
-**决策**: Audit Log 覆盖认证流程，Management Hooks 覆盖管理操作
-
-**权衡**:
-- ✅ 职责清晰，避免重复记录
-- ⚠️ 管理操作（如删除用户）无审计日志记录
-- ⚠️ 认证流程（如 Token 交换）无 Management Hooks 触发
-
-### 6.5 订阅缓存 TTL 决策
+### 6.6 订阅缓存 TTL 决策
 
 **决策**: 基于 `currentPeriodEnd` 动态计算，上限 24 小时
 
 **理由**: 周期结束时缓存自然失效，无需失效推送。权衡：Cloud 侧变更最长需 24 小时生效。
-
-### 6.6 Token 用量守卫容错决策
-
-**决策**: 意外错误不阻断请求，仅上报 AppInsights
-
-**理由**: Token 发放是核心功能，不应因配额检查意外故障中断。仅明确的 429 阻断。
 
 ## 七、代码路径索引
 
@@ -556,12 +657,13 @@ try {
 | 租户实例创建 | `packages/core/src/tenants/Tenant.ts` |
 | 路由初始化（中间件挂载） | `packages/core/src/routes/init.ts` |
 | 认证守卫 | `packages/core/src/middleware/koa-auth/index.ts` |
-| OIDC 认证守卫 | `packages/core/src/middleware/koa-auth/koa-oidc-auth.ts` |
 | 租户守卫 | `packages/core/src/middleware/koa-tenant-guard.ts` |
 | Management API Hooks 中间件 | `packages/core/src/middleware/koa-management-api-hooks.ts` |
 | Hook 上下文管理器 | `packages/core/src/libraries/hook/context-manager.ts` |
 | Hook 核心逻辑（触发 Webhook） | `packages/core/src/libraries/hook/index.ts` |
 | 管理 API Hook 注册表 | `packages/schemas/src/foundations/jsonb-types/hooks.ts` |
+| Sentinel Guard（Identifier.Lockout 触发） | `packages/core/src/routes/experience/classes/libraries/sentinel-guard.ts` |
+| Experience Interaction Hooks | `packages/core/src/routes/experience/middleware/koa-experience-interaction-hooks.ts` |
 | 配额守卫中间件 | `packages/core/src/middleware/koa-quota-guard.ts` |
 | 配额判定核心 | `packages/core/src/libraries/quota.ts` |
 | Token 用量守卫 | `packages/core/src/middleware/koa-token-usage-guard.ts` |
@@ -569,13 +671,9 @@ try {
 | 输入输出守卫 | `packages/core/src/middleware/koa-guard.ts` |
 | 全局错误处理 | `packages/core/src/middleware/koa-error-handler.ts` |
 | 审计日志中间件 | `packages/core/src/middleware/koa-audit-log.ts` |
-| OIDC 事件监听器 | `packages/core/src/event-listeners/index.ts` |
-| Grant 审计日志 | `packages/core/src/event-listeners/grant.ts` |
 | 基础缓存 | `packages/core/src/caches/base-cache.ts` |
 | 订阅缓存 | `packages/core/src/caches/tenant-subscription.ts` |
 | SchemaRouter | `packages/core/src/utils/SchemaRouter.ts` |
 | 错误处理 | `packages/core/src/errors/RequestError/index.ts` |
 | 管理 API Scope 定义 | `packages/schemas/src/seeds/management-api.ts` |
-| 订阅类型定义 | `packages/core/src/utils/subscription/types.ts` |
-| OIDC 初始化 | `packages/core/src/oidc/init.ts` |
 | 角色路由（配额接入示例） | `packages/core/src/routes/role.ts` |
