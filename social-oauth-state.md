@@ -340,67 +340,136 @@ export const signInAndLinkWithSocial = async (
 
 **验证记录依赖**：
 
-- **1 条** `SocialVerification` 记录（通过独立的 account verification API 创建，不依赖 Experience interaction）；
+- **1 条** `SocialVerification` 记录（通过独立的 verification API 创建并持久化到 `verification_records` 表，不依赖 Experience interaction）；
 - 可选：**安全验证记录**（如密码或邮箱二次验证），取决于账号安全策略（`assertIdentityVerifiedIfRequired`）。
 
-**核心流程**：
+---
 
-**前端**：[SocialCallback](file:///d:/fz/0601-2/solo-dogfeeding/code/22-logto/packages/account/src/pages/SocialCallback/index.tsx)
+#### 3.3.1 验证记录生命周期三阶段
+
+My Account 场景下的 `SocialVerification` 有清晰的三阶段生命周期，每个阶段对数据库的操作不同：
 
 ```
-用户在账号中心点击"添加社交账号"
-    │
-    ▼
-1. createSocialVerification(accessToken, { connectorId, state, redirectUri })
-   → POST /api/verifications/social
-   → 返回 { verificationRecordId, authorizationUri }
-    │
-    ▼
-2. 跳转到第三方授权（state 存入 accountStorage.socialFlow）
-    │
-    ▼
-3. 回调 /social/callback/:connectorId?state=xxx&code=xxx
-    │
-    ├─ 校验 state（与 accountStorage 中存储的值比对）
-    │
-    ├─ verifySocialVerification(accessToken, { verificationRecordId, connectorData })
-    │   → POST /api/verifications/social/verify
-    │
-    └─ linkSocialIdentity(accessToken, verificationId, socialVerificationRecordId)
-        → POST /api/my-account/identities
-        { newIdentifierVerificationRecordId: socialVerificationRecordId }
+  ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+  │  创建阶段   │────▶│  校验阶段   │────▶│  绑定阶段   │
+  │  insert DB  │     │  read+update│     │  read only  │
+  └─────────────┘     └─────────────┘     └─────────────┘
 ```
 
-**后端**：
+##### 阶段一：创建（插入数据库）
 
-验证记录创建：account API 通过 `buildVerificationRecordByIdAndType` 创建 `SocialVerification`，session 存在 `verificationRecord.connectorSession` 自身内（profile/verification 模式，不依赖 OIDC interaction）。
+**入口 API**：`POST /api/verifications/social` —— [verification/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/22-logto/packages/core/src/routes/verification/index.ts#L188-L225)
 
-身份绑定核心：[identities.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/22-logto/packages/core/src/routes/account/identities.ts#L46-L105) `linkSocialIdentityCore()`
+```typescript
+router.post(`${verificationApiPrefix}/social`, ..., async (ctx, next) => {
+  const { connectorId, ...rest } = ctx.guard.body;
+
+  // 1. 内存中创建 SocialVerification 实例
+  const socialVerification = SocialVerification.create(libraries, queries, connectorId);
+
+  // 2. 生成授权 URL（session 写入 verificationRecord.connectorSession）
+  const authorizationUri = await socialVerification.createAuthorizationUrl(
+    ctx, tenantContext, rest, 'verificationRecord'  // 存储模式：verificationRecord
+  );
+
+  // 3. 插入 verification_records 表
+  const { expiresAt } = await insertVerificationRecord(socialVerification, queries);
+
+  ctx.body = { verificationRecordId, authorizationUri, expiresAt };
+  ctx.status = 201;
+});
+```
+
+数据库插入实现：[verification.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/22-logto/packages/core/src/libraries/verification.ts#L71-L85)
+
+```typescript
+export const insertVerificationRecord = async (verificationRecord, queries, userId?) => {
+  const { id, ...rest } = verificationRecord.toJson();
+  return queries.verificationRecords.insert({
+    id,
+    userId,        // My Account social 场景不填 userId（新标识符验证）
+    data: rest,    // 包含 connectorId、type、connectorSession 等
+    expiresAt: new Date(Date.now() + expirationTime).valueOf(),
+  });
+};
+```
+
+> **注意**：此阶段是整个生命周期中**唯一一次写入（insert）**操作。`connectorSession` 随记录一起落库，供后续阶段消费。
+
+##### 阶段二：校验（按 id 读取 + 更新）
+
+**入口 API**：`POST /api/verifications/social/verify` —— [verification/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/22-logto/packages/core/src/routes/verification/index.ts#L227-L262)
+
+```typescript
+router.post(`${verificationApiPrefix}/social/verify`, ..., async (ctx, next) => {
+  const { connectorData, verificationRecordId } = ctx.guard.body;
+
+  // 1. 按 id 从 verification_records 表中读出并重建 SocialVerification 实例
+  const socialVerification = await buildVerificationRecordByIdAndType({
+    type: VerificationType.Social,
+    id: verificationRecordId,
+    queries,
+    libraries,
+  });
+
+  // 2. 执行身份校验（连接器 getUserInfo → 填充 socialUserInfo / encryptedTokenSet）
+  await socialVerification.verify(ctx, tenantContext, connectorData, 'verificationRecord');
+
+  // 3. 更新回数据库（isVerified = true，socialUserInfo 等已写入 data 字段）
+  await updateVerificationRecord(socialVerification, queries);
+
+  ctx.body = { verificationRecordId };
+});
+```
+
+读取实现：[verification.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/22-logto/packages/core/src/libraries/verification.ts#L17-L43)
+
+```typescript
+const getVerificationRecordById = async ({ id, queries, libraries, userId }) => {
+  const record = await queries.verificationRecords.findActiveVerificationRecordById(id);
+  assertThat(record, 'verification_record.not_found');
+  if (userId) {
+    assertThat(record.userId === userId, 'verification_record.not_found');
+  }
+  const result = verificationRecordDataGuard.safeParse({ ...record.data, id: record.id });
+  assertThat(result.success, 'verification_record.not_found');
+  return buildVerificationRecord(libraries, queries, result.data);
+};
+```
+
+> **注意**：此阶段先**按 id 读取**验证记录，完成 verify 后再**更新**（update）回数据库。`findActiveVerificationRecordById` 会检查 `expiresAt`，过期记录直接报 not found。
+
+##### 阶段三：绑定（按 id 读取，只读）
+
+**入口 API**：`POST /api/my-account/identities` / `PUT /api/my-account/identities` —— [identities.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/22-logto/packages/core/src/routes/account/identities.ts#L46-L105)
+
+绑定阶段只做**只读读取**，不修改验证记录本身：
 
 ```typescript
 const linkSocialIdentityCore = async ({
   user,
   newIdentifierVerificationRecordId,
   allowReplace,
-  appendDataHookContext,
-  getAppInsightsContext,
+  ...
 }) => {
-  // 1. 从 verification records 表中取出社交验证记录
+  // 1. 按 id 从 verification_records 表中读出验证记录（只读）
   const newVerificationRecord = await buildVerificationRecordByIdAndType({
     type: VerificationType.Social,
     id: newIdentifierVerificationRecordId,
     queries,
     libraries,
   });
+
+  // 2. 强校验：必须已通过 verify 阶段
   assertThat(newVerificationRecord.isVerified, 'verification_record.not_found');
 
-  // 2. 取出社交身份信息
+  // 3. 取出社交身份信息（来自阶段二写入的 socialUserInfo）
   const { socialIdentity: { target, userInfo } } = await newVerificationRecord.toUserProfile();
 
-  // 3. identity 冲突校验
+  // 4. identity 冲突校验
   await checkIdentifierCollision({ identity: { target, id: userInfo.id } }, user.id);
 
-  // 4. 写入 identities
+  // 5. 写入目标用户的 identities 字段（操作 users 表，非 verification_records 表）
   const currentUser = await findUserById(user.id);
   const existingIdentity = currentUser.identities[target];
   if (!allowReplace) {
@@ -413,13 +482,63 @@ const linkSocialIdentityCore = async ({
     },
   });
 
-  // 5. 可选：upsert token set secret
+  // 6. 可选：upsert token set secret
   const tokenSetSecret = await newVerificationRecord.getTokenSetSecret();
   if (tokenSetSecret) {
     await trySafe(async () => upsertSocialTokenSetSecret(user.id, tokenSetSecret));
   }
 };
 ```
+
+> **关键理解**：
+> - 绑定阶段**仅读取**验证记录（`findActiveVerificationRecordById`），不会调用 `updateVerificationRecord`；
+> - 验证记录在整个生命周期中只经历 **一次 insert（创建） + 一次 update（校验）**，之后一直处于只读状态；
+> - 绑定操作的写入发生在 `users.identities` 字段和 `user_social_connectors` 表（token storage），与 `verification_records` 表无关。
+
+---
+
+#### 3.3.2 前端调用流程
+
+**前端**：[SocialCallback](file:///d:/fz/0601-2/solo-dogfeeding/code/22-logto/packages/account/src/pages/SocialCallback/index.tsx)
+
+```
+用户在账号中心点击"添加社交账号"
+    │
+    ▼
+  阶段一：创建验证记录
+    │
+    ├─ createSocialVerification(accessToken, { connectorId, state, redirectUri })
+    │   → POST /api/verifications/social
+    │   → 返回 { verificationRecordId, authorizationUri, expiresAt }
+    │
+    ├─ state 存入 accountStorage.socialFlow（含 verificationRecordId）
+    │
+    ▼
+  跳转到第三方授权
+    │
+    ▼
+  阶段二：校验验证记录
+    │
+    ├─ 回调 /social/callback/:connectorId?state=xxx&code=xxx
+    │
+    ├─ 前端校验 state（与 accountStorage 中存储的值比对）
+    │
+    └─ verifySocialVerification(accessToken, { verificationRecordId, connectorData })
+        → POST /api/verifications/social/verify
+        → 验证通过，isVerified = true
+    │
+    ▼
+  阶段三：绑定到用户
+    │
+    └─ linkSocialIdentity(accessToken, verificationId, socialVerificationRecordId)
+        → POST /api/my-account/identities
+        → body: { newIdentifierVerificationRecordId: socialVerificationRecordId }
+        → 从 verification_records 读出 → 写入 users.identities
+```
+
+---
+
+#### 3.3.3 安全验证与操作接口
 
 **安全验证要求**：根据账号安全策略，可能需要用户先完成身份验证（密码或邮箱验证码），通过 `assertIdentityVerifiedIfRequired()` 检查请求头 `verification_id` 传入的验证记录。
 
@@ -428,6 +547,16 @@ const linkSocialIdentityCore = async ({
 - `POST /api/my-account/identities` — 新增绑定（`allowReplace: false`）
 - `PUT /api/my-account/identities` — 替换绑定（`allowReplace: true`）
 - `DELETE /api/my-account/identities/:target` — 解绑
+
+---
+
+#### 3.3.4 三阶段操作总表
+
+| 阶段 | API | 数据库操作 | 关键函数 | 记录状态变化 |
+|---|---|---|---|---|
+| **创建** | `POST /verifications/social` | `INSERT` | `insertVerificationRecord()` | 新建 → 未校验（带 connectorSession） |
+| **校验** | `POST /verifications/social/verify` | `SELECT` + `UPDATE` | `buildVerificationRecordByIdAndType()` → `verify()` → `updateVerificationRecord()` | 未校验 → 已校验（填充 socialUserInfo） |
+| **绑定** | `POST/PUT /my-account/identities` | `SELECT`（只读） | `buildVerificationRecordByIdAndType()` → 断言 `isVerified` → 写入 users.identities | 保持已校验（只读消费） |
 
 ---
 
