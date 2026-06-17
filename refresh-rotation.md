@@ -906,6 +906,66 @@ WHERE id IN (
 - **先 revoke（更大操作）后 destroy**，串行执行，虽然慢但保证 revoke 覆盖 destroy；
 - 或用 advisory lock 在 grantId 维度做互斥，确保同一时间只有一个吊销在跑。
 
+### 14.6 Promise.all 单边失败时 `throw InvalidGrant` 是否会执行
+
+**JavaScript 规范：`await Promise.all([p1, p2])` 在任一 Promise reject 时会立即 reject，后续的同步代码不会执行。**
+
+原代码 [refresh-token.ts L161-L164](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/oidc/grants/refresh-token.ts#L161-L164)：
+
+```typescript
+if (refreshToken.consumed) {
+  await Promise.all([refreshToken.destroy(), revoke(ctx, refreshToken.grantId)]);
+  throw new InvalidGrant('refresh token already used');   // ⚠️ Promise.all 抛错时，这一行永远不会执行
+}
+```
+
+**执行路径分两种：**
+
+| 场景 | `await Promise.all(...)` 结果 | `throw new InvalidGrant` 是否执行 |
+|------|------------------------------|----------------------------------|
+| destroy 和 revoke **均 resolve** | resolve undefined → 继续下一行 | ✅ **执行**，抛 InvalidGrant |
+| 任一操作 **reject** | **立即 reject**，await 向外抛出错误 | ❌ **不会执行**，这行 unreachable |
+
+也就是说：
+- **数据库操作都成功** → 客户端收到标准的 OAuth `invalid_grant` 错误（由下面这行 throw 触发）
+- **任一数据库操作失败** → 客户端收到**数据库异常的原始错误**（Postgres 连接错误、SQL 错误等），完全走另一条错误路径，不是 OAuth 标准错误
+
+### 14.7 客户端最终收到的 HTTP 错误码：两条不同错误路径
+
+错误处理的关键中间件是 [koa-oidc-error-handler.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/middleware/koa-oidc-error-handler.ts)，由 [Tenant.ts L128](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/tenants/Tenant.ts#L128) 注册在 oidc 路由外层。
+
+#### 路径 A：数据库都成功 → `throw new InvalidGrant`（标准 OAuth 400）
+
+1. `InvalidGrant` 是 `errors.OIDCProviderError` 的子类（从 `oidc-provider/lib/helpers/errors.js` 导出）
+2. 被 [koa-oidc-error-handler.ts L94](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/middleware/koa-oidc-error-handler.ts#L94) 的 `instanceof errors.OIDCProviderError` 捕获
+3. [L100](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/middleware/koa-oidc-error-handler.ts#L100)：`ctx.status = error.statusCode || 500` → `InvalidGrant` 的 `statusCode` 固定为 **400**
+4. [L101](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/middleware/koa-oidc-error-handler.ts#L101)：`ctx.body = errorOut(error)` → `InvalidGrant` 的 `expose: true`，所以输出：
+   ```json
+   {
+     "error": "invalid_grant",
+     "error_description": "refresh token already used",
+     "error_uri": "https://openid.sh/debug/invalid_grant",
+     "code": "oidc.invalid_grant",
+     "message": "<国际化翻译>"
+   }
+   ```
+
+#### 路径 B：数据库失败 → 原始 DB 错误 → 通用 500
+
+1. `pool.query()` 抛错是 Postgres 驱动（pg）的原生 Error，**不是** `OIDCProviderError` 实例
+2. 被 [koa-oidc-error-handler.ts L94](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/middleware/koa-oidc-error-handler.ts#L94) 的 `instanceof` 检查**拒绝**
+3. L95：`throw error` → 错误继续向外冒泡，被 Koa 的默认错误处理或外层全局错误中间件捕获
+4. 最终响应：**HTTP 500**，响应体取决于全局错误处理（通常是 `{ "code": "internal_server_error", "message": "..." }` 之类的通用格式，**不是 OAuth 标准 `invalid_grant`**）
+
+#### 两种路径对比
+
+| 路径 | 触发条件 | HTTP 状态码 | 响应 error 字段 | 是否符合 OAuth 2.0 |
+|------|---------|------------|----------------|------------------|
+| A（都成功） | destroy 和 revoke 均无异常 | **400** | `invalid_grant` | ✅ 是 |
+| B（DB 失败） | 任一 SQL 抛错 | **500** | `internal_server_error` / 其他通用码 | ❌ 否 |
+
+**隐患**：在生产环境 DB 压力高时，路径 B 可能导致客户端 SDK 无法识别错误（SDK 只处理 OAuth 的 4xx invalid_grant），从而触发无限重试而非让用户重新登录。
+
 ---
 
 ## 十五、代码路径追踪 5：3 秒宽容窗口与分布式多实例时钟漂移的行为边界
