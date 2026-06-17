@@ -159,57 +159,240 @@ if (nonce) {
 
 ---
 
-## 三、账号关联阶段
+## 三、账号关联阶段（三种绑定方式
 
 state 本身不直接参与账号关联写入，但它是确保 `SocialVerification` 记录可信的前置门槛。只有通过 state + nonce 双重校验、`isVerified = true` 的记录，才能用于后续的身份查找与绑定。
 
-### 3.1 路径一：直接登录（identity 已存在）
+Logto 中社交身份与用户账号的绑定存在**三种典型方式**，各自的触发条件、验证记录依赖和实现路径各不相同。
 
-[social-verification.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/22-logto/packages/core/src/routes/experience/classes/verifications/social-verification.ts#L180-L203) `identifyUser()`：
+### 3.1 方式一：默认绑定（新用户注册时自动绑定）
+
+**触发条件：
+- 社交身份（target + id）在系统中不存在；
+- 社交返回的邮箱/手机号也不匹配任何现有用户；
+- 注册模式开启（SignInMode.SignInAndRegister）。
+
+**验证记录依赖**：
+- **仅需 1 条** `SocialVerification` 记录（`isVerified = true`）。
+
+**核心流程**：
+
+前端入口：[use-social-register.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/22-logto/packages/experience/src/hooks/use-social-register.ts) → `registerWithVerifiedIdentifier(verificationId)`
+
+后端调用链：
 
 ```
-findUserBySocialIdentity()
-  = queries.users.findUserByIdentity(target, socialUserInfo.id)
-        │
-        ├─ 找到用户 → 返回 User → identifyAndSubmitInteraction 完成登录
-        └─ 未找到 → 尝试 findSocialRelatedUser() 走路径二
+POST /experience/register
+    │
+    ├─ experienceInteraction.createUser(socialVerificationId)
+    │     │
+    │     ├─ getNewUserProfileFromVerificationRecord()   // helpers.ts
+    │     │    └─ verificationRecord.toUserProfile()
+    │     │       → { socialIdentity: { target, userInfo } }
+    │     │    └─ verificationRecord.toSyncedProfile(true)
+    │     │       → { name, avatar, primaryEmail, primaryPhone
+    │     │    └─ socialConnectorTokenSetSecret
+    │     │
+    │     ├─ profile.setProfileWithValidation()           // 唯一校验
+    │     ├─ profile.assertUserMandatoryProfileFulfilled() // 必填字段校验
+    │     └─ provisionLibrary.createUser(profile)
+    │          └─ insertUser({ ..., identities: toUserSocialIdentityData(socialIdentity) })
+    │              // identities[target] = { userId: userInfo.id, details: userInfo }
+    │
+    └─ 返回 redirectTo → 完成注册并登录
 ```
 
-### 3.2 路径二：基于邮箱/手机的 Linking Flow
+**关键实现细节**：
 
-当社交 identity 不存在，但返回的 email/phone 已在系统中绑到其他账号时：
+1. `createUser() 方法在 [experience-interaction.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/22-logto/packages/core/src/routes/experience/classes/experience-interaction.ts#L273-L315) 中定义，仅在 `InteractionEvent.Register` 事件下可用。
+2. 新用户创建时 social identity 与 profile 数据一起通过 `insertUser` 写入 `identities` 字段，见 [provision-library.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/22-logto/packages/core/src/routes/experience/classes/libraries/provision-library.ts#L58-L136)。
+3. 如果连接器启用了 token storage，`socialConnectorTokenSetSecret 也会在创建用户后一起 upsert 到 secrets 表。
 
-1. `identifyUser()` 抛 `user.identity_not_exist`，payload 带 `relatedUser: { type, value }`；
-2. 前端跳转 [SocialLinkAccount](file:///d:/fz/0601-2/solo-dogfeeding/code/22-logto/packages/experience/src/pages/SocialLinkAccount/index.tsx) 页面，要求用户用该邮箱/手机做二次验证；
-3. 用户完成邮箱/手机验证，产生 `identifierVerificationId`；
-4. 调 [signInAndLinkWithSocial()](file:///d:/fz/0601-2/solo-dogfeeding/code/22-logto/packages/experience/src/apis/experience/social.ts#L86-L94)：
+### 3.2 方式二：二次验证绑定（Linking Flow）
+
+**触发条件**：
+- 社交身份（target + id）在系统中不存在；
+- 但社交返回的 email / phone **已绑定到某个已有用户**（`findSocialRelatedUser()` 命中）；
+- 社交登录设置中 `automaticAccountLinking` 为 false（需用户手动确认）或为 true（自动绑定）。
+
+**验证记录依赖**：
+- **2 条验证记录**，缺一不可：
+  1. `SocialVerification` — 社交身份本身（`isVerified = true`，待绑定的社交身份）；
+  2. `EmailVerificationCode` 或 `PhoneVerificationCode` — 待绑定目标账号的标识符验证（证明用户拥有该邮箱/手机）。
+
+**核心流程**：
+
+```
+SocialVerification.identifyUser()
+    │
+    ├─ findUserBySocialIdentity() → 未命中
+    │
+    └─ findSocialRelatedUser() → 命中 { type, value, user }
+         │
+         ├─ 抛 user.identity_not_exist 错误，payload 带 relatedUser
+         │
+         ▼
+[前端] 前端决策：
+    ├─ automaticAccountLinking=true  → 自动走 bindSocialRelatedUser()
+    └─ automaticAccountLinking=false → 跳转 /social/link/:connectorId 页面
+         → 用户输入邮箱/手机验证码 → 生成 identifierVerificationId
+         → 调用 signInAndLinkWithSocial()
+```
+
+**自动绑定路径（automaticAccountLinking = true**：
+
+入口：[use-social-sign-in-listener.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/22-logto/packages/experience/src/pages/SocialSignInWebCallback/use-social-sign-in-listener.ts#L72-L80
+```typescript
+if (relatedUser) {
+  if (socialSignInSettings.automaticAccountLinking) {
+    await bindSocialRelatedUser(verificationId);
+  } else {
+    navigate(`/social/link/${connectorId}`, ...);
+  }
+}
+```
+
+后端实现：[bindSocialRelatedUser](file:///d:/fz/0601-2/solo-dogfeeding/code/22-logto/packages/experience/src/apis/experience/social.ts#L46-L50)
+```typescript
+export const bindSocialRelatedUser = async (verificationId: string) => {
+  await updateInteractionEvent(InteractionEvent.SignIn);
+  await identifyUser({ verificationId, linkSocialIdentity: true });
+  return submitInteraction();
+};
+```
+
+其中 `identifyUser(verificationId, linkSocialIdentity = true)` 走 `identifyRelatedUser()` 路径，通过邮箱/手机找到目标用户，然后在 `submitInteraction` 阶段将 social identity 写入该用户。
+
+**手动绑定路径（automaticAccountLinking = false）：
+
+1. 前端跳转 [SocialLinkAccount](file:///d:/fz/0601-2/solo-dogfeeding/code/22-logto/packages/experience/src/pages/SocialLinkAccount/index.tsx) 页面，展示提示并要求用户用邮箱/手机验证；
+2. 用户完成邮箱/手机验证码验证，产生 `identifierVerificationId`；
+3. 调用 [signInAndLinkWithSocial()](file:///d:/fz/0601-2/solo-dogfeeding/code/22-logto/packages/experience/src/apis/experience/social.ts#L86-L94)：
    ```typescript
-   await identifyUser({ verificationId: identifierVerificationId });  // 找到目标用户
-   await updateProfile({ type: 'social', verificationId: socialVerificationid }); // 写入 identity
+   // 用 identifierVerificationId 找到目标用户
+   await identifyUser({ verificationId: identifierVerificationId });
+   // 用 socialVerificationId 将社交身份追加到 profile
+   await updateProfile({ type: 'social', verificationId: socialVerificationid });
    return submitInteraction();
    ```
-5. `updateProfile` 内部将 social identity（target + userInfo.id + details）合并进 `user.identities`。
 
-### 3.3 路径三：控制台/My Account 主动关联
+**后端 identity 写入机制**：
 
-不依赖 Experience 的 OIDC interaction，直接走独立 API：
+在 [helpers.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/22-logto/packages/core/src/routes/experience/classes/helpers.ts#L147-L159) `identifyUserByVerificationRecord() 中，当 `linkSocialIdentity = true` 时：
 
-**后端路由**：[routes-me/social.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/22-logto/packages/core/src/routes-me/social.ts)
+```typescript
+case VerificationType.Social: {
+  const user = linkSocialIdentity
+    ? await verificationRecord.identifyRelatedUser()    // 按邮箱/手机找用户
+    : await verificationRecord.identifyUser();      // 按社交 identity 找用户
+  const syncedProfile = {
+    ...(await verificationRecord.toSyncedProfile(),
+    ...conditional(linkSocialIdentity && (await verificationRecord.toUserProfile())),
+    // 关键：linkSocialIdentity 为 true 时追加 socialIdentity 到 profile
+    socialConnectorTokenSetSecret: await verificationRecord.getTokenSetSecret(),
+  };
+  return { user, syncedProfile };
+}
+```
 
-1. `POST /me/social/authorization-uri` — 由客户端自己生成 state + redirectUri，后端仅透传给连接器（**注意**：此处 `jti` 传空串，仅支持 Google/GitHub 这类不依赖 session 的连接器）。
-2. `POST /me/social/link-identity` — 回调成功后，携带 `connectorData`：
-   ```typescript
-   const socialUserInfo = await connector.getUserInfo(connectorData, notImplemented);
-   await updateUserById(userId, {
-     identities: {
-       ...user.identities,
-       [target]: { userId: socialUserInfo.id, details: socialUserInfo },
-     },
-   });
-   ```
-3. `DELETE /me/social/identity/:connectorId` — 解绑。
+之后 `experience-interaction.ts` 的 `identifyUser()` 方法会将 `syncedProfile` 通过 `profile.unsafeSet(syncedProfile)` 写入交互上下文的 profile 中，最终在 `submitInteraction` 时与已有用户合并写入 `user.identities`。
 
-### 3.4 SocialVerification 记录的数据结构
+### 3.3 方式三：My Account 主动绑定
+
+**触发条件**：
+- 用户已登录（已通过身份认证）；
+- 在账号中心（My Account / Account Center）主动发起社交身份绑定操作；
+- 账号中心 social 字段可编辑（`AccountCenterControlValue.Edit`）。
+
+**验证记录依赖**：
+- **1 条** `SocialVerification` 记录（通过独立的 verification API 创建，不依赖 Experience interaction；
+- 可选：**安全验证记录**（如密码/邮箱二次验证），取决于账号安全策略。
+
+**核心流程**：
+
+**前端**：[SocialCallback](file:///d:/fz/0601-2/solo-dogfeeding/code/22-logto/packages/account/src/pages/SocialCallback/index.tsx)
+
+```
+用户在账号中心点击"添加社交账号
+    │
+    ▼
+1. createSocialVerification(accessToken, { connectorId, state, redirectUri })
+   → POST /api/verifications/social
+   → 返回 { verificationRecordId, authorizationUri }
+    │
+    ▼
+2. 跳转到第三方授权（state 存 accountStorage.socialFlow 中
+    │
+    ▼
+3. 回调 /social/callback/:connectorId?state=xxx&code=xxx
+    │
+    ├─ 校验 state（与 accountStorage 中存储的比对
+    │
+    ├─ verifySocialVerification(accessToken, { verificationRecordId, connectorData })
+    │   → POST /api/verifications/social/verify
+    │
+    └─ linkSocialIdentity(accessToken, verificationId, socialVerificationRecordId)
+        → POST /api/my-account/identities
+        { newIdentifierVerificationRecordId: socialVerificationRecordId }
+```
+
+**后端**：
+
+验证记录创建：account API 通过 `buildVerificationRecordByIdAndType` 创建 `SocialVerification`，session 存在 verificationRecord.connectorSession 内（profile/verification 模式）。
+
+身份绑定：[identities.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/22-logto/packages/core/src/routes/account/identities.ts#L46-L105) `linkSocialIdentityCore()`
+
+```typescript
+const linkSocialIdentityCore = async ({ user, newIdentifierVerificationRecordId, allowReplace, ... }) => {
+  // 1. 从 verification records 表中取出社交验证记录
+  const newVerificationRecord = await buildVerificationRecordByIdAndType({
+    type: VerificationType.Social,
+    id: newIdentifierVerificationRecordId,
+    ...
+  });
+  assertThat(newVerificationRecord.isVerified, 'verification_record.not_found');
+
+  // 2. 取出社交身份信息
+  const { socialIdentity: { target, userInfo } } = await newVerificationRecord.toUserProfile();
+
+  // 3. 校验 identity 冲突检查
+  await checkIdentifierCollision({ identity: { target, id: userInfo.id }, user.id);
+
+  // 4. 写入 identities
+  const updatedUser = await updateUserById(user.id, {
+    identities: {
+    ...currentUser.identities,
+    [target]: { userId: userInfo.id, details: userInfo },
+  });
+
+  // 5. 可选：upsert token set secret
+  const tokenSetSecret = await newVerificationRecord.getTokenSetSecret();
+  if (tokenSetSecret) {
+    await upsertSocialTokenSetSecret(user.id, tokenSetSecret);
+  }
+};
+```
+
+**安全验证要求：根据账号安全策略，可能需要用户先完成身份验证（密码或邮箱验证码），通过 `assertIdentityVerifiedIfRequired()` 检查，verification_id` 头传入的验证记录。
+
+三种操作接口：
+- `POST /api/my-account/identities` — 新增绑定（`allowReplace: false`）
+- `PUT /api/my-account/identities` — 替换绑定（`allowReplace: true`）
+- `DELETE /api/my-account/identities/:target` — 解绑
+
+### 3.4 三种绑定方式对比
+
+| 维度 | 默认绑定（注册时） | 二次验证绑定（Linking Flow） | My Account 主动绑定 |
+|---|---|---|---|
+| **触发场景 | 新用户首次社交登录注册 | 社交 identity 不存在但邮箱/手机已被占用 | 已登录用户在账号中心主动添加 |
+| **验证记录数 | 1 条（SocialVerification） | 2 条（Social + Email/Phone） | 1 条（SocialVerification） + 可选安全验证 |
+| **交互上下文** | Experience Interaction（OIDC interaction) | Experience Interaction（OIDC interaction） | Account API（独立 verification records） |
+| **identity 写入时机** | 创建用户时一并写入 | submitInteraction 阶段 merge 到已有用户 | 直接 updateUserById 写入 identities |
+| **关键 API | POST /experience/register | identifyUser(linkSocialIdentity=true) 或 updateProfile + submit | POST/PUT /api/my-account/identities |
+| **token storage** | 支持（创建用户后 upsert） | 支持（syncedProfile 携带） | 支持（linkSocialIdentityCore 内 upsert） |
+| **state 校验方** | 前端 sessionStorage + 后端 nonce | 前端 sessionStorage + 后端 nonce | 前端 accountStorage + 后端 nonce |
+
+### 3.5 SocialVerification 记录的数据结构
 
 [social-verification.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/22-logto/packages/schemas/src/types/verification-records/social-verification.ts)：
 
@@ -223,6 +406,10 @@ type SocialVerificationRecordData = {
   connectorSession?: ConnectorSession;  // 可选：profile 模式会话（experience 模式存 interaction）
 };
 ```
+
+**两种存储模式**：
+- **Experience 模式**：`connectorSession` 存 OIDC `interaction.result.connectorSession`（兼容 SAML ACS 等依赖 jti 的连接器
+- **Profile/Account 模式**：`connectorSession` 存 verificationRecord 自身内（不依赖 OIDC interaction）
 
 ---
 
