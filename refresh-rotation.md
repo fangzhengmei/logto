@@ -12,9 +12,13 @@
 |------|------|
 | [refresh-token.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/oidc/grants/refresh-token.ts) | `refresh_token` grant 主处理逻辑 |
 | [defaults.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/oidc/defaults.ts) | 默认轮换策略与 TTL 策略 |
-| [init.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/oidc/init.ts) | OIDC Provider 初始化，注册轮换配置 |
-| [oidc-model-instance.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/queries/oidc-model-instance.ts) | 数据层：消费判定、作废窗口、按 grantId 批量吊销 |
+| [init.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/oidc/init.ts) | OIDC Provider 初始化，注册轮换配置（客户端开关 → 默认策略的联动） |
+| [oidc-model-instance.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/queries/oidc-model-instance.ts) | 数据层：3 秒消费窗口、按 grantId 批量吊销 |
+| [insert-into.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/database/insert-into.ts) | 数据库 UPSERT：ON CONFLICT DO UPDATE，支撑并发写入安全 |
 | [adapter.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/oidc/adapter.ts) | oidc-provider ↔ 数据库的适配层 |
+| [grants/utils.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/oidc/grants/utils.ts) | DPoP/mTLS sender-constrained 绑定校验与传递 |
+| [oidc.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/schemas/src/consts/oidc.ts) | `customClientMetadataDefault`（rotateRefreshToken 默认 true、refreshTokenTtl 默认 14 天） |
+| [oidc-module.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/schemas/src/foundations/jsonb-types/oidc-module.ts) | CustomClientMetadata 类型定义与字段说明 |
 | [grant.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/event-listeners/grant.ts) | grant 成功/错误/吊销事件审计日志 |
 
 ---
@@ -395,3 +399,426 @@ POST /oidc/token  (grant_type=refresh_token)
                           │ refresh_token  │
                           └────────────────┘
 ```
+
+---
+
+## 十一、代码路径追踪 1：rotateRefreshToken 的二级 fallback 完整调用链
+
+本节追踪：**客户端 metadata 的 `rotateRefreshToken` → 租户级 `customClientMetadataDefault.rotateRefreshToken` → `defaults.rotateRefreshToken(ctx)`** 的完整数据流。
+
+### 11.1 数据源注入链：客户端配置如何变成 `client.metadata()`
+
+#### 步骤 A：数据库 → Application 记录 → adapter Client.find
+
+每个 Logto 应用（Application）在数据库中保存了 `customClientMetadata`（JSONB 字段）。当 oidc-provider 需要 Client 对象时，调用 adapter 的 `find(id)`：
+
+[adapter.ts L178-L200](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/oidc/adapter.ts#L178-L200)：
+
+```
+find(id):
+  ├─ 内建应用（demo/account-center/device-demo）→ 直接 buildXxxClientMetadata(envSet)
+  └─ 普通应用 → findApplicationById(id) 查库 → transpileClient(application)
+                         │
+                         └─ transpileClient() 展开：
+                              client_id,
+                              client_secret,
+                              ...getConstantClientMetadata(envSet, type, customClientMetadata),
+                                        │
+                                        └─ （注入 application_type, token_endpoint_auth_method 等
+                                             基于 ApplicationType 推导的常量）
+                              ...transpileMetadata(oidcClientMetadata),  // OIDC 标准字段
+                              ...customClientMetadata,                   // ⚠️ 直接展开，
+                                                              rotateRefreshToken 在这里注入！
+```
+
+**关键代码** [adapter.ts L171](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/oidc/adapter.ts#L171)：
+
+```typescript
+...customClientMetadata,  // 直接展开数据库中保存的 CustomClientMetadata JSONB
+```
+
+数据库中若 `customClientMetadata.rotateRefreshToken` 未设置 → 该字段根本不存在于展开对象中。
+
+#### 步骤 B：oidc-provider Client 包装 `.metadata()`
+
+oidc-provider 内部将 adapter 返回的 plain object 包装为 Client 实例，并暴露 `client.metadata()` 方法返回整个 metadata 对象。
+
+若数据库中从未配置 `rotateRefreshToken` → `client.metadata().rotateRefreshToken === undefined`。
+
+### 11.2 二级 fallback 决策链：`init.ts` 中的配置入口
+
+[init.ts L443-L454](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/oidc/init.ts#L443-L454)：
+
+```typescript
+rotateRefreshToken: (ctx) => {
+  const { Client: client } = ctx.oidc.entities;
+
+  if (
+    !(client?.metadata().rotateRefreshToken ?? customClientMetadataDefault.rotateRefreshToken)
+  ) {
+    return false;
+  }
+
+  return defaults.rotateRefreshToken(ctx);
+};
+```
+
+配合 [oidc.ts L14-L18](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/schemas/src/consts/oidc.ts#L14-L18)：
+
+```typescript
+export const customClientMetadataDefault = Object.freeze({
+  rotateRefreshToken: true,   // 租户级默认
+});
+```
+
+### 11.3 `??` + `!` 的精确求值
+
+表达式：`!(A ?? B)`，其中：
+- **A** = `client?.metadata().rotateRefreshToken`（应用实际配置 / undefined / null）
+- **B** = `customClientMetadataDefault.rotateRefreshToken`（恒为 `true`）
+
+逐行展开求值：
+
+```
+第 1 层：client 存在吗？
+  ├─ client == null/undefined → client?.metadata() → undefined → A = undefined
+  └─ client 存在 → 读 rotateRefreshToken 字段：
+       ├─ 数据库显式设置 false → A = false
+       ├─ 数据库显式设置 true  → A = true
+       └─ 数据库未设置（undefined/null） → A = undefined / null
+
+第 2 层：A ?? B（nullish coalescing）
+  只有 A === undefined 或 A === null 时才取 B
+
+第 3 层：!() 取反
+
+真值表：
+
+   A（应用配置）      │  A ?? B  │  !(A ?? B)  │  返回值      │  含义
+  ───────────────────┼──────────┼────────────┼────────────┼───────────
+   true              │ true     │ false      │ 跳过 if    │ → 继续 defaults
+   undefined         │ true(B)  │ false      │ 跳过 if    │ → 继续 defaults
+   null              │ true(B)  │ false      │ 跳过 if    │ → 继续 defaults
+   false             │ false    │ true       │ 进入 if    │ → return false（不轮换）
+```
+
+**结论：只有应用显式将 `rotateRefreshToken = false` 写入数据库时才能关闭轮换；其他所有情况都走 `defaults.rotateRefreshToken(ctx)`。**
+
+### 11.4 `defaults.rotateRefreshToken(ctx)` 的内部规则
+
+[defaults.ts L23-L41](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/oidc/defaults.ts#L23-L41) 内部再做 3 条短路判断，见专题六。
+
+完整链路图：
+
+```
+POST /oidc/token (grant_type=refresh_token)
+        │
+        ▼
+  oidc-provider 认证 client
+        │
+        ▼
+  buildHandler() 进入主流程
+        │
+        ▼
+  L184: rotateRefreshToken === true || (typeof === 'function' && await rotateRefreshToken(ctx))
+        │
+        ▼
+  ┌── init.ts rotateRefreshToken(ctx) ────────────────────────────────┐
+  │   const A = client?.metadata().rotateRefreshToken                │
+  │   const B = customClientMetadataDefault.rotateRefreshToken (true) │
+  │   if (!(A ?? B)) → return false     ← 只有 A===false 才走这里     │
+  │   return defaults.rotateRefreshToken(ctx)                         │
+  └──────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+  ┌── defaults.rotateRefreshToken(ctx) ─────────────────────────┐
+  │   规则 0: refreshToken / client 存在？ 否 → return false     │
+  │   规则 1: totalLifetime() ≥ 1 年？ 是 → return false        │
+  │   规则 2: 公共客户端 + 非发送方约束？ 是 → return true       │
+  │   规则 3: ttlPercentagePassed() ≥ 70%？ 是→true 否→false     │
+  └──────────────────────────────────────────────────────────────┘
+        │
+        ▼
+  返回 true  → 进入轮换（consume + 新 RT + 保存）
+  返回 false → 跳过轮换，refreshToken 保持原值
+```
+
+---
+
+## 十二、代码路径追踪 2：rotations 字段——写入了但从未被读取做上限保护
+
+### 12.1 写入位置：唯一一处 `rotations` 赋值
+
+[refresh-token.ts L204](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/oidc/grants/refresh-token.ts#L204)：
+
+```typescript
+rotations: typeof refreshToken.rotations === 'number' ? refreshToken.rotations + 1 : 1,
+```
+
+语义：
+- 旧令牌上有 `rotations` 字段 → +1
+- 旧令牌上没有（首次授权签发的 RT，或老数据迁移）→ 从 1 开始
+
+### 12.2 读取位置：全局搜索的证据
+
+对 `packages/` 全目录搜索 `.rotations` 和 `rotations` 两个模式的结果：
+
+| 搜索模式 | 匹配文件数 | 匹配行数 | 匹配语义 |
+|---------|-----------|---------|---------|
+| `"rotations"` 字符串全文 | 1 | L204 | **仅写入**，构造新 RefreshToken 时赋值 |
+| `\.rotations` 点属性读取 | 1 | L204 | **读自己的旧值**，纯粹为了 `+1` 写回新 token |
+
+**在整个 Logto 代码库（所有 `packages/**`）中，没有任何地方用 `rotations` 做分支判断、比较运算、或阈值检查。**
+
+### 12.3 真正的上限保护机制：`iiat` + `totalLifetime()`
+
+`rotations` 写入后原样存入数据库的 `payload` JSONB，供 oidc-provider 内部或外部调试时读取。**实际生效的上限保护不依赖它。**
+
+实际生效的链条：
+
+```
+  初始授权
+     │
+     ▼
+  RT_0.iiat = 首次签发时间（epoch）
+     │
+     ├── 轮换 1 次 → RT_1.iiat = RT_0.iiat （传递，不重置）
+     ├── 轮换 2 次 → RT_2.iiat = RT_0.iiat
+     └── 轮换 N 次 → RT_N.iiat = RT_0.iiat
+                        │
+                        ▼
+             defaults.rotateRefreshToken L32
+             if (refreshToken.totalLifetime() >= 1 year) return false
+                        │
+                        ▼
+             oidc-provider 内部 totalLifetime() = Date.now() - iiat
+                        │
+                        ▼
+             ≥ 1 年 → 停止轮换
+             < 1 年 → 继续检查其他条件
+```
+
+更严的更早生效上限：**Grant TTL = 180 天**
+
+[init.ts L441](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/oidc/init.ts#L441) 设置 `Grant: 180 * 3600 * 24` = 180 天。在轮换主流程的 [refresh-token.ts L125-L127](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/oidc/grants/refresh-token.ts#L125-L127)：
+
+```typescript
+if (isKeyInObject(grant, 'isExpired') && grant.isExpired) {
+  throw new InvalidGrant('grant is expired');
+}
+```
+
+发生在 rotateRefreshToken 决策 **之前**。所以：
+- Day 0-180：Grant 有效，totalLifetime() < 180 天 < 1 年 → 正常轮换
+- Day 180-365：Grant 过期 → 早于 rotateRefreshToken 决策被拦截 → **永远不会触发 1 年上限**
+- Day 365+：理论上 stop，但 Grant 早已失效，实际不到
+
+### 12.4 rotations 字段的真实作用
+
+虽然不参与控制，但写入 rotations 不是无意义的死代码：
+
+1. **可观测性**：payload JSONB 中保存该值，可通过数据库查询分析用户刷新频率
+2. **oidc-provider 兼容性**：oidc-provider 原库默认会在 Rotating RefreshToken 时维护该字段，Logto 作为 fork 保留了该行为
+3. **未来功能**：如果将来要做"轮换 N 次后强制重新授权"的策略，不需要数据迁移就能启用
+
+---
+
+## 十三、代码路径追踪 3：`isSenderConstrained()` 在两条分支中的调用时序、数据流交汇与负面路径
+
+本节追踪同一个刷新令牌上的 `isSenderConstrained()` 如何同时影响 **rotateRefreshToken 决策** 和 **refreshTokenTtl 决策**，以及两条分支的执行顺序、数据流如何交叉。
+
+### 13.1 `isSenderConstrained()` 的判定源头
+
+sender-constrained 绑定来自两条途径，在 AccessToken 签发时校验，在 RefreshToken 构造时**原样传递**：
+
+```
+  初始授权/上一次刷新时：
+     handleDPoP() → 写入 jkt（JWK 指纹）
+     handleClientCertificate() → 写入 x5t#S256（X.509 证书指纹）
+     │
+     ▼
+  RefreshToken payload 中携带：{ jkt, 'x5t#S256' }
+     │
+     ▼
+  [refresh-token.ts L208-L209] 下次轮换时原样传递：
+     jkt: refreshToken.jkt
+     'x5t#S256': refreshToken['x5t#S256']
+     │
+     ▼
+  oidc-provider RefreshToken.isSenderConstrained() 内部：
+     return Boolean(this.jkt || this['x5t#S256'])
+```
+
+**即：只要 refresh token 的 payload 中存在 `jkt` 或 `x5t#S256` 任一 → `isSenderConstrained() === true`。**
+
+### 13.2 两条分支中 `isSenderConstrained` 的精确位置
+
+#### 分支 A：rotateRefreshToken 中（正向判断：非 sender-constrained 才强制轮换）
+
+[defaults.ts L36](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/oidc/defaults.ts#L36)：
+
+```typescript
+if (client.clientAuthMethod === 'none' && !refreshToken.isSenderConstrained()) {
+  return true;   // 公共客户端 + 无绑定 → 每次请求都轮换
+}
+```
+
+此处是 **`!isSenderConstrained()`**：**没有**发送方约束时才 return true（强制轮换）。
+
+#### 分支 B：refreshTokenTtl 中（正面判断：非 sender-constrained 才限制 TTL 继承）
+
+[defaults.ts L15](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/oidc/defaults.ts#L15)：
+
+```typescript
+if (
+  ctx.oidc.entities.RotatedRefreshToken &&
+  client.applicationType === 'web' &&
+  client.clientAuthMethod === 'none' &&
+  !token.isSenderConstrained()            // ⚠️ 同样是 !isSenderConstrained()
+) {
+  return ctx.oidc.entities.RotatedRefreshToken.remainingTTL;
+}
+```
+
+此处也是 **`!isSenderConstrained()`**：**没有**发送方约束时才进入 TTL 正面分支（继承剩余寿命，禁止滚动续期）。
+
+### 13.3 完整调用时序：先 rotateRefreshToken，后 refreshTokenTtl
+
+这两个函数在主流程中的调用**位置和顺序**完全由 [refresh-token.ts L184-L218](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/oidc/grants/refresh-token.ts#L184-L218) 决定：
+
+```
+buildHandler() 主流程
+  │
+  ├─ L184: await rotateRefreshToken(ctx)          ◄── 调用点 1（决策轮换）
+  │     │
+  │     └─ defaults.rotateRefreshToken(ctx)
+  │           └─ isSenderConstrained() ← 首次读取 jkt/x5t#S256（规则 2）
+  │
+  │   决策结果：
+  │     true  → 继续轮换分支
+  │     false → 跳至 AT 签发（跳过 L188-L218，永远不调用 refreshTokenTtl）
+  │
+  ├─ [仅决策为 true 时执行]
+  │    ├─ L188: await refreshToken.consume()
+  │    ├─ L189: ctx.oidc.entity('RotatedRefreshToken', refreshToken)  ◄── 设置上下文
+  │    │        └────────────────────┐
+  │    │                             │  被 refreshTokenTtl 用作条件 1
+  │    ├─ L191: new RefreshToken({   │
+  │    │      ...                    │
+  │    │      rotations: +1          │
+  │    │      jkt: 旧值              │  sender-constrained 属性已传递给新 token
+  │    │      x5t#S256: 旧值         │
+  │    │    })                       │
+  │    ├─ L216: ctx.oidc.entity('RefreshToken', refreshToken)
+  │    └─ L217: refreshTokenValue = await refreshToken.save()  ◄── 调用点 2（计算 TTL）
+  │              │
+  │              └─ oidc-provider 内部：
+  │                   const ttl = configuration.ttl.RefreshToken(ctx, this, client)
+  │                          │
+  │                          └─ init.ts L412-L429:
+  │                               const defaultTtl = defaults.refreshTokenTtl(ctx, token, client)
+  │                                    │
+  │                                    └─ defaults.refreshTokenTtl()
+  │                                         ├─ 检查 RotatedRefreshToken（上面 L189 设的）  ← 条件 1
+  │                                         ├─ applicationType === 'web'                   ← 条件 2
+  │                                         ├─ clientAuthMethod === 'none'                 ← 条件 3
+  │                                         └─ !token.isSenderConstrained()                ← 条件 4
+  │                                                                    ↑
+  │                                          第二次读取 jkt/x5t#S256，来自新 RT 本身（继承自旧 RT）
+  │
+  └─ ... 签发 AT/IDT ...
+```
+
+### 13.4 四个组合的完整路径分析
+
+结合 `isSenderConstrained()` 的 true/false 和两条分支的执行条件，得到 4 种典型组合：
+
+#### 组合 1：公共 SPA + **无** sender-constrained（最常见、风险最高）
+
+```
+rotateRefreshToken:
+  clientAuthMethod === 'none' ✔
+  !isSenderConstrained() = true ✔
+  → return true（强制轮换，每次请求都轮换）
+
+→ 进入轮换分支：consume + 设置 RotatedRefreshToken + 新 RT.save()
+   → 调用 refreshTokenTtl:
+     RotatedRefreshToken 存在 ✔
+     applicationType='web' ✔
+     clientAuthMethod='none' ✔
+     !isSenderConstrained()=true ✔
+     4/4 条件满足 → 正面分支 → return remainingTTL（继承剩余寿命，禁滚动续期）
+```
+
+#### 组合 2：公共 SPA + DPoP/mTLS sender-constrained
+
+```
+rotateRefreshToken:
+  clientAuthMethod === 'none' ✔
+  !isSenderConstrained() = false ❌
+  → 跳过 return true → 进入 ttlPercentagePassed() ≥ 70% 判断
+     （仅当单个 RT 寿命到期才轮换）
+
+→ 触发轮换时（TTL ≥ 70%）：
+   → 调用 refreshTokenTtl:
+     RotatedRefreshToken 存在 ✔
+     applicationType='web' ✔
+     clientAuthMethod='none' ✔
+     !isSenderConstrained()=false ❌
+     条件 4 不满足 → 负面分支 → return undefined
+       → init.ts 读取 metadata.refreshTokenTtlInDays（默认 14 天）
+       → 每次轮换重置完整 14 天 TTL，可滚动续期
+```
+
+#### 组合 3：传统机密 Web 应用（client_secret_basic）+ 无 sender-constrained
+
+```
+rotateRefreshToken:
+  clientAuthMethod === 'none' ❌
+  → 跳过规则 2 → 进入 ttlPercentagePassed() ≥ 70%
+
+→ 触发轮换时：
+   → 调用 refreshTokenTtl:
+     clientAuthMethod='client_secret_basic' ❌（条件 3 不满足）
+     → 负面分支 → return undefined
+       → metadata 取 TTL（默认 14 天，重置完整）
+```
+
+#### 组合 4：Native App（application_type=native，auth=none）+ 无 sender-constrained
+
+```
+rotateRefreshToken:
+  clientAuthMethod === 'none' ✔
+  !isSenderConstrained() = true ✔
+  → return true（每次请求强制轮换）
+
+→ 调用 refreshTokenTtl:
+  applicationType='native' ❌（条件 2：≠ 'web'）
+  → 负面分支 → return undefined
+    → metadata 取 TTL（默认 14 天，重置完整）
+```
+
+### 13.5 负面分支汇总：何时进入 `metadata` TTL 路径
+
+refreshTokenTtl 4 条件中**任一不满足**即进入负面分支返回 `undefined`，然后从 init.ts 走应用配置：
+
+| 不满足的条件 | 场景 | TTL 结果 |
+|------------|------|---------|
+| `!RotatedRefreshToken` | 本次没轮换（包括 rotateRefreshToken 返回 false 的所有情况） | `refreshTokenTtlInDays` 重置 |
+| `applicationType !== 'web'` | Native 应用 | 重置 |
+| `clientAuthMethod !== 'none'` | 传统 Web / M2M 机密客户端 | 重置 |
+| `isSenderConstrained() === true` | DPoP/mTLS 绑定 | 重置 |
+
+**只有一种组合进入正面分支：公共 Web SPA + 本次轮换了 + 非 sender-constrained。其余全部负面分支，从 metadata 重置完整 TTL。**
+
+### 13.6 数据流交汇点：同一个属性的两次读取
+
+同一个 RefreshToken 上的 `isSenderConstrained()` 属性在一次请求中被读取两次，但**读取对象不同**：
+
+| 读取时机 | 所属函数 | 读取的对象 | 数据来源 |
+|---------|---------|-----------|---------|
+| L184 之前 | rotateRefreshToken | **旧** RefreshToken（从数据库 `find` 出来那个） | 初始授权或上一次轮换时写入的 jkt/x5t#S256 |
+| L217 save() 内部 | refreshTokenTtl | **新** RefreshToken（刚 `new RefreshToken(...)` 构造的） | 从旧 RT 深拷贝传递过来的 `jkt` 和 `x5t#S256` |
+
+两次读取的结果永远一致——因为轮换时 `jkt` 和 `x5t#S256` 是**原样传递**的。所以尽管是两次读取、读取两个不同对象，值保证相同，两条分支的判断不会矛盾。
+
