@@ -822,3 +822,265 @@ refreshTokenTtl 4 条件中**任一不满足**即进入负面分支返回 `undef
 
 两次读取的结果永远一致——因为轮换时 `jkt` 和 `x5t#S256` 是**原样传递**的。所以尽管是两次读取、读取两个不同对象，值保证相同，两条分支的判断不会矛盾。
 
+---
+
+## 十四、代码路径追踪 4：异常吊销分支的无事务并行执行与单边失败的状态分析
+
+### 14.1 异常吊销分支的触发代码
+
+[refresh-token.ts L161-L164](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/oidc/grants/refresh-token.ts#L161-L164)：
+
+```typescript
+if (refreshToken.consumed) {
+  await Promise.all([refreshToken.destroy(), revoke(ctx, refreshToken.grantId)]);
+  throw new InvalidGrant('refresh token already used');
+}
+```
+
+两个操作**无事务包裹**，通过 `Promise.all()` 并发（并行）启动。
+
+### 14.2 两个操作的底层 SQL 与数据影响范围
+
+#### 操作 A：`refreshToken.destroy()` → adapter `destroyInstanceById`
+
+[oidc-model-instance.ts L176-L182](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/queries/oidc-model-instance.ts#L176-L182)：
+
+```sql
+DELETE FROM oidc_model_instances
+WHERE model_name = 'RefreshToken' AND id = $refreshToken.jti$;
+```
+
+**影响范围**：**1 行**，就是当前正在被使用的旧刷新令牌本身（按主键删除）。
+
+#### 操作 B：`revoke(ctx, grantId)` → 调用 oidc-provider 内部 helpers/revoke.js
+
+从 import 路径 [refresh-token.ts L29](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/oidc/grants/refresh-token.ts#L29)（`import revoke from 'oidc-provider/lib/helpers/revoke.js'`）可以确认这是 oidc-provider 原库的 revoke helper。结合 [adapter.ts L222](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/oidc/adapter.ts#L222) 的 adapter 接口 `revokeByGrantId` 推断，revoke 内部对 oidc-provider 管理的**每个模型类型**（主要是 `RefreshToken` 和 `AccessToken`）分别调用 adapter 的 `revokeByGrantId(modelName, grantId)`。
+
+Logto 侧的 `revokeInstanceByGrantId` 实现见 [oidc-model-instance.ts L184-L205](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/queries/oidc-model-instance.ts#L184-L205)：
+
+```sql
+DELETE FROM oidc_model_instances
+WHERE id IN (
+  SELECT id FROM oidc_model_instances
+  WHERE model_name = $modelName$          -- 'RefreshToken' 或 'AccessToken'
+    AND payload ? 'grantId'               -- JSONB 含 grantId 键
+    AND payload->>'grantId' = $grantId$
+  LIMIT 1000
+)
+-- 循环执行直到 rowCount == 0
+```
+
+**影响范围**：
+- RefreshToken 模型：**所有**该 grantId 下刷新令牌（含尚未消耗的所有轮换出来的后续令牌）
+- AccessToken 模型：**所有**该 grantId 下访问令牌
+
+### 14.3 四种失败场景的数据库最终状态
+
+`Promise.all([destroy, revoke])` 并发启动，无任何数据库事务（BEGIN/COMMIT/ROLLBACK）。两个 DELETE 各自独立提交。
+
+| 场景 | destroy（单条 DELETE） | revoke（N 条分批 DELETE） | 数据库状态 | 安全后果 |
+|------|--------------------------|----------------------------|-----------|---------|
+| ✅ 均成功 | ✅ 旧 RT 被删 | ✅ 该 grantId 下**所有** RT/AT 被清 | grantId 对应所有令牌归零 | 预期结果：合法用户掉线，攻击者令牌也失效 |
+| ❌ A 失败，B 成功 | ❌ 旧 RT 仍在（consumedAt=X，可能已过 3 秒窗） | ✅ 其他所有 RT/AT 被清 | **只剩这一条旧 RT**，其余全没了 | 低风险：旧 RT 本身已 `consumed`，后续请求仍会命中异常吊销分支（再删一次，DELETE 0 rows 无害） |
+| ✅ A 成功，❌ B 第 1 批失败 | ✅ 旧 RT 被删 | ❌ 还没开始任何 DELETE（第 1 批 SQL 报错） | grantId 下**所有 RT/AT 原样保留** | ⚠️ **高风险**：整个吊销动作只删了一条旧 RT，攻击者持有的其他轮换 RT 仍可继续使用——异常检测未能生效 |
+| ✅ A 成功，❌ B 中间批失败 | ✅ 旧 RT 被删 | 部分批次 DELETE 已提交，后续批次失败 | grantId 下 **部分** RT/AT 被清，部分残留 | ⚠️ **中风险**：攻击者持有的部分令牌可能仍有效 |
+
+### 14.4 单边失败的安全风险等级评估
+
+**最危险场景**：第 3 种（destroy 成功，revoke 第 1 批就失败）。此时重放检测形同虚设——攻击者只要持有另一个由正常轮换产生的有效刷新令牌，就能继续攻击，且不会再触发异常吊销分支（因为另一个 RT 从未被 consume）。
+
+**触发 B 失败的常见原因**：
+- PostgreSQL 连接池耗尽/网络闪断 → 第 1 批 query 抛错
+- SQL 层面 JSONB 运算符 `?` 的权限问题（极少）
+- PostgreSQL statement_timeout 超限时大批量数据正在删除
+- `revokeInstanceByGrantId` 的循环**没有 try/catch**（源码见 [oidc-model-instance.ts L184-L205](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/queries/oidc-model-instance.ts#L184-L205)），任何中间 `pool.query` 抛错会直接 reject，已执行的批次无法回滚
+
+### 14.5 为什么不用事务？代价与权衡
+
+添加 BEGIN / COMMIT / ROLLBACK 事务包裹两个并发操作需要：
+1. 从连接池中获取**同一个**连接，两条 DELETE 串行执行（不再是 `Promise.all`）
+2. 如果 revoke 批次大（数万行），事务长时间持有锁，阻塞其他 grant 的正常插入/查询
+3. `revokeInstanceByGrantId` 循环语义需要改成单事务内的多次 DELETE，逻辑复杂性显著提升
+
+目前设计是**有意识的"最佳努力"吊销**：能清多少清多少，失败时至少抛异常阻止本次请求继续。如果要完全解决一致性问题，需要改为：
+- **先 revoke（更大操作）后 destroy**，串行执行，虽然慢但保证 revoke 覆盖 destroy；
+- 或用 advisory lock 在 grantId 维度做互斥，确保同一时间只有一个吊销在跑。
+
+---
+
+## 十五、代码路径追踪 5：3 秒宽容窗口与分布式多实例时钟漂移的行为边界
+
+### 15.1 3 秒窗口使用的时间源：Node.js 本地 `Date.now()`
+
+3 秒宽容窗口的所有时间计算**全部在应用层（Node.js）用本地时钟完成**，不依赖 PostgreSQL 的 `now()`。
+
+证据链：
+
+**写入 consumedAt 时**（写库时间戳）：
+[consumeInstanceById](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/queries/oidc-model-instance.ts#L167-L174) → 用 [convertToTimestamp()](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/utils/sql.ts#L100-L101)：
+
+```typescript
+export const convertToTimestamp = (time = new Date()) =>
+  sql`to_timestamp(${time.valueOf() / 1000})`;
+```
+
+这里 `new Date()` 是**当前 Node 进程的本地时间**，转成 epoch 秒后传入 PostgreSQL 的 `to_timestamp()`。PostgreSQL 只是把传入的秒数转成 timestamp 存储，**不会用数据库自己的 now() 覆盖**。
+
+**判断 consumed 时**（读库后计算窗口）：
+[isConsumed()](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/queries/oidc-model-instance.ts#L29-L45)：
+
+```typescript
+const isConsumed = (modelName: string, consumedAt: Nullable<number>): boolean => {
+  // ...
+  return isBefore(addSeconds(consumedAt, refreshTokenReuseInterval), Date.now());
+};
+```
+
+- `consumedAt` 是从数据库读出的 bigint（millisecond timestamp，见下面 15.2 的转换说明）
+- `Date.now()` 是**当前 Node 进程的本地时间**
+- 加法和比较全部在 JS 进程内完成
+
+**结论：写入和读取的时间戳都由应用实例本地时钟产生。整个宽容窗口计算完全不依赖数据库时钟。**
+
+### 15.2 consumedAt 的格式转换：Node.js 毫秒 vs PostgreSQL 秒
+
+`oidc_model_instances.consumed_at` 字段类型是 `timestamptz`（PostgreSQL 带时区的时间戳）。读写转换：
+
+```
+写入：
+  Node.js new Date().valueOf() / 1000  →  epoch 秒  →  to_timestamp()  →  timestamptz
+
+读取：
+  SELECT ..., extract(epoch from consumed_at) * 1000  →  bigint 毫秒  →  JS Number
+```
+
+转换代码在 [oidc-model-instance.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/queries/oidc-model-instance.ts) 的查询语句中用 `extract` 做。
+
+### 15.3 分布式多实例下四种典型时钟漂移场景
+
+假设同一 Logto 部署的两个实例 A（主 US-East）和 B（主 EU-West）：
+
+| 场景 | 实例 A 本地时钟 | 实例 B 本地时钟 | 相对漂移 | 行为与风险 |
+|------|-----------------|-----------------|---------|-----------|
+| **A 快 1 秒，B 慢 1 秒**（总漂移 2 秒） | A = 真实 T + 1 | B = 真实 T - 1 | 2s | ✅ **安全**：3 秒窗口 - 2 秒漂移 = 1 秒实际容错。正常并发仍在窗口内。 |
+| **A 快 5 秒，B 慢 1 秒**（总漂移 6 秒） | A = T + 5 | B = T - 1 | 6s | ⚠️ **跨实例 3 秒窗口失效**：A 在 t₀ 写入 consumedAt = T+5；B 收到并发请求时本地时钟 = T-1+0.5 = T-0.5；<br>isConsumed 在 B 上判断：<br>`consumedAt(T+5) + 3s = T+8 > Date.now()(T-0.5)` → false，窗口**意外扩大**到 8.5 秒。<br>攻击者有更长时间重放旧令牌不触发吊销。 |
+| **A 慢 3 秒，B 快 3 秒**（总漂移 6 秒，反向） | A = T - 3 | B = T + 3 | 6s | ⚠️ **跨实例 3 秒窗口意外收缩**：A 在 t₀ 写入 consumedAt = T-3；B 收到并发请求时本地时钟 = T+3+0.5 = T+3.5；<br>isConsumed 在 B 上判断：<br>`consumedAt(T-3) + 3s = T > Date.now()(T+3.5)` → true（T > T+3.5? 否）<br>实际 `T > T+3.5?` 为 false → consumed = false。<br>但如果延迟再久一点（比如 B 在真实 T+0.5 收到请求，B 时钟 T+3+0.5 = T+3.5，<br> consumedAt = T-3 + 3 = T，判断 T > T+3.5？false，还在窗口）。<br>**反向漂移会让窗口在跨实例调用时缩短甚至归零** → 合法客户端可能遭遇"已被使用"错误，**正常请求异常吊销**。 |
+| **极端：实例 NTP 挂了，漂移 5 分钟** | A = T - 300s | B = T + 300s | 10 分钟 | 🚨 **灾难性**：<br>A 消费 RT 后 → B 上 isConsumed 判定：(T-300)+3 = T-297 > Date.now()(T+300)? 否 → 还在窗口内（窗口被拉到了 597 秒）；<br>反之 B 消费后 → A 上判断 (T+300)+3 = T+303 > Date.now()(T-300)? 否 → 仍在窗口（又被拉到 603 秒）。<br>实际效果是宽容窗口被**膨胀到 10 分钟以上**，攻击者可用大量时间重放。 |
+
+### 15.4 行为边界总结与改进建议
+
+**适用的前提条件**：
+- 所有 Logto 实例时钟同步 ≤ 1 秒（正确配置 NTP 的 Kubernetes VM 都能满足）
+- 总漂移不超过 2 秒
+
+**实际可观测到的问题信号**：
+- 错误日志中 `InvalidGrant('refresh token already used')` 异常增多，伴随"刚刚正常刷新过"的用户反馈 → 怀疑时钟漂移导致窗口意外收缩
+- 同一 grantId 下 refresh token 轮换次数异常高但从未触发吊销 → 怀疑时钟漂移导致窗口意外扩大
+
+**潜在改进**：
+- 将 consumedAt 的写入改为 PostgreSQL `now()` 而非应用时间，读取用 `consumedAt + interval '3 seconds' < now()` 完全在 DB 层计算，彻底消除实例时钟差——但会增加数据库 CPU 开销（每条 SELECT 带区间运算）
+
+---
+
+## 十六、代码路径追踪 6：`isKeyInObject` 判断 `grant.isExpired` 的类型 hack 与升级风险
+
+### 16.1 代码原始位置与注释
+
+[refresh-token.ts L120-L127](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/oidc/grants/refresh-token.ts#L120-L127)：
+
+```typescript
+/**
+ * It's actually available on the `BaseModel` class - but missing from the typings.
+ *
+ * @see {@link https://github.com/panva/node-oidc-provider/blob/cf2069cbb31a6a855876e95157372d25dde2511c/lib/models/base_model.js#L128 | oidc-provider/lib/models/base_model.js#L128}
+ */
+if (isKeyInObject(grant, 'isExpired') && grant.isExpired) {
+  throw new InvalidGrant('grant is expired');
+}
+```
+
+### 16.2 `isKeyInObject` 的类型语义
+
+`isKeyInObject` 来自 `@silverhand/essentials` 工具库，是 TypeScript 的**类型守卫（type guard）**模式。语义：
+
+```typescript
+function isKeyInObject<T extends object, K extends PropertyKey>(
+  obj: T,
+  key: K
+): obj is T & Record<K, unknown>
+```
+
+调用前，`grant` 的类型是 `Grant`，TypeScript 认为上面**没有** `isExpired` 键（因为 oidc-provider 的 TypeScript 声明里没声明 BaseModel 的内部属性）。调用后，如果返回 `true`，TypeScript 就把 `grant` 的类型**收窄**为 `Grant & Record<'isExpired', unknown>`，于是：
+
+```typescript
+grant.isExpired  // ✅ 不再报 TS2339 属性不存在错误
+```
+
+但这是**纯编译期 hack**，运行时只做 `'isExpired' in grant`（JavaScript in 运算符）检查类型。
+
+### 16.3 oidc-provider 中 BaseModel 的 `isExpired` 实际实现
+
+代码注释明确钉死了实现位置（[oidc-provider base_model.js#L128](https://github.com/panva/node-oidc-provider/blob/cf2069cbb31a6a855876e95157372d25dde2511c/lib/models/base_model.js#L128)）。实际是 **getter（计算属性）** 而非常量：
+
+```javascript
+// oidc-provider 内部实现（推断自注释链接 + Logto Grant.find({ ignoreExpiration: true }) 行为）
+get isExpired() {
+  return this.exp !== undefined && this.exp < Math.floor(Date.now() / 1000);
+}
+```
+
+因为 Grant.find 时带了 `{ ignoreExpiration: true }`（[refresh-token.ts L112-L114](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/oidc/grants/refresh-token.ts#L112-L114)），oidc-provider 会跳过内部的自动过期校验，直接把过期 Grant 也返回。**Logto 必须自己做这个判断**，否则后面的处理会用到过期 Grant。
+
+### 16.4 升级 oidc-provider 后可能失效的三种方式
+
+#### 风险 1：oidc-provider 删除或重命名 `isExpired` getter
+
+**概率：低但不可逆。**
+
+oidc-provider 是遵循 semver 的库，删除 `BaseModel` 内部属性属于 breaking change，会在大版本升级时发生。
+
+- **失效表现**：`'isExpired' in grant` 返回 false → 整个 if 条件短路 → **过期 Grant 不抛错就继续执行**
+- **后果**：Grant 已过期但刷新令牌还没过期的边界时间窗内，用户可以继续换取 AT/RT——突破授权时长限制
+- **如何防护**：
+  - 大版本升级 oidc-provider 前跑单元测试（[refresh-token.test.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/oidc/grants/refresh-token.test.ts) 应覆盖过期场景）
+  - 更稳妥做法：**不用 getter**，直接读 `grant.exp`（oidc JWT 标准字段，更稳定），用 `grant.exp < Math.floor(Date.now()/1000)` 手写判断
+
+#### 风险 2：oidc-provider 把 getter 改成 `isExpired()` 方法
+
+**概率：中等。**
+
+如果从 `get isExpired()` 改成 `isExpired()`：
+- `'isExpired' in grant` 仍返回 `true`（方法是属性，值为 function）→ 通过了检查
+- 但 `grant.isExpired` 变成 function 而非 boolean → `&& grant.isExpired` 永远为 truthy（function ≠ 0/null/false）→ **所有 Grant 都被判为过期**
+- **后果**：所有刷新请求一律抛 `InvalidGrant('grant is expired')`——大范围用户掉线
+
+#### 风险 3：oidc-provider 在 `Grant.find({ ignoreExpiration: true })` 内部也做了过滤
+
+**概率：极低，但最危险。**
+
+如果 oidc-provider 后续版本忽略 `ignoreExpiration` 选项或者删除这个参数：
+- `Grant.find()` 在 Grant 过期时直接返回 null
+- Logto 的下一句 `if (!grant) throw InvalidGrant('grant not found')` 会成功拦截
+- **后果可控**：只是错误信息从 'grant is expired' 变成 'grant not found'，行为仍然安全
+
+### 16.5 现有类型 hack 的加固建议
+
+目前写法是双条件 `isKeyInObject(grant, 'isExpired') && grant.isExpired`。可以做以下加固：
+
+| 问题 | 加固方式 |
+|------|---------|
+| getter 改 method 后 truthy 误判 | 改成 `typeof grant.isExpired === 'boolean' && grant.isExpired` |
+| 依赖内部未声明属性 | 直接用 `grant.exp` 字段判断：`grant.exp !== undefined && grant.exp < Math.floor(Date.now() / 1000)` |
+| 缺少显式测试 | 在 refresh-token.test.ts 中增加专门断言：模拟 Grant.isExpired getter 被删除/改为函数时，系统仍能正确拦截或至少抛可观测错误 |
+
+### 16.6 同模式的其他隐患位置
+
+全代码库搜索 `isKeyInObject` 后（见 rg 结果），类似的类型 hack 模式在以下位置也有使用，升级相关依赖时需同样关注：
+
+- [middleware/koa-auth/utils.ts L42 + L48](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/middleware/koa-auth/utils.ts)：`configuration.jwks_uri` 和 `jwks.keys`（oidc-provider 配置）
+- [env-set/preconditions.ts L33](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/env-set/preconditions.ts)：`row.tablename`（Postgres 行对象）
+- [routes/swagger/utils/general.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/routes/swagger/utils/general.ts)：Swagger OpenAPI 文档对象操作
+
+这些位置中，只有 `koa-auth/utils.ts` 是和 oidc-provider 相关的，其余是自有类型，升级风险低。
+
+
