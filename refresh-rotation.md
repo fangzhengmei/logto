@@ -137,33 +137,101 @@ const isConsumed = (modelName: string, consumedAt: Nullable<number>): boolean =>
 
 ---
 
-## 四、并发刷新去重
+## 四、并发刷新：3 秒窗口的真去重机制与多令牌签发
 
-### 问题场景
+### 4.1 问题场景：为什么会有并发？
 
-在 Next.js 等无共享内存的 Serverless 环境中，多个并发请求可能同时携带同一个刷新令牌来换取新令牌。没有作废窗口的话：
+在 Next.js 等无共享内存的 Serverless 环境中，多个并发请求可能同时携带同一个刷新令牌来换取新令牌。典型场景：
+- 前端 SPA 在组件挂载/路由切换时，多个 hook 同时触发 token 刷新
+- Serverless 函数水平扩展，两个实例同时收到同一用户的请求
+- 移动端网络抖动导致重试，旧请求并未真正丢失
+
+### 4.2 3 秒窗口 + 数据库 UPSERT：真去重的实现原理
+
+**结论先行：3 秒窗口内并不会严格"去重"只签发一个新令牌，而是容忍多个新令牌并行签发，靠数据库的唯一约束和幂等操作保证不出错。**
+
+#### 步骤 1：旧令牌消费的数据库幂等性
+
+旧刷新令牌的 `consume` 操作对应 [oidc-model-instance.ts L167-L174](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/queries/oidc-model-instance.ts#L167-L174)：
+
+```typescript
+const consumeInstanceById = async (modelName: string, id: string) => {
+  await pool.query(sql`
+    update ${table}
+    set ${fields.consumedAt}=${convertToTimestamp()}
+    where ${fields.modelName}=${modelName}
+      and ${fields.id}=${id}
+  `);
+};
+```
+
+这是一个**纯 UPDATE**，不带任何 SELECT-for-UPDATE 锁或事务隔离。N 个并发请求同时执行这条 SQL，结果完全等价于执行一次——所有请求都将 `consumedAt` 设置为"当前时间"，数据库最终只保留最后一次写入的值。**操作天然幂等。**
+
+#### 步骤 2：新刷新令牌的入库：ON CONFLICT DO UPDATE
+
+新刷新令牌的 `save()` 走 adapter 的 `upsert` → [oidc-model-instance.ts L67-L72](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/queries/oidc-model-instance.ts#L67-L72)：
+
+```typescript
+const upsertInstance = buildInsertIntoWithPool(pool)(OidcModelInstances, {
+  onConflict: {
+    fields: [fields.tenantId, fields.modelName, fields.id],
+    setExcludedFields: [fields.payload, fields.expiresAt],
+  },
+});
+```
+
+生成的 SQL 形态（见 [insert-into.ts L90-L98](file:///d:/fz/0601-2/solo-dogfeeding/code/7-logto/packages/core/src/database/insert-into.ts#L90-L98)）：
+
+```sql
+INSERT INTO oidc_model_instances (tenant_id, model_name, id, payload, expires_at)
+VALUES (...)
+ON CONFLICT (tenant_id, model_name, id) DO UPDATE
+SET payload=excluded.payload, expires_at=excluded.expires_at
+```
+
+**关键点：新刷新令牌的主键 `id` 是 oidc-provider 在构造 `new RefreshToken(...)` 时生成的随机 jti（jwt id），全局唯一。** 所以并发请求各自生成的新令牌根本不会在主键上冲突——**它们会以完全独立的两行同时 INSERT 成功**，不存在 ON CONFLICT 的情况。
+
+> 除非发生极低概率的 jti 碰撞，此时 ON CONFLICT DO UPDATE 会用后写入的 payload/expiresAt 覆盖先写入的，保证最终一致性而不抛异常。
+
+#### 步骤 3：最终状态：多个新刷新令牌并存
+
+3 秒窗口内 N 个并发请求 → N 个新刷新令牌写入数据库，全部有效且共享同一个 `grantId`。
 
 ```
-请求 A: find → consumed: undefined → consume → 签发新 RT
-请求 B: find → consumed: undefined → consume → 也签发新 RT （或者冲突）
+┌────────────────────────────────────────────────────────────┐
+│  并发请求：A、B、C （t=0 至 t=0.3s 内全部到达）                │
+│                                                            │
+│  A: find RT_old → consumed未设置 → consume → save RT_A     │
+│  B: find RT_old → consumed已设但3s内 → 视为未消费           │
+│                → consume → save RT_B                       │
+│  C: find RT_old → consumed已设但3s内 → 视为未消费           │
+│                → consume → save RT_C                       │
+│                                                            │
+│  数据库最终状态：                                            │
+│    RT_old  ── consumedAt=t0                                │
+│    RT_A    ── grantId=G1, rotations=N                      │
+│    RT_B    ── grantId=G1, rotations=N                      │
+│    RT_C    ── grantId=G1, rotations=N   ← 三个都有效         │
+└────────────────────────────────────────────────────────────┘
 ```
 
-### 3 秒窗口如何去重
+### 4.3 这是"去重"吗？为什么这样设计？
 
-```
-时间轴：
-t=0  请求 A 到达 → find RT (consumedAt=null) → isConsumed=false ✓ → consume → consumedAt=t0
-t=0.5 请求 B 到达 → find RT (consumedAt=t0) → isConsumed? → t0+3s > t0.5 → isConsumed=false ✓
-t=0.5 请求 B 继续 → consume （幂等 UPDATE consumedAt） → 也会尝试轮换？
-```
+严格来说它**不是去重**（不去重，允许多发），而是：
 
-注意：3 秒窗口内，**多个并发请求都能通过 `isConsumed` 检查**。但这不会无限去重，而是依赖以下机制控制：
+| 方案 | 是否采用 | 原因 |
+|------|---------|------|
+| SELECT FOR UPDATE + 行锁 | ❌ | 需要额外事务；在连接池/Serverless 下死锁风险高；性能损耗 |
+| 3 秒容错 + 允许并发多发 | ✅ | **对客户端最友好**：所有并发请求都能拿到各自的新令牌 |
+| 异常吊销分支（3s 外） | ✅ | **对安全最严格**：重放必触发整个 grantId 下所有令牌吊销 |
 
-1. **数据库层面**：`consumeInstanceById` 是纯 UPDATE 操作，多次执行结果一致（幂等）
-2. **业务层面**：每个请求都会独立签发新的刷新令牌，但它们共享同一个 `grantId`
-3. **安全兜底**：如果攻击者在 3 秒外重放旧令牌，会触发"异常吊销分支"（见下一节）
+这是一种**"宽松容错 + 严格安全"**的组合：
+- 对合法客户端的偶然并发（预期内的网络波动/Serverless 多实例）→ **完全不报错**，多发几个令牌代价极小
+- 对攻击者的故意重放（3 秒外重试同一个旧令牌）→ **最严厉惩罚**，一锅端整个授权链
 
-实际上 3 秒窗口是**故意放宽**的容错机制，而非严格互斥锁。真正严格的互斥由 oidc-provider 的 `consumed` 检查 + 异常吊销分支保证。
+### 4.4 Access Token 是否也并发多发？
+
+是的。刷新令牌轮换的后续流程还会签发 AT/IDT，它们和 RT 一样：每个并发请求独立构造、独立 jti、独立 INSERT。客户端每个并发请求都收到完整的 token 三元组（AT/RT/IDT）。
 
 ---
 
