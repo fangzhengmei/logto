@@ -538,15 +538,174 @@ const linkSocialIdentityCore = async ({
 
 ---
 
-#### 3.3.3 安全验证与操作接口
+#### 3.3.3 三种操作接口详解
 
-**安全验证要求**：根据账号安全策略，可能需要用户先完成身份验证（密码或邮箱验证码），通过 `assertIdentityVerifiedIfRequired()` 检查请求头 `verification_id` 传入的验证记录。
+My Account 提供三个 API 操作社交身份，其中 DELETE（解绑）与 POST/PUT（新增/替换）的内部逻辑完全不同——**DELETE 不参与 SocialVerification 流程**，仅依赖当前登录态与业务规则校验。
 
-三种操作接口：
+##### `POST /api/my-account/identities` — 新增绑定
 
-- `POST /api/my-account/identities` — 新增绑定（`allowReplace: false`）
-- `PUT /api/my-account/identities` — 替换绑定（`allowReplace: true`）
-- `DELETE /api/my-account/identities/:target` — 解绑
+**依赖**：`SocialVerification` 记录（`isVerified = true`） + 安全验证 + 编辑权限。
+
+实现：[identities.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/22-logto/packages/core/src/routes/account/identities.ts#L107-L138)
+
+```typescript
+router.post(`${accountApiPrefix}/identities`, ..., async (ctx, next) => {
+  const { id: userId, scopes, identityVerified } = ctx.auth;
+
+  // 校验 1：账号中心 social 字段可编辑
+  assertThat(
+    ctx.accountCenter.fields.social === AccountCenterControlValue.Edit,
+    'account_center.field_not_editable'
+  );
+  // 校验 2：拥有 Identities scope
+  assertThat(scopes.has(UserScope.Identities), ...);
+
+  const user = await findUserById(userId);
+  // 校验 3：安全验证（如用户有密码/邮箱/手机，需先通过二次验证）
+  assertIdentityVerifiedIfRequired(user, identityVerified);
+
+  // 核心操作：allowReplace = false → 已有同 target 的 identity 时拒绝
+  await linkSocialIdentityCore({
+    user,
+    newIdentifierVerificationRecordId: ctx.guard.body.newIdentifierVerificationRecordId,
+    allowReplace: false,
+    ...
+  });
+  ctx.status = 204;
+});
+```
+
+`linkSocialIdentityCore` 内部关键行为（`allowReplace = false`）：
+
+1. 按 id 读取 `SocialVerification` → 断言 `isVerified`；
+2. 取出 `socialIdentity.{ target, userInfo }`；
+3. `checkIdentifierCollision()` — 防止同一社交账号绑到其他用户；
+4. **断言 `!existingIdentity`** → 若该 target 已存在 identity，抛 `user.identity_already_in_use`；
+5. `updateUserById()` 写入 identities；
+6. 可选 upsert token set secret。
+
+##### `PUT /api/my-account/identities` — 替换绑定
+
+**依赖**：同 POST（`SocialVerification` + 安全验证 + 编辑权限），但 `allowReplace = true`。
+
+实现：[identities.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/22-logto/packages/core/src/routes/account/identities.ts#L140-L171)
+
+```typescript
+router.put(`${accountApiPrefix}/identities`, ..., async (ctx, next) => {
+  // 同 POST 的三项校验...
+  await linkSocialIdentityCore({
+    user,
+    newIdentifierVerificationRecordId: ctx.guard.body.newIdentifierVerificationRecordId,
+    allowReplace: true,   // 唯一差异：允许覆盖已有同 target 的 identity
+    ...
+  });
+  ctx.status = 204;
+});
+```
+
+`linkSocialIdentityCore` 内部关键行为（`allowReplace = true`）：
+
+1. 同 POST 的步骤 1-3；
+2. **不检查** `existingIdentity` — 若该 target 已有 identity，直接覆盖；
+3. `updateUserById()` 写入 identities（覆盖旧值）；
+4. 若新记录**无** token set secret **且**旧 identity 的 `userId` 与新不同 → `deleteSocialTokenSetSecretByUserIdAndTarget()` 清除旧 secret；
+5. 若新记录有 token set secret → upsert。
+
+##### `DELETE /api/my-account/identities/:target` — 解绑
+
+**⚠️ 不参与 SocialVerification 流程**——无需任何 `SocialVerification` 记录，也不涉及 `verification_records` 表。
+
+**依赖**（仅四项）：
+
+1. **当前登录用户** — `ctx.auth` 提供用户 id，无需额外身份证明；
+2. **安全验证** — `assertIdentityVerifiedIfRequired(user, identityVerified)`；
+3. **编辑权限** — `ctx.accountCenter.fields.social === AccountCenterControlValue.Edit`；
+4. **身份删除限制** — `assertCanDeleteSocialIdentity()` 确保删除后用户仍至少保留一种登录方式。
+
+实现：[identities.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/22-logto/packages/core/src/routes/account/identities.ts#L173-L206)
+
+```typescript
+router.delete(`${accountApiPrefix}/identities/:target`, ..., async (ctx, next) => {
+  const { id: userId, scopes, identityVerified } = ctx.auth;
+  const { target } = ctx.guard.params;
+  const { fields } = ctx.accountCenter;
+
+  // 校验 1：账号中心 social 字段可编辑
+  assertThat(fields.social === AccountCenterControlValue.Edit, 'account_center.field_not_editable');
+  // 校验 2：拥有 Identities scope
+  assertThat(scopes.has(UserScope.Identities), 'auth.unauthorized');
+
+  const [user, ssoIdentities] = await Promise.all([
+    findUserById(userId),
+    userSsoIdentities.findUserSsoIdentitiesByUserId(userId),
+  ]);
+  // 校验 3：安全验证
+  assertIdentityVerifiedIfRequired(user, identityVerified);
+  // 校验 4：删除后仍保留至少一种登录方式
+  assertCanDeleteSocialIdentity(user, target, ssoIdentities.length);
+
+  // 执行删除
+  const updatedUser = await deleteUserIdentity(userId, target);
+  ctx.appendDataHookContext('User.Data.Updated', { user: updatedUser });
+  ctx.status = 204;
+});
+```
+
+`assertCanDeleteSocialIdentity()` 的内部逻辑 —— [user.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/22-logto/packages/core/src/utils/user.ts#L144-L152)：
+
+```typescript
+export const assertCanDeleteSocialIdentity = (user: User, target: string, ssoIdentityCount = 0) => {
+  // 1. 该 target 必须存在于用户 identities 中
+  assertThat(user.identities[target], new RequestError({ code: 'user.identity_not_exist', status: 404 }));
+
+  // 2. 模拟删除后的剩余身份计数 > 0
+  const { [target]: _deletedIdentity, ...identities } = user.identities;
+  assertUserHasRemainingIdentifier(user, { identities }, ssoIdentityCount);
+};
+```
+
+`getUserIdentifierCount()` 计算公式 —— [user.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/22-logto/packages/core/src/utils/user.ts#L119-L127)：
+
+```typescript
+export const getUserIdentifierCount = (user: User, ssoIdentityCount = 0): number => {
+  return (
+    Number(Boolean(user.username)) +     // 有用户名 → +1
+    Number(Boolean(user.primaryEmail)) + // 有邮箱   → +1
+    Number(Boolean(user.primaryPhone)) + // 有手机   → +1
+    Object.keys(user.identities).length + // 社交身份数
+    ssoIdentityCount                      // SSO 身份数
+  );
+};
+```
+
+> 删除后计数归零时抛 `user.last_sign_in_method_required`，阻止用户将自己锁在门外。
+
+`deleteUserIdentity()` 的 SQL 实现 —— [user.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/22-logto/packages/core/src/queries/user.ts#L435-L441)：
+
+```typescript
+const deleteUserIdentity = async (userId: string, target: string) =>
+  pool.one<User>(sql`
+    update ${table}
+    set ${fields.identities}=${fields.identities}::jsonb - ${target}
+    where ${fields.id}=${userId}
+    returning *
+  `);
+```
+
+> 使用 PostgreSQL 的 `jsonb - key` 操作符，从 `identities` JSONB 字段中原子移除指定 target 的键值对。
+
+##### 三种操作对比
+
+| 维度 | POST（新增） | PUT（替换） | DELETE（解绑） |
+|---|---|---|---|
+| **是否需要 SocialVerification** | ✅ 必须已校验 | ✅ 必须已校验 | ❌ **不参与** |
+| **是否操作 verification_records 表** | ✅ 读取 | ✅ 读取 | ❌ **不涉及** |
+| **allowReplace** | `false` | `true` | N/A |
+| **已有同 target identity** | 抛 `identity_already_in_use` | 覆盖旧值 | 删除该 target |
+| **token set secret 处理** | upsert 新值 | upsert 新值；若新无旧有则 delete 旧 | N/A（DB 级联或未处理） |
+| **身份删除限制** | 不涉及 | 不涉及 | `assertCanDeleteSocialIdentity()` → `assertUserHasRemainingIdentifier()` |
+| **关键校验** | 碰撞检查 + 不可覆盖 | 碰撞检查 + 可覆盖 | identity 存在 + 删后仍有登录方式 |
+| **数据写入** | `updateUserById()` 追加 identity | `updateUserById()` 覆盖 identity | `deleteUserIdentity()` 移除 identity key |
 
 ---
 
