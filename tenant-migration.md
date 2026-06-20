@@ -1,495 +1,618 @@
-# Admin Tenant 创建与数据迁移代码理解
+# Admin Tenant 创建与数据迁移 — 代码事实对照
 
 ## 概述
 
-Logto 的多租户架构通过 **PostgreSQL 行级安全 (RLS)** + **数据库角色隔离** + **Alteration 版本管理** 三层机制实现。Admin Tenant 的创建和数据迁移涉及三个核心阶段：**数据库 Schema 初始化** → **Alteration 脚本执行** → **默认数据 Seed**。
+Logto 的多租户体系 = **PostgreSQL 行级安全 (RLS)** + **数据库角色隔离** + **Alteration 版本管理**。Admin Tenant 的创建不是单一脚本完成的，而是在多个连续的 Alteration 脚本中逐步完善，最后通过 Seed 命令将所有最新状态一次性落地。
+
+两条初始化路径：
+
+| 路径 | 命令 | 适用场景 | 执行方式 |
+|------|------|----------|----------|
+| **全新初始化** | `pnpm cli db seed` | 空数据库首次部署 | 从 SQL 模板建最新表 + 插入完整种子数据 + 时间戳跳到最新 |
+| **增量升级** | `pnpm cli db alteration deploy <version>` | 已有数据库升级 | 逐个执行 Alteration 脚本，每步事务内原子更新 |
 
 ---
 
-## 一、多租户架构基础
+## 一、多租户架构基础（代码事实）
 
 ### 1.1 租户数据模型
 
-[tenants.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/schemas/src/models/tenants.ts) 定义了租户表结构：
+[tenants.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/schemas/src/models/tenants.ts)
 
 ```sql
 create table tenants (
-  id varchar(21) not null,              -- 租户ID (如 'admin', 'default')
-  db_user varchar(128),                 -- 数据库角色名
-  db_user_password varchar(128),        -- 数据库角色密码
-  name varchar(128) not null default 'My Project',
-  tag varchar(64) not null default 'Development',
-  created_at timestamptz not null default(now()),
-  is_suspended boolean not null default false,
+  id                  varchar(21)  not null,  -- 租户ID: 'admin' | 'default' | 6位随机
+  db_user             varchar(128),           -- 对应的PostgreSQL角色名
+  db_user_password    varchar(128),           -- 角色密码
+  name                varchar(128) not null default 'My Project',
+  tag                 varchar(64)  not null default 'development',
+  created_at          timestamptz  not null default(now()),
+  is_suspended        boolean      not null default false,
   primary key (id),
   constraint tenants__db_user unique (db_user)
 );
 ```
 
-每个租户对应一个独立的 PostgreSQL 数据库角色，通过 RLS 实现数据隔离。
+**关键点**：`tenants` 表自己也启用 RLS，策略是 `using (db_user = current_user)`，租户只能看到自己那一行记录（且只允许读 `id`、`db_user` 两列）。
 
-### 1.2 租户数据库元数据
+### 1.2 租户数据库角色体系
 
-[tenant.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/toolkit/core-kit/src/models/tenant.ts) 中 `createTenantDatabaseMetadata()` 负责生成租户数据库角色信息：
+[tenant.ts (core-kit)](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/toolkit/core-kit/src/models/tenant.ts)
 
-```typescript
-export const createTenantDatabaseMetadata = (
-  databaseName: string,
-  tenantId = generateTenantId()
-): TenantDatabaseMetadata => {
-  const parentRole = `logto_tenant_${databaseName}`;
-  const role = `logto_tenant_${databaseName}_${tenantId}`;
-  const password = generateStandardId(32);
-
-  return { id: tenantId, parentRole, role, password };
-};
+角色命名规则：
+```
+基础角色:        logto_tenant_{database}       (noinherit, 授予所有表权限，但对tenants和systems表有严格限制)
+租户角色(继承):  logto_tenant_{database}_{tenantId}  (inherit login, in role 基础角色)
 ```
 
-**命名规则**：
-- 基础角色：`logto_tenant_{database}`
-- 租户角色：`logto_tenant_{database}_{tenantId}`
+**数据库权限矩阵**（来自 [multi-tenancy-rls.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/schemas/alterations/1.0.0_rc.1-1675788753-multi-tenancy-rls.ts#L61-L99)）：
 
-### 1.3 行级安全 (RLS) 触发机制
+| 对象 | 基础角色权限 | RLS 策略 |
+|------|-------------|----------|
+| 所有业务表 (20+) | SELECT/INSERT/UPDATE/DELETE | `tenant_id = (select id from tenants where db_user = current_user)` |
+| `tenants` 表 | 仅 SELECT (id, db_user) | `db_user = current_user`（只能看到自己这行） |
+| `systems` 表 | 所有权限被收回 | 无（租户完全不可见） |
 
-在 [add-admin-tenant.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/schemas/alterations/1.0.0_rc.1-1676115897-add-admin-tenant.ts#L112-L125) 中定义了 `set_tenant_id()` 触发器函数：
+### 1.3 set_tenant_id() 触发器自动注入 tenant_id
 
+**初始版本** ([add-tenant-id-trigger.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/schemas/alterations/1.0.0_rc.0-1674032095.6-add-tenant-id-trigger.ts#L24-L38))：
 ```sql
-create or replace function set_tenant_id() returns trigger as
-$$ begin
-  if new.tenant_id is not null then
-    return new;
-  end if;
-
+create function set_tenant_id() returns trigger as $$ begin
   select tenants.id into new.tenant_id
-    from tenants
-    where tenants.db_user = current_user;
-
+    from tenants where ('tenant_user_' || tenants.id) = current_user;
+  if new.tenant_id is null then new.tenant_id := 'default'; end if;
   return new;
 end; $$ language plpgsql;
 ```
 
-该触发器会在插入数据时自动根据当前数据库角色设置 `tenant_id`，确保数据归属正确。
-
-### 1.4 多租户表结构改造
-
-[multi-tenancy.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/schemas/alterations/1.0.0_rc.0-1674032095.5-multi-tenancy.ts) 是多租户改造的核心脚本，为所有业务表添加 `tenant_id` 列：
-
-- 为 20+ 张业务表添加 `tenant_id` 列并关联外键
-- 重建所有索引，添加 `tenant_id` 作为前缀
-- 重建所有唯一约束，包含 `tenant_id` 确保租户内唯一性
+**修正版本**（[add-admin-tenant.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/schemas/alterations/1.0.0_rc.1-1676115897-add-admin-tenant.ts#L112-L125)，与 `db_user` 列对齐后）：
+```sql
+create or replace function set_tenant_id() returns trigger as $$ begin
+  if new.tenant_id is not null then return new; end if;      -- 手动指定优先
+  select tenants.id into new.tenant_id
+    from tenants where tenants.db_user = current_user;      -- 否则按当前DB角色推断
+  return new;
+end; $$ language plpgsql;
+```
 
 ---
 
-## 二、Alteration 迁移系统
+## 二、运行时租户归属（关键！最易混淆的部分）
 
-### 2.1 Alteration 脚本类型定义
+**重要原则：Admin Tenant 是"控制平面"，存储所有租户的管理元数据；普通租户是"数据平面"，存储用户自己的业务数据。**
 
-[alteration.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/schemas/src/types/alteration.ts) 定义了迁移脚本接口：
+### 2.1 Default Tenant (tenant_id = 'default') 内存储的数据
+
+Default 租户是 OSS 版本唯一的**业务租户**（数据平面）。它的数据包括：
+
+| 数据类型 | 具体内容 | 代码位置 |
+|----------|---------|----------|
+| Management API (OSS 用) | resource: `https://default.logto.app/api`, scope: `all`, 内部 admin 角色 | `defaultManagementApi` in [management-api.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/schemas/src/seeds/management-api.ts#L39-L75) |
+| OIDC 配置 | `oidc.privateKeys`, `oidc.cookieKeys` | `seedOidcConfigs()` |
+| Sign-in Experience | 默认 SIE 配置 | `createDefaultSignInExperience()` |
+| ID Token 配置 | 默认 ID Token 配置 | `createDefaultIdTokenConfig()` |
+| Account Center | 默认 AC 配置 | `createDefaultAccountCenter()` |
+| 业务用户 | 普通注册用户（非管理员） | `users` 表 |
+| 用户创建的应用/资源/角色/连接器等 | 用户在 Console 中创建的一切 | 各业务表 |
+| Logto Configs | `adminConsole` 引导状态、`oidc.*` 等 | `logto_configs` 表 |
+| 管理员 Legacy 角色 (OSS) | `default:admin` 角色，用于 OSS 版本首次管理员登录 | `seedLegacyManagementApiUserRole()` |
+
+### 2.2 Admin Tenant (tenant_id = 'admin') 内存储的数据
+
+Admin Tenant 是**控制平面**，存储的东西远多于普通租户——所有租户的管理元数据都在这里。
+
+#### A. 所有租户的 Management API 定义 + Proxy 角色
+
+这是最容易搞错的：**每个租户的 Management API Resource 定义，都建在 Admin Tenant 里**，而不是在租户自己的表里。
 
 ```typescript
-export type AlterationScript = {
-  beforeUp?: (connection: CommonQueryMethods) => Promise<void>;    // 非事务性前置操作
-  beforeDown?: (connection: CommonQueryMethods) => Promise<void>;  // 非事务性回滚前置操作
-  up: (connection: DatabaseTransactionConnection) => Promise<void>;    // 事务性升级
-  down: (connection: DatabaseTransactionConnection) => Promise<void>;  // 事务性回滚
+// createAdminDataInAdminTenant(tenantId) — 资源在 admin 租户中
+{
+  resource: { tenantId: 'admin', indicator: `https://${tenantId}.logto.app/api` },
+  scopes:   [{ tenantId: 'admin', name: 'all' }],
+  role:     { tenantId: 'admin', id: `m-${tenantId}`, name: `machine:mapi:${tenantId}` }
+}
+```
+
+[management-api.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/schemas/src/seeds/management-api.ts#L127-L149)
+
+所以 Admin Tenant 中至少有 **两套** Management API 定义（初始时）：
+- `https://default.logto.app/api` + `m-default` 角色（M2M proxy 角色）
+- `https://admin.logto.app/api` + `m-admin` 角色（M2M proxy 角色）
+
+每个还有相应的 M2M 应用（`m-{tenantId}`）和应用角色绑定，用于 Cloud 场景通过 mapi-proxy 转发请求。
+
+#### B. Me API（Admin Tenant 自己的 API）
+
+```typescript
+{
+  resource: { tenantId: 'admin', indicator: 'https://admin.logto.app/me' },
+  scopes:   [{ tenantId: 'admin', name: 'all' }],
+  role:     { tenantId: 'admin', name: 'user' }   // 登录 Console 的普通用户角色
+}
+```
+
+[management-api.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/schemas/src/seeds/management-api.ts#L151-L178)
+
+#### C. Cloud API
+
+```typescript
+resource: 'https://cloud.logto.io/api'  (tenant_id: admin)
+scopes:
+  - create:tenant                      → 分配给 user 角色
+  - manage:tenant:self                 → 分配给 user 角色
+  - manage:tenant                      → 分配给 admin:admin 角色
+  - send:sms / send:email              → 分配给 tenantApplication 角色
+  - fetch:custom:jwt                   → 分配给 tenantApplication 角色
+  - report:subscription:updates        → 分配给 tenantApplication 角色
+  - manage:affiliate / create:affiliate
+  - access:mcp:api
+```
+
+[cloud-api.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/schemas/src/seeds/cloud-api.ts#L13-L88)
+
+#### D. 管理角色体系（都在 Admin Tenant 中）
+
+| 角色名 | 类型 | 作用 | 创建位置 |
+|--------|------|------|----------|
+| `{tenantId}:admin` (例: `default:admin`, `admin:admin`) | M2M/User | 租户管理员角色，持有对应该租户 Management API 的 `all` scope | Alteration `seed-for-admin-tenant.ts` |
+| `machine:mapi:{tenantId}` (id: `m-{tenantId}`) | M2M | Management API Proxy 用的 M2M 角色，持有对应该租户 API 的 `all` scope | Alteration `sync-tenant-orgs.ts` / Seed `createAdminDataInAdminTenant()` |
+| `user` | User | Admin Tenant 普通用户角色，持有 Me API 的 `all` + Cloud API 的 `create:tenant` + `manage:tenant:self` | Alteration `add-admin-tenant.ts` |
+| `tenantApplication` (后更名为 AdminTenantRole.TenantApplication) | M2M | 代表业务租户向 Logto Cloud 发送请求的 M2M 角色 | Alteration `m2m-app-for-tenants.ts` |
+| Logto Management API access | M2M | OSS 用的预配置 M2M 访问角色，在 default 租户中 | `seedPreConfiguredManagementApiAccessRole()` |
+
+#### E. 租户组织 (Tenant Organizations)
+
+所有租户的组织也存在 Admin Tenant 中（每个租户对应一个 Organization 记录）：
+
+```
+organizations 表 (tenant_id = 'admin'):
+  id        name
+  t-default 'Tenant default'
+  t-admin   'Tenant admin'
+```
+
+组织模板同样在 Admin Tenant 中：
+```
+organization_roles (tenant_id = 'admin'):
+  id            name
+  admin         admin          → 所有 8 个 scopes (read/write/delete data, read/invite/remove member, update member role, manage tenant)
+  collaborator  collaborator   → 5 个 scopes (read/write/delete data, read member)
+
+organization_scopes (tenant_id = 'admin'):
+  id                    name
+  read-data             read:data
+  write-data            write:data
+  delete-data           delete:data
+  read-member           read:member
+  invite-member         invite:member
+  remove-member         remove:member
+  update-member-role    update:member:role
+  manage-tenant         manage:tenant
+```
+
+[tenant-organization.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/schemas/src/types/tenant-organization.ts)
+
+Admin 用户的权限 = 其在某租户组织中的角色（而非 `{tenantId}:admin` 角色）——这是 `sync-tenant-orgs.ts` 引入的新体系。
+
+#### F. Admin Tenant 自身的配置
+
+Admin Tenant 作为一个租户，也需要自己的业务配置：
+- OIDC 配置（私钥、cookie keys）
+- Admin Tenant Sign-in Experience
+- Admin Console 配置（`logto_configs` 中 key=`adminConsole`, tenant_id=`admin`）
+- ID Token 配置
+- Account Center 配置
+
+#### G. 管理员用户
+
+所有登录 Admin Console 的用户，**其 `users` 记录在 Admin Tenant 中**（无论他管理的是哪个租户）。用户和租户的关系通过 `organization_user_relations` + `organization_role_user_relations` 表建立（都在 Admin Tenant 中）。
+
+**小结图示**：
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  Admin Tenant (控制平面, tenant_id = 'admin')                    │
+│  • 所有租户的 Management API 资源 + Proxy 角色/应用               │
+│    - default 租户的 API:  https://default.logto.app/api          │
+│    - admin 租户的 API:    https://admin.logto.app/api            │
+│  • Me API:                  https://admin.logto.app/me           │
+│  • Cloud API:               https://cloud.logto.io/api           │
+│  • 管理员用户 (users 表)                                           │
+│  • 管理角色体系:  default:admin, admin:admin, user,              │
+│                  machine:mapi:*, tenantApplication               │
+│  • 所有租户组织 + 组织模板 (roles/scopes/membership)              │
+│  • 每个租户的 Mapi Proxy M2M 应用 + Cloud Service M2M 应用       │
+│  • Admin Console SPA 应用                                         │
+│  • 两个租户的 adminConsole 引导配置                                │
+│  • Admin Tenant 自己的 OIDC/SIE/AC/ID Token 配置                 │
+└──────────────────────────────────────────────────────────────────┘
+                              │
+                              │  管理权限关系（组织成员关系表实现）
+                              ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  Default Tenant (数据平面, tenant_id = 'default')                │
+│  • 普通注册用户 (users 表)                                        │
+│  • 用户创建的应用/资源/角色/连接器/自定义短语等                   │
+│  • Management API (OSS 版本用, 本地直接访问)                      │
+│  • OIDC / SIE / ID Token / AC 配置                               │
+│  • Logto Configs (adminConsole 引导状态等)                        │
+│  • 业务日志 / 会话 / 密码码等                                     │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 三、Alteration 迁移系统
+
+### 3.1 脚本类型定义
+
+[alteration.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/schemas/src/types/alteration.ts)
+
+```typescript
+type AlterationScript = {
+  beforeUp?:   (CommonQueryMethods)          => Promise<void>;   // 事务外执行
+  beforeDown?: (CommonQueryMethods)          => Promise<void>;   // 事务外执行
+  up:         (DatabaseTransactionConnection) => Promise<void>;   // 事务内执行
+  down:       (DatabaseTransactionConnection) => Promise<void>;   // 事务内执行
 };
 ```
 
-**重要说明**：
-- `up/down` 在事务中执行，失败可自动回滚
-- `beforeUp/beforeDown` 在事务外执行，用于无法包装在事务中的操作（如 `CREATE INDEX CONCURRENTLY`）
+**事务模型**：每个脚本的 `up/down` + `updateDatabaseTimestamp` 包在一个事务里，原子性有保障。但 `beforeUp/beforeDown` 是事务外的，失败可能留下半成品。
 
-### 2.2 迁移执行流程
+### 3.2 执行引擎
 
-[index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/cli/src/commands/database/alteration/index.ts) 是迁移命令的核心实现：
+[index.ts (alteration command)](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/cli/src/commands/database/alteration/index.ts#L64-L123)
 
-#### 部署流程 (`deployAlteration()`)
-
-```typescript
-const deployAlteration = async (
-  pool: DatabasePool,
-  { path: filePath, filename }: AlterationFile,
-  action: 'up' | 'down' = 'up'
-) => {
-  const { up, down, beforeUp, beforeDown } = await importAlterationScript(filePath);
-  const timestamp = getTimestampFromFilename(filename);
-
-  if (action === 'up') {
-    if (beforeUp) {
-      await beforeUp(pool);  // 非事务性步骤
-    }
-
-    await pool.transaction(async (connection) => {
-      await up(connection);  // 事务性升级
-      await updateDatabaseTimestamp(connection, timestamp);  // 更新版本号
-    });
-  }
-  // ... down 逻辑类似
-};
+```
+deployAlteration(file, 'up'):
+  1. import script → { beforeUp, up }
+  2. if beforeUp:  await beforeUp(pool)       // 事务外！
+  3. begin transaction:
+       a. await up(connection)
+       b. await updateDatabaseTimestamp(connection, timestamp)
+     commit
 ```
 
-**关键特性**：
-1. 每个 `up` 操作在独立事务中执行
-2. 事务内同时更新数据库时间戳，确保原子性
-3. 失败时根据是否有 `beforeUp` 提示不同的恢复策略
-
-#### 命令入口
-
-CLI 支持三种操作：
-- `list` - 列出所有可用的迁移脚本
-- `deploy [version]` - 部署迁移到指定版本
-- `rollback [version]` - 回滚到指定版本
-
-### 2.3 迁移版本管理
-
-[utils.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/cli/src/commands/database/alteration/utils.ts) 处理脚本文件解析：
-
-**文件命名规则**：
-```
-{version}-{timestamp}-{description}.ts
-```
-
-示例：
+**脚本文件命名**：`{semver}-{unix_timestamp}[.sub]-{description}.ts`
 - `1.0.0_rc.1-1676115897-add-admin-tenant.ts`
-- `next-1780906060-add-verification-code-policy.ts`
+- `next-1780906060-add-verification-code-policy.ts` （`next` 表示还未绑定到正式版本）
+- 时间戳是**秒级**（10 位），可用 `.1` 创建子版本
 
-**时间戳提取**：
-- 支持 `1676115897` (10位秒级时间戳)
-- 支持 `1676115897.1` (带小数的子版本)
+### 3.3 数据库版本追踪
 
-### 2.4 数据库版本追踪
+[system.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/cli/src/queries/system.ts#L52-L69)
 
-[system.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/cli/src/queries/system.ts) 中 `updateDatabaseTimestamp()` 将版本信息存储在 `systems` 表：
+存储在 `systems` 表，key = `AlterationState`，value = `{ timestamp: number, updatedAt: string }`。
 
-```typescript
-const value: AlterationState = {
-  timestamp,
-  updatedAt: new Date().toISOString(),
-};
+### 3.4 启动前置检查
 
-await connection.query(
-  sql`
-    insert into ${table} (key, value) 
-      values (${AlterationStateKey.AlterationState}, ${sql.jsonb(value)})
-      on conflict (key) do update set value=excluded.value
-  `
-);
-```
+[preconditions.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/core/src/env-set/preconditions.ts) 在 Core 启动时强制检查：
 
-### 2.5 运行时前置检查
+1. **无未部署的 Alteration**：比较 `systems` 表的时间戳和文件系统脚本时间戳，有差异直接报错
+2. **所有业务表启用 RLS**：`pg_tables` 里除了 `systems` 和 `service_logs` 外，`rowsecurity` 必须为 true
 
-[preconditions.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/core/src/env-set/preconditions.ts) 在 Core 启动时检查：
-
-1. **检查未部署的迁移**：`checkAlterationState()` 比较文件系统和数据库的时间戳
-2. **检查 RLS 启用状态**：`checkRowLevelSecurity()` 确保所有业务表都启用了行级安全
+这保证了 Core 不会在 Schema 版本不匹配的情况下运行。
 
 ---
 
-## 三、Admin Tenant 创建流程
+## 四、Admin Tenant 相关 Alteration 脚本时间线（按执行顺序）
 
-Admin Tenant 的创建涉及 **两个连续的 Alteration 脚本**，分别在 `1.0.0-rc.1` 版本中引入。
+> **注意**：这 23 个脚本是在多次版本升级中逐步引入的。新部署时用 Seed 跳过全部，直接建最终状态。只有已有数据库升级时才需要逐个执行。
 
-### 3.1 阶段一：创建 Admin Tenant 基础结构
+### 阶段 1：多租户底层架构（`1.0.0_rc.0`）
 
-脚本：[1.0.0_rc.1-1676115897-add-admin-tenant.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/schemas/alterations/1.0.0_rc.1-1676115897-add-admin-tenant.ts)
+| # | 时间戳 | 脚本 | 核心操作 |
+|---|--------|------|----------|
+| 1 | `1674032095.3` | [tenant-table.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/schemas/alterations/1.0.0_rc.0-1674032095.3-tenant-table.ts) | 创建 `tenants` 表；插入 `id='default'` 行（此时还没有 db_user 列） |
+| 2 | `1674032095.5` | [multi-tenancy.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/schemas/alterations/1.0.0_rc.0-1674032095.5-multi-tenancy.ts) | 16 张业务表加 `tenant_id` 列 + 外键 + 重建索引/约束（tenant_id 前缀）|
+| 3 | `1674032095.6` | [add-tenant-id-trigger.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/schemas/alterations/1.0.0_rc.0-1674032095.6-add-tenant-id-trigger.ts) | 创建 `set_tenant_id()` 函数；为 17 张表创建 `BEFORE INSERT` 触发器 |
 
-**执行步骤**：
+### 阶段 2：RLS 启用 + Default Tenant 角色（`1.0.0_rc.1`）
 
-1. **更新触发器函数** - 修改 `set_tenant_id()` 使用新的角色匹配规则
-2. **更新用户表约束** - 将用户名、邮箱、电话的唯一约束改为租户内唯一
-3. **更新资源标识** - 将 `https://api.logto.io` 改为 `https://default.logto.app/api`
-4. **创建 Admin Tenant**：
-   ```sql
-   insert into tenants (id, db_user, db_user_password)
-     values ('admin', 'logto_tenant_{db}_admin', {password});
-   
-   create role logto_tenant_{db}_admin with inherit login
-     password '{password}'
-     in role logto_tenant_{db};
-   ```
-5. **初始化默认租户的 Management API 数据**：
-   - 创建 `https://default.logto.app/api` 资源
-   - 创建 `all` scope
-   - 创建 `default:admin` 角色并关联 scope
-6. **初始化 Admin Tenant 的 Me API 数据**：
-   - 创建 `https://admin.logto.app/me` 资源
-   - 创建 `all` scope
-   - 创建 `user` 角色并关联 scope
+| # | 时间戳 | 脚本 | 核心操作 |
+|---|--------|------|----------|
+| 4 | `1675788753` | [multi-tenancy-rls.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/schemas/alterations/1.0.0_rc.1-1675788753-multi-tenancy-rls.ts) | ① tenants 表加 `db_user` 列 ② 创建 `logto_tenant_{db}` 基础角色并授/收权限 ③ `tenants` 表启用 RLS ④ 20 张业务表启用 RLS + 创建 tenant_id policy ⑤ 为 `default` 租户创建 `logto_tenant_{db}_default` 登录角色，写入 `tenants.db_user/db_user_password` |
 
-### 3.2 阶段二：Seed Admin Tenant 数据
+### 阶段 3：创建 Admin Tenant + 迁移管理员（`1.0.0_rc.1`）
 
-脚本：[1.0.0-1677765137-seed-for-admin-tenant.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/schemas/alterations/1.0.0-1677765137-seed-for-admin-tenant.ts)
+| # | 时间戳 | 脚本 | 核心操作 |
+|---|--------|------|----------|
+| 5 | `1676115897` | [add-admin-tenant.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/schemas/alterations/1.0.0_rc.1-1676115897-add-admin-tenant.ts) | **Admin Tenant 诞生** ① 重写 `set_tenant_id()`（改用 `db_user` 匹配） ② `users` 表唯一约束改为 tenant_id 内唯一 ③ 资源标识 `api.logto.io` → `default.logto.app/api` ④ 插入 tenants 表 `id='admin'` 行 ⑤ 创建 `logto_tenant_{db}_admin` 登录角色 ⑥ **在 admin 租户中**创建 default 租户的 Management API（`default:admin` 角色 + `all` scope） ⑦ **在 admin 租户中**创建 Me API（`user` 角色） |
+| 6 | `1676190092` | [migrate-admin-data.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/schemas/alterations/1.0.0_rc.1-1676190092-migrate-admin-data.ts) | ① 为 admin 租户生成 OIDC 私钥 + cookie keys ② 找出所有有 `admin` 角色的用户 ③ 验证这些用户没有多余角色（否则要求用户手动处理） ④ 从 `users_roles` 删除角色 ⑤ 将这些用户的 `users/logs/oidc_model_instances` 的 tenant_id 从 `default` → `admin` ⑥ 在 admin 租户中给它们分配 `default:admin` + `user` 两个角色 |
 
-**执行步骤**：
+### 阶段 4：Admin Management API + Console 配置（`1.0.0`）
 
-1. **创建 Admin Management API**：
-   - 资源：`https://admin.logto.app/api` (管理 Admin Tenant 自身)
-   - 资源：`https://cloud.logto.io/api` (Cloud 相关操作)
-   - 创建 `admin:admin` 角色，分配 Admin API 的 `all` scope
-   - 给 `user` 角色分配 Cloud API 的 `create:tenant` scope
+| # | 时间戳 | 脚本 | 核心操作 |
+|---|--------|------|----------|
+| 7 | `1677208902` | [update-admin-console-config.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/schemas/alterations/1.0.0-1677208902-update-admin-console-config.ts) | 数据迁移：更新 `logto_configs` 中 adminConsole 配置字段结构 |
+| 8 | `1677765137` | [seed-for-admin-tenant.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/schemas/alterations/1.0.0-1677765137-seed-for-admin-tenant.ts) | **完善 Admin Tenant 控制面能力** ① 在 admin 租户中创建 `https://admin.logto.app/api`（Admin Tenant 自己的 Management API） ② 在 admin 租户中创建 `https://cloud.logto.io/api`（Cloud API）+ `create:tenant` scope ③ 创建 `admin:admin` 角色，分配 Admin API 的 `all` scope ④ 给 `user` 角色分配 Cloud API 的 `create:tenant` scope ⑤ 在 admin 租户的 `logto_configs` 中插入 key=`adminConsole` 的初始配置 |
+| 9 | `1677907982` | [allow-admin-create-multiple-tenants.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/schemas/alterations/1.0.0-1677907982-allow-admin-create-multiple-tenants.ts) | Cloud API 增加 `manage:tenant` scope，分配给 `admin:admin` 角色 |
+| 10 | `1678425761` | [m2m-app-for-tenants.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/schemas/alterations/1.0.0-1678425761-m2m-app-for-tenants.ts) | ① Cloud API 增加 `send:sms` / `send:email` scopes ② 创建 `tenantApplication` 角色（M2M），分配短信/邮件 scope ③ 给 `admin:admin` 角色也分配这两个 scope ④ **遍历已有租户（除admin外）**，为每个在 admin 租户中创建一个 Cloud Service M2M 应用，并绑定 `tenantApplication` 角色 |
 
-2. **初始化 Admin Console 配置**：
-   ```sql
-   insert into logto_configs (tenant_id, key, value)
-   values ('admin', 'adminConsole', {
-     language: 'en',
-     appearanceMode: 'system',
-     livePreviewChecked: false,
-     applicationCreated: false,
-     signInExperienceCustomized: false,
-     passwordlessConfigured: false,
-     selfHostingChecked: false,
-     communityChecked: false,
-     m2mApplicationCreated: false,
-   });
-   ```
+### 阶段 5：后续增强和修复（`1.5.0` 及以后）
 
-### 3.3 阶段三：迁移现有 Admin 用户
+| # | 时间戳 | 脚本 | 核心操作 |
+|---|--------|------|----------|
+| 11 | `1684382842` | `1.5.0-...-add-name-tag-created-at-for-tenants-table.ts` | tenants 表增加 `name`, `tag`, `created_at` 列 |
+| 12 | `1684837981` | `1.5.0-...-add-manage-tenant-self-scope-to-user-role.ts` | Cloud API 增加 `manage:tenant:self` scope，分配给 `user` 角色 |
+| 13 | `1692088012` | `1.8.0-...-add-is-suspend-column-to-tenants-table.ts` | tenants 表增加 `is_suspended` 列 |
+| 14 | `1702544178` | [sync-tenant-orgs.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/schemas/alterations/1.13.0-1702544178-sync-tenant-orgs.ts) | **租户组织体系上线**：① 在 admin 租户中创建组织模板 (owner/admin/member 3 角色 + 7 个 scopes) ② 为每个租户创建组织记录（id=`t-{tenantId}`） ③ 查找已有 `%:admin` 角色的用户，建立组织成员关系并分配 `owner` 角色 ④ 为每个租户创建 Mapi Proxy M2M 角色（`m-{tenantId}` = `machine:mapi:{tenantId}`）并绑定对应该租户 Management API 的 `all` scope ⑤ 为每个租户创建 Mapi Proxy M2M 应用（id=`m-{tenantId}`）并绑定角色 |
+| 15 | `1703230000` | [update-tenant-roles.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/schemas/alterations/1.13.0-1703230000-update-tenant-roles.ts) | 组织角色重构：① 删除 `owner` 角色，把所有 owner 变成 admin ② `admin` 角色增加 `manage:tenant` scope 权限 ③ `member` 角色增加 `delete:data` scope（并改名为 Collaborator 在后续版本） |
+| 16-23 | 后续 | 若干小脚本 | 包括增加 read:member scope、Cloud API 增加更多 scope、tenants 表权限调整、为 admin 租户启用 MFA/Account Center/组织 MFA 策略、增加索引等 |
 
-脚本：[1.0.0_rc.1-1676190092-migrate-admin-data.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/schemas/alterations/1.0.0_rc.1-1676190092-migrate-admin-data.ts)
+### 时间线图示
 
-**执行步骤**：
-
-1. **为 Admin Tenant 初始化 OIDC 配置** - 生成私钥和 Cookie 密钥
-2. **查找 Admin 用户** - 查询具有 `admin` 角色的用户
-3. **验证用户角色** - 确保 Admin 用户没有其他角色（否则需要用户手动处理）
-4. **数据迁移**：
-   - 从 `users_roles` 中删除这些用户的角色关联
-   - 将这些用户的 `tenant_id` 从 `default` 改为 `admin`
-   - 迁移相关的 `logs` 和 `oidc_model_instances` 数据
-5. **重新分配角色** - 在 Admin Tenant 中为这些用户分配 `default:admin` 和 `user` 角色
-
----
-
-## 四、Seed 命令中的租户初始化
-
-### 4.1 Seed 总流程
-
-[index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/cli/src/commands/database/seed/index.ts) 中 `seedByPool()` 是入口：
-
-```typescript
-export const seedByPool = async (pool: DatabasePool, options: SeedByPoolOptions) => {
-  await pool.transaction(async (connection) => {
-    const latestTimestamp = await getLatestAlterationTimestamp();
-    
-    // 1. 创建所有表
-    const tableInfo = await createTables(connection, encryptBaseRole);
-    
-    // 2. 插入种子数据
-    await seedTables(connection, latestTimestamp, cloud, options);
-    
-    // 3. Cloud 专属数据
-    if (cloud) {
-      await seedCloud(connection);
-    }
-    
-    // 4. 测试数据
-    if (test) {
-      await seedTest(connection);
-    }
-  });
-};
 ```
-
-**关键设计**：
-- 获取最新的 alteration 时间戳，seed 完成后直接设置到该版本
-- 整个过程在单个事务中执行，失败全部回滚
-- Seed 数据后数据库时间戳直接跳到最新，无需逐个执行 alteration
-
-### 4.2 创建表结构
-
-[tables.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/cli/src/commands/database/seed/tables.ts#L93-L150) 中 `createTables()`：
-
-1. 从 `@logto/schemas/tables` 目录读取所有 `.sql` 文件
-2. 根据 `init_order` 注释确定执行顺序
-3. 支持三个生命周期钩子：
-   - `before_all` - 创建表前执行（如创建基础角色）
-   - `after_each` - 每张表创建后执行（如启用 RLS、设置权限）
-   - `after_all` - 所有表创建后执行
-
-### 4.3 种子数据准备
-
-[tables.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/cli/src/commands/database/seed/tables.ts#L152-L231) 中 `seedTables()` 是核心：
-
-#### Default Tenant 初始化
-```typescript
-await createTenant(connection, defaultTenantId);           // 创建 default 租户
-await seedOidcConfigs(connection, defaultTenantId);        // 初始化 OIDC 配置
-await seedAdminData(connection, defaultManagementApi);     // 初始化 Management API
-await seedPreConfiguredManagementApiAccessRole(...);       // 创建预配置的访问角色
-```
-
-#### Admin Tenant 初始化
-```typescript
-await createTenant(connection, adminTenantId);             // 创建 admin 租户
-await seedOidcConfigs(connection, adminTenantId);          // 初始化 OIDC 配置
-await seedAdminData(connection, createAdminDataInAdminTenant(defaultTenantId));  // default 租户的管理 API
-await seedAdminData(connection, createAdminDataInAdminTenant(adminTenantId));    // admin 租户的管理 API
-await seedAdminData(connection, createMeApiInAdminTenant());                    // Me API
-await seedAdminData(connection, cloudData, ...cloudAdditionalScopes);            // Cloud API
-```
-
-#### 通用配置
-- 创建 `tenant-application` 角色（用于 M2M 应用访问 Cloud API）
-- 创建 Admin Console 配置（default 和 admin 两个租户）
-- 创建 ID Token 配置
-- 创建 Sign-in Experience 配置
-- 创建 Admin Console 应用
-- 创建 Account Center 配置
-
-#### 租户组织初始化
-[tenant-organizations.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/cli/src/commands/database/seed/tenant-organizations.ts) 中 `seedTenantOrganizations()`：
-
-1. **初始化组织模板**：
-   - 创建 TenantRole (Admin, Member, Collaborator) 对应的组织角色
-   - 创建 TenantScope 对应的组织 scope
-   - 建立角色与 scope 的关联关系
-
-2. **创建租户组织**：
-   - 为 `default` 和 `admin` 两个租户各创建一个组织
-   - 组织 ID 与租户 ID 有固定映射关系
-
-#### Management API Proxy 应用
-
-[tenant.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/cli/src/commands/database/seed/tenant.ts#L125-L152) 中 `seedManagementApiProxyApplications()`：
-
-为 `default` 和 `admin` 租户各创建一个 M2M 应用，作为 Management API 的代理，并分配对应的 proxy 角色。
-
-### 4.4 租户创建函数
-
-[tenant.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/cli/src/commands/database/seed/tenant.ts#L27-L42) 中 `createTenant()`：
-
-```typescript
-export const createTenant = async (pool: CommonQueryMethods, tenantId: string) => {
-  const database = await getDatabaseName(pool, true);
-  const { parentRole, role, password } = createTenantDatabaseMetadata(database, tenantId);
-  
-  // 插入 tenants 表记录
-  await pool.query(insertInto({ id: tenantId, dbUser: role, dbUserPassword: password }, 'tenants'));
-  
-  // 创建 PostgreSQL 角色
-  await pool.query(sql`
-    create role ${sql.identifier([role])} with inherit login
-      password '${sql.raw(password)}'
-      in role ${sql.identifier([parentRole])};
-  `);
-};
+1.0.0_rc.0                          1.0.0_rc.1                         1.0.0                  1.13+
+    │                                   │                                  │                      │
+    ├ 1674032095.3  tenants 表          ├ 1675788753  RLS + default 角色   ├ 1677208902 Console 配  ├ 租户组织
+    ├ 1674032095.5  16表+tenant_id     ├ 1676115897  创建 admin 租户      │   置结构迁移         ├ 组织角色调整
+    └ 1674032095.6  触发器             ├ 1676190092  迁移 admin 用户      ├ 1677765137  Admin API └ ...
+                                      │                                ├ 1677907982  manage:tenant
+                                      │                                └ 1678425761  M2M app per tenant
+                                      ▼
+                               Admin Tenant 诞生
 ```
 
 ---
 
-## 五、运行时租户解析
+## 五、Seed 命令中租户初始化的实际执行路径
 
-[tenant.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/core/src/utils/tenant.ts) 中 `getTenantId()` 负责从请求 URL 解析租户 ID：
+> Seed 不执行任何 Alteration 脚本。它直接读取最新的 SQL 模板建表，然后按**最新的 Schema + 最新的数据规范**一次性插入所有数据。
+
+### 5.1 整体流程
+
+[seed/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/cli/src/commands/database/seed/index.ts#L20-L58)
+
+```typescript
+seedByPool(pool, options):
+  transaction {
+    latestTimestamp = getLatestAlterationTimestamp()  // 读文件系统，不读DB
+    createTables(connection)                           // 1. 建表
+    seedTables(connection, latestTimestamp, cloud)     // 2. 插种子数据（下面展开）
+    if cloud: seedCloud(connection)                   // 3. Cloud 专属
+    if test:  seedTest(connection)                    // 4. 测试数据
+  }
+```
+
+### 5.2 createTables — 建表
+
+[seed/tables.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/cli/src/commands/database/seed/tables.ts#L93-L150)
 
 ```
-请求 URL → 匹配规则 → 租户ID
+1. 从 @logto/schemas/tables/*.sql 读取所有建表 SQL（包括最新列结构，如 name/tag/is_suspended）
+2. 按 init_order 注释排序
+3. 执行 before_all.sql：创建 logto_tenant_{db} 基础角色等
+4. 顺序执行各 CREATE TABLE SQL
+5. 对每个表执行 after_each.sql（若表 SQL 未标记 /* no_after_each */）：
+   - 启用 RLS
+   - 创建 set_tenant_id 触发器
+   - 给基础角色授权
+   - 创建 RLS policy
+6. 执行 after_all.sql
+```
+
+**结果**：`tenants` 表、所有业务表、触发器、RLS 策略、基础角色都就位。
+
+### 5.3 seedTables — 插入种子数据（完整展开）
+
+[seed/tables.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/cli/src/commands/database/seed/tables.ts#L152-L231)
+
+按执行顺序，下面是每个步骤的**实际 tenant_id** 归属：
+
+#### Step 1：Default Tenant 基础
+
+```
+createTenant(default):
+  → tenants 表插入 id='default', db_user='logto_tenant_{db}_default'
+  → 创建 PostgreSQL 登录角色
+
+seedOidcConfigs(default):
+  → logto_configs (tenant_id='default'): oidc.privateKeys, oidc.cookieKeys
+
+seedAdminData(defaultManagementApi):
+  // 注意！defaultManagementApi.tenantId = 'default'
+  // 这是 OSS 版本直接使用的 Management API（位于 default 租户）
+  → resources        (tenant_id='default'): https://default.logto.app/api
+  → scopes           (tenant_id='default'): all
+  → roles            (tenant_id='default'): name='admin' (内部角色)
+  → roles_scopes     (tenant_id='default'): admin 角色绑定 all scope
+
+seedPreConfiguredManagementApiAccessRole(default):
+  // OSS 预配置的 M2M 访问角色
+  → roles            (tenant_id='default'): 'Logto Management API access'
+```
+
+#### Step 2：Admin Tenant 基础
+
+```
+createTenant(admin):
+  → tenants 表插入 id='admin', db_user='logto_tenant_{db}_admin'
+  → 创建 PostgreSQL 登录角色
+
+seedOidcConfigs(admin):
+  → logto_configs (tenant_id='admin'): oidc.privateKeys, oidc.cookieKeys
+```
+
+#### Step 3：Admin Tenant 中的控制面数据（核心！）
+
+```
+seedAdminData(createAdminDataInAdminTenant(defaultTenantId)):
+  // default 租户的 Management API 在 Admin 控制面中的定义（供 mapi-proxy 用）
+  → resources        (tenant_id='admin'):   https://default.logto.app/api
+  → scopes           (tenant_id='admin'):   all
+  → roles            (tenant_id='admin'):   id='m-default', name='machine:mapi:default'
+  → roles_scopes     (tenant_id='admin'):   m-default 角色绑定 all scope
+
+seedAdminData(createAdminDataInAdminTenant(adminTenantId)):
+  // admin 租户自己的 Management API 在自己控制面中的定义
+  → resources        (tenant_id='admin'):   https://admin.logto.app/api
+  → scopes           (tenant_id='admin'):   all
+  → roles            (tenant_id='admin'):   id='m-admin', name='machine:mapi:admin'
+  → roles_scopes     (tenant_id='admin'):   m-admin 角色绑定 all scope
+
+seedAdminData(createMeApiInAdminTenant()):
+  → resources        (tenant_id='admin'):   https://admin.logto.app/me
+  → scopes           (tenant_id='admin'):   all
+  → roles            (tenant_id='admin'):   name='user' (User 类型)
+  → roles_scopes     (tenant_id='admin'):   user 角色绑定 all scope
+
+seedAdminData(cloudData, ...cloudAdditionalScopes):
+  // cloudData.role = { tenantId='admin', name='user' }（不是创建新角色，而是对已存在的 user 角色加 scope）
+  → resources        (tenant_id='admin'):   https://cloud.logto.io/api
+  → scopes           (tenant_id='admin'):   create:tenant, manage:tenant:self
+                                               send:sms, send:email, fetch:custom:jwt,
+                                               report:subscription:updates,
+                                               create:affiliate, manage:affiliate
+  → roles_scopes     (tenant_id='admin'):   user 角色绑定 create:tenant + manage:tenant:self
+```
+
+#### Step 4：Tenant Application 角色
+
+```
+createTenantApplicationRole() → 插入 roles 表:
+  → roles (tenant_id='admin'): name='tenantApplication' (M2M)
+
+assignScopesToRole(admin, applicationRole.id, send:sms, send:email, fetch:custom:jwt, report:...):
+  → roles_scopes (tenant_id='admin'): tenantApplication 角色绑定这 4 个 scopes
+```
+
+#### Step 5：并行插入一批配置数据和应用
+
+```
+Promise.all [
+  seedLegacyManagementApiUserRole:
+    // OSS 专用：在 admin 租户中创建 name='default:admin' 的 Legacy 用户角色，
+    // 关联到 default 租户 Management API 的 all scope（这里的资源和 scope 在 admin 租户中）
+    → roles            (tenant_id='admin'):  name='default:admin'
+    → roles_scopes     (tenant_id='admin'):  该角色关联 default API 的 all scope
+
+  seedTenantCloudServiceApplication(default):
+    // 为 default 租户创建 Cloud Service M2M 应用，绑定 tenantApplication 角色
+    → applications     (tenant_id='admin'):  name='Cloud Service', customClientMetadata={tenantId:'default'}
+    → applications_roles (tenant_id='admin'): 应用绑定 tenantApplication 角色
+
+  // 以下 4 项的 tenant_id 都是参数传入：
+  createDefaultAdminConsoleConfig(default) → logto_configs (tenant_id='default')
+  createDefaultAdminConsoleConfig(admin)   → logto_configs (tenant_id='admin')
+  createDefaultIdTokenConfig(default)      → logto_configs (tenant_id='default')
+  createDefaultIdTokenConfig(admin)        → logto_configs (tenant_id='admin')
+  createDefaultSignInExperience(default)   → sign_in_experiences (tenant_id='default')
+  createAdminTenantSignInExperience()      → sign_in_experiences (tenant_id='admin')
+  createDefaultAdminConsoleApplication()   → applications (tenant_id='admin'): SPA, id='admin-console'
+  createDefaultAccountCenter(default)      → account_centers (tenant_id='default')
+  createAdminTenantAccountCenter()         → account_centers (tenant_id='admin')
+]
+```
+
+#### Step 6：租户组织 + Mapi Proxy 应用
+
+```
+Promise.all [
+  seedTenantOrganizations:
+    // 组织模板
+    → organization_roles   (tenant_id='admin'):  admin, collaborator 两个角色
+    → organization_scopes  (tenant_id='admin'):  8 个 scopes
+    → organization_role_scope_relations (上述关联)
+    // 两个租户的组织
+    → organizations        (tenant_id='admin'):  id='t-default', 't-admin'
+
+  seedManagementApiProxyApplications:
+    // 为 default 和 admin 各创建一套 Mapi Proxy M2M 应用（这些应用在 Alteration 中是 sync-tenant-orgs.ts 才创建的）
+    → applications         (tenant_id='admin'):  id='m-default', 'm-admin'
+    → applications_roles   (tenant_id='admin'):  两个应用分别绑定 m-default、m-admin 角色
+]
+```
+
+#### Step 7：版本标记
+
+```
+updateDatabaseTimestamp(latestTimestamp)
+  → systems 表: key=AlterationState, value={timestamp: 最新脚本的时间戳}
+```
+
+Seed 完成后，数据库的时间戳直接等于所有脚本中最新那个，Core 启动检查通过。
+
+### 5.4 对比：Alteration 升级 vs Seed 初始化
+
+| 事项 | Alteration 升级路径 | Seed 初始化路径 |
+|------|---------------------|-----------------|
+| 建表方式 | 先有旧表，每步 `ALTER TABLE` | 直接执行最新 SQL 模板 |
+| Admin Tenant 创建 | `add-admin-tenant.ts` (脚本#5) 中单独建 | `createTenant(admin)` 在 seedTables 中直接插入 |
+| Admin 用户迁移 | `migrate-admin-data.ts` (脚本#6) 从 default 迁走用户 | 无（初始数据库没有用户） |
+| Management API 定义位置 | 分两批：先 `add-admin-tenant.ts` 建 default 的，后 `seed-for-admin-tenant.ts` 建 admin 自己的 | 一批同时建：`createAdminDataInAdminTenant(default)` + `createAdminDataInAdminTenant(admin)` |
+| default 租户中是否也有 Management API | 没有（Alteration 时代只有 admin 租户中有一份） | **有**！`seedAdminData(defaultManagementApi)` 在 default 租户中额外建了一份（OSS 本地用） |
+| 租户组织 | `sync-tenant-orgs.ts` (脚本#14) 中遍历已有租户创建 | `seedTenantOrganizations()` 直接为 default 和 admin 建两个组织 |
+| Mapi Proxy 应用 | `sync-tenant-orgs.ts` 遍历已有租户创建 | `seedManagementApiProxyApplications()` 为两个初始租户创建 |
+| Cloud Service 应用 | `m2m-app-for-tenants.ts` (脚本#10) 遍历非 admin 租户创建 | `seedTenantCloudServiceApplication(default)` 为 default 创建 |
+| 执行事务粒度 | 每个脚本一个事务 | 整个 Seed 过程一个事务 |
+| 时间戳更新 | 每执行一个脚本更新一次 | 最后一次性更新到最新 |
+
+---
+
+## 六、运行时租户解析流程
+
+[core/src/utils/tenant.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/core/src/utils/tenant.ts#L87-L129)
+
+Core 服务收到请求时，按以下优先级解析 `tenant_id`：
+
+```
+HTTP 请求 URL
     │
-    ├─ 匹配 Admin URL → adminTenantId ('admin')
-    ├─ 开发模式指定 → developmentTenantId
-    ├─ 单租户模式 → defaultTenantId ('default')
-    ├─ 路径模式 → 从 URL 路径提取
-    └─ 域名模式 → 从自定义域名或通配符域名匹配
+    ▼
+1. 是否匹配 adminUrlSet（如 http://localhost:3002/）？
+   → 是 → tenant_id = 'admin'
+    │
+    ▼ 否
+2. 是否为开发环境 + 指定了 DEVELOPMENT_TENANT_ID？
+   → 是 → tenant_id = 指定值
+    │
+    ▼ 否
+3. 是否为单租户模式（IS_MULTI_TENANCY=false）？
+   → 是 → tenant_id = 'default'
+    │
+    ▼ 否（多租户）
+4. 是否为路径多租户（IS_PATH_BASED_MULTI_TENANCY=true）？
+   → 是 → 从 URL 路径片段提取
+    │
+    ▼ 否（域名多租户）
+5. 是否匹配自定义域名？查 domains 表 + Redis 缓存
+   → 是 → tenant_id = 对应租户
+    │
+    ▼ 否
+6. 是否匹配通配符域名模式（如 *.logto.app）？
+   → 是 → 从 hostname 前缀提取
 ```
 
-解析结果会通过 [koa-tenant-guard.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/core/src/middleware/koa-tenant-guard.ts) 中间件设置到请求上下文。
+解析结果通过 [koa-tenant-guard.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/65-logto/packages/core/src/middleware/koa-tenant-guard.ts) 设置到请求上下文，后续的所有查询都通过这个 tenant_id + RLS 机制限定访问范围。
 
 ---
 
-## 六、整体流程关系图
+## 七、易错点和注意事项
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                     数据库初始化 (首次部署)                      │
-├─────────────────────────────────────────────────────────────────┤
-│  pnpm cli db seed                                               │
-│    │                                                            │
-│    ├─ createTables()          → 创建所有表 + RLS 策略           │
-│    ├─ seedTables()            → 插入 default/admin 租户数据     │
-│    │   ├─ createTenant(default)                                │
-│    │   ├─ createTenant(admin)                                  │
-│    │   ├─ seedAdminData()    → API 资源、角色、scope            │
-│    │   ├─ seedTenantOrganizations()                           │
-│    │   └─ seedManagementApiProxyApplications()                │
-│    └─ updateDatabaseTimestamp() → 直接跳到最新版本              │
-└─────────────────────────────────────────────────────────────────┘
+### 7.1 Management API 的"双份"问题
 
-┌─────────────────────────────────────────────────────────────────┐
-│                        版本升级 (已有数据库)                      │
-├─────────────────────────────────────────────────────────────────┤
-│  pnpm alteration deploy <version>                                │
-│    │                                                            │
-│    ├─ getAvailableAlterations() → 比较文件与数据库时间戳        │
-│    ├─ chooseAlterationsByVersion() → 筛选要执行的脚本           │
-│    └─ 逐个执行 deployAlteration()                                │
-│         ├─ beforeUp()        → 非事务性前置操作 (可选)          │
-│         └─ transaction {                                         │
-│              up()             → 事务性升级                       │
-│              updateDatabaseTimestamp() → 更新版本号              │
-│            }                                                    │
-└────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+Seed 路径下，default 租户的 Management API 实际上有**两份**：
+- **一份在 default 租户中**：`defaultManagementApi`（OSS 本地访问用）
+- **一份在 admin 租户中**：`createAdminDataInAdminTenant('default')`（Cloud/Mapi-proxy 场景用）
 
-┌────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│                                        Admin Tenant 创建时间线                                        │
-├────────────────────────────────────────────────────────────────────────────────────────────────────────┤
-│  1.0.0_rc.0 系列                                                                                       │
-│    ├─ 1674032095.3  →  创建 tenants 表                                                                │
-│    ├─ 1674032095.5  →  为所有表添加 tenant_id 列 + RLS                                                │
-│    └─ 1674032095.6  →  添加 set_tenant_id 触发器                                                      │
-│                                                                                                        │
-│  1.0.0_rc.1 系列                                                                                       │
-│    ├─ 1676115897  →  add-admin-tenant.ts                                                              │
-│    │                  • 更新触发器函数                                                                 │
-│    │                  • 创建 admin 租户 + 数据库角色                                                  │
-│    │                  • 初始化 default 租户 Management API                                            │
-│    │                  • 初始化 admin 租户 Me API                                                      │
-│    ├─ 1676190092  →  migrate-admin-data.ts                                                            │
-│    │                  • 为 admin 租户生成 OIDC 配置                                                   │
-│    │                  • 将 admin 用户从 default 迁移到 admin 租户                                     │
-│    └─ ... (其他变更)                                                                                  │
-│                                                                                                        │
-│  1.0.0 系列                                                                                           │
-│    └─ 1677765137  →  seed-for-admin-tenant.ts                                                         │
-│                       • 创建 Admin Management API                                                     │
-│                       • 创建 Cloud API                                                                 │
-│                       • 初始化 Admin Console 配置                                                     │
-└────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-```
+两者指向同一个 indicator `https://default.logto.app/api`，但分属不同租户。前者是单租户 OSS 模式遗留，后者是多租户 Cloud 模式所需。
 
----
+### 7.2 Admin 用户归属容易搞错
 
-## 七、关键注意事项
+管理员用户的 `users` 表记录在 **admin 租户**中，而不是 default 或他管理的租户中。他和某个具体租户的权限关系，完全由 `organization_user_relations`（组织成员）和 `organization_role_user_relations`（组织角色）两张表（都在 admin 租户中）决定。
 
-### 7.1 Seed vs Alteration 的区别
+### 7.3 `tenants` 表本身的 RLS
 
-| 维度 | Seed (`pnpm cli db seed`) | Alteration (`pnpm alteration deploy`) |
-|------|--------------------------|--------------------------------------|
-| 适用场景 | 全新数据库初始化 | 已有数据库版本升级 |
-| 执行方式 | 单个事务，直接创建最新 Schema | 逐个脚本执行，每个脚本独立事务 |
-| 版本处理 | 直接跳到最新时间戳 | 逐步更新，每个脚本更新一次 |
-| 数据准备 | 完整的种子数据 | 增量数据迁移/转换 |
-| 回滚能力 | 无（事务整体回滚） | 支持 `down()` 回滚 |
+`tenants` 表也启用了 RLS，但策略特殊——租户登录角色只允许看到**自己那一行**的 `id` 和 `db_user` 两列。`systems` 表则完全禁止租户访问。`set_tenant_id` 触发器依赖此策略正常工作。
 
-### 7.2 Admin Tenant 的特殊性
+### 7.4 Alteration 的 beforeUp/beforeDown 风险
 
-1. **固定 ID**：`admin`（其他租户是自动生成的 6 位字符）
-2. **数据归属**：所有租户的管理数据（如用户角色、组织关系）都存储在 Admin Tenant 中
-3. **双角色体系**：Admin Tenant 中同时存在管理其他租户的角色和管理自身的角色
-4. **预配置角色**：
-   - `{tenantId}:admin` - 租户管理员角色
-   - `tenant-application` - M2M 应用访问 Cloud API 的角色
-   - `user` - Admin Tenant 普通用户角色
+如果脚本定义了 `beforeUp`，那部分代码在事务外执行。一旦失败，后面的事务回滚了但 `beforeUp` 的副作用可能已经生效。Logto 在错误提示中明确区分了两种情况，指引开发者如何手动处理脏数据和重新同步时间戳。
 
-### 7.3 时间戳版本控制
+### 7.5 Seed 和 Alteration 绝对不能混用
 
-- Alteration 脚本使用 **Unix 秒级时间戳** 作为版本号（10位数字）
-- 同一时间戳可通过 `.1`, `.2` 后缀创建子版本
-- `next-` 前缀表示开发中的变更，还未绑定到具体版本
-- 数据库中只存储一个整数时间戳，表示当前已部署的最新版本
-
-### 7.4 非事务性操作风险
-
-如果 alteration 包含 `beforeUp` 步骤，失败时这部分操作可能已经生效，需要：
-1. 检查数据库状态
-2. 手动修复问题
-3. 重新运行部署命令来同步状态和时间戳
+- 空数据库用 `seed`，不要跑 alteration
+- 已有数据库必须用 alteration，不要重新 seed（会破坏现有数据）
+- `checkPreconditions()` 保证了 Core 启动时 `systems.AlterationState.timestamp` 必须等于最新脚本的时间戳，不管你走哪条路径，最终时间戳必须一致。
