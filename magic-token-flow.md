@@ -516,7 +516,372 @@ Submit 逻辑在 [experience-interaction.ts](file:///d:/fz/0601-2/solo-dogfeedin
 
 ---
 
-## 八、核心文件索引
+## 八、魔法链接入口与登录衔接
+
+### 8.1 魔法链接 URL 参数
+
+魔法链接通过 OIDC 授权 URL 的额外参数传递。关键参数定义在 [oidc.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/schemas/src/consts/oidc.ts#L20-L80)：
+
+| 参数键 | 枚举值 | 说明 |
+|--------|-------|------|
+| `one_time_token` | `ExtraParamsKey.OneTimeToken` | 一次性令牌值，后端生成的随机字符串 |
+| `login_hint` | `ExtraParamsKey.LoginHint` | 登录提示，在魔法链接场景中传入邮箱地址 |
+| `prompt` | 标准 OIDC 参数 | 当值为 `login` 时强制重新认证 |
+
+魔法链接的完整 URL 格式：
+
+```
+https://<logto-domain>/oidc/auth?
+  client_id=<app-id>&
+  redirect_uri=<callback>&
+  response_type=code&
+  scope=openid+profile+email&
+  one_time_token=<token>&
+  login_hint=<email>
+```
+
+业务系统在调用 `POST /one-time-tokens` 创建令牌后，将返回的 `token` 和 `email` 拼接到 OIDC 授权 URL 中，通过邮件发送给用户。
+
+### 8.2 后端入口：koa-consent-guard 中间件
+
+当用户点击魔法链接，OIDC 授权端点接收请求后，会经过 `koaConsentGuard` 中间件处理。这是魔法链接进入 Experience SPA 的**后端网关**。
+
+核心逻辑在 [koa-consent-guard.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/core/src/middleware/koa-consent-guard.ts)。
+
+#### 8.2.1 参数提取与校验
+
+```
+从 OIDC params 中提取 one_time_token + login_hint
+  ↓
+getOneTimeTokenParams() 校验
+  ├── 两个参数必须同时存在且为 string 类型
+  └── 缺少任一参数 → 跳过 one-time-token 处理，继续正常授权流程
+```
+
+#### 8.2.2 账户切换判断（SwitchAccount）
+
+```
+获取当前 session 的登录用户 primaryEmail
+  ↓
+判断是否需要切换账户：
+  ├── 当前用户邮箱 ≠ login_hint
+  ├── 且没有 prompt=login
+  └── 且上一次提交的登录账号不匹配 login_hint
+  ↓
+满足以上所有条件 → 重定向到 /switch-account 页面
+  ↓
+不满足（邮箱匹配 / prompt=login / 上次登录匹配）→ 继续后续流程
+```
+
+重定向 URL 格式：`/switch-account?login_hint=<email>&one_time_token=<token>`
+
+#### 8.2.3 令牌预检查
+
+```
+调用 libraries.oneTimeTokens.checkOneTimeToken(token, loginHint)
+  ├── 令牌不存在 → 重定向到错误页
+  ├── 邮箱不匹配 → 重定向到错误页
+  ├── 令牌已过期 → 重定向到错误页
+  ├── 令牌已消费（token_consumed）→ 特殊处理（见下文）
+  └── 令牌已撤销 → 重定向到错误页
+```
+
+错误页重定向 URL 格式：`/one-time-token?errorMessage=<error.message>`
+
+#### 8.2.4 已消费令牌的特殊处理
+
+当令牌状态为 `Consumed` 时，存在一个**宽松放行**逻辑：
+
+```
+token_consumed 错误 + shouldContinueWithConsumedOneTimeToken() 判断
+  ├── 当前用户邮箱 === login_hint → 放行（继续 next()）
+  ├── 上次提交登录匹配 login_hint → 放行
+  └── 均不匹配 → 重定向到错误页
+```
+
+设计意图：如果用户已经用该邮箱登录了（令牌被消费），不需要再强制报错，直接放行完成授权即可。
+
+#### 8.2.5 正常流程重定向
+
+令牌预检查通过后，重定向到 Experience SPA 的 OneTimeToken 页面：
+
+```
+ctx.redirect(buildExperienceUrl(experience.routes.oneTimeToken, token, loginHint))
+→ /one-time-token?login_hint=<email>&one_time_token=<token>
+```
+
+### 8.3 前端落地页：OneTimeToken 组件
+
+路由：`/one-time-token`（不在 AppLayout 内，无导航栏）
+
+组件在 [OneTimeToken/index.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/experience/src/pages/OneTimeToken/index.tsx)。
+
+#### 8.3.1 参数解析
+
+```
+useEffect 中解析 URL 参数：
+  ├── token = params.get('one_time_token')
+  ├── email = params.get('login_hint')
+  └── errorMessage = params.get('errorMessage')
+```
+
+#### 8.3.2 前置校验与错误跳转
+
+```
+1. errorMessage 存在 → 跳转错误页
+   navigate('/one-time-token/error', { state: { errorMessage } })
+
+2. token 或 email 缺失 → 跳转错误页
+   navigate('/one-time-token/error')
+
+3. 条款同意策略为 Manual → 弹出条款确认
+   ├── 用户拒绝 → 跳转错误页
+   └── 用户同意 → 继续
+
+4. 防重复提交
+   └── isSubmitted.current 标志位
+```
+
+#### 8.3.3 令牌验证（signInWithOneTimeToken）
+
+```
+asyncSignInWithOneTimeToken({
+  token,
+  identifier: { type: SignInIdentifier.Email, value: email }
+})
+  ↓
+内部调用链：
+  1. initInteraction(InteractionEvent.SignIn)
+     → PUT /experience { interactionEvent: 'SignIn' }
+
+  2. POST /experience/verification/one-time-token/verify
+     → 创建 OneTimeTokenVerification 记录
+     → 校验并消费令牌
+     → 返回 { verificationId }
+```
+
+#### 8.3.4 登录衔接：先登录后注册
+
+这是魔法链接流程的**核心衔接逻辑**：
+
+```
+验证通过获得 verificationId
+  ↓
+submit(verificationId)  // 尝试用 SignIn 事件登录
+  ↓
+asyncIdentifyUserAndSubmit({ verificationId })
+  → POST /experience/identification { verificationId }
+  → POST /experience/submit
+  ↓
+判断结果：
+  ├── 成功 → redirectTo(result.redirectTo) 完成登录
+  └── 错误码 user.user_not_exist → 注册兜底
+```
+
+#### 8.3.5 注册兜底（registerWithOneTimeToken）
+
+当用户不存在时，自动切换为注册流程：
+
+```
+registerWithOneTimeToken(verificationId)
+  ↓
+1. 条款同意校验（agreeToTermsPolicy）
+   ├── Manual 策略 → 弹出条款确认
+   │   └── 拒绝 → 跳转错误页 terms_acceptance_required_description
+   └── Automatic 或已同意 → 继续
+
+2. asyncRegisterWithVerifiedIdentifier(verificationId)
+  ↓
+内部调用链：
+  a. updateInteractionEvent(InteractionEvent.Register)
+     → PUT /experience/interaction-event { interactionEvent: 'Register' }
+
+  b. identifyAndSubmitInteraction({ verificationId })
+     → POST /experience/identification { verificationId }
+     → POST /experience/submit
+```
+
+**关键点**：令牌已被验证（verified=true），注册时不需要重新验证邮箱。Verification Record 从 SignIn 交互保留到 Register 交互，`verified` 状态不重置。
+
+#### 8.3.6 服务端对注册兜底的支持
+
+在 [sign-in-experience-validator.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/core/src/routes/experience/classes/libraries/sign-in-experience-validator.ts#L103-L128) 中：
+
+```typescript
+public async guardInteractionEvent(event: InteractionEvent, hasVerifiedOneTimeToken = false) {
+  switch (event) {
+    case InteractionEvent.Register: {
+      assertThat(
+        signInMode !== SignInMode.SignIn ||
+          // 即使注册被关闭，One-Time Token 验证通过后仍允许注册
+          hasVerifiedOneTimeToken,
+        new RequestError({ code: 'auth.forbidden', status: 403 })
+      );
+      break;
+    }
+  }
+}
+```
+
+这意味着：**即使管理员将 signInMode 设为 SignIn（禁止注册），通过魔法链接验证的新用户仍可注册**。这是 One-Time Token 的特权——它保证了通过邮件验证身份的新用户不会因为注册开关被拦截。
+
+同时，在 `guardSignInVerificationMethod` 中，OneTimeToken 类型**不做方法级别校验**：
+
+```typescript
+case VerificationType.OneTimeToken:
+case VerificationType.Social: {
+  // No need to verify one-time token and social verification methods
+  break;
+}
+```
+
+这是因为 One-Time Token 不在常规的 signIn.methods 配置中，它是一种独立的认证通道。
+
+### 8.4 前端入口的多路汇聚
+
+魔法链接的用户可以从多个页面进入 OneTimeToken 流程，系统会自动做路由汇聚：
+
+#### 8.4.1 从 SignIn 页面进入
+
+[SignIn/index.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/experience/src/pages/SignIn/index.tsx#L117-L124)：
+
+```typescript
+if (params.get(ExtraParamsKey.OneTimeToken)) {
+  return <Navigate replace to={`/${experience.routes.oneTimeToken}?${params.toString()}`} />;
+}
+```
+
+#### 8.4.2 从 Register 页面进入
+
+[Register/index.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/experience/src/pages/Register/index.tsx#L46-L53)（RegisterFooter 中）：
+
+```typescript
+if (params.get(ExtraParamsKey.OneTimeToken)) {
+  return <Navigate replace to={`/${experience.routes.oneTimeToken}?${params.toString()}`} />;
+}
+```
+
+#### 8.4.3 从 SwitchAccount 页面进入
+
+[SwitchAccount/index.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/experience/src/pages/SwitchAccount/index.tsx#L79-L89)：
+
+用户点击"Continue as"按钮后，导航到 OneTimeToken 页面：
+
+```typescript
+onClick={() => {
+  navigate(
+    { pathname: `/${experience.routes.oneTimeToken}`, search: `?${params.toString()}` },
+    { replace: true }
+  );
+}}
+```
+
+#### 8.4.4 从后端 consent-guard 直接重定向
+
+[koa-consent-guard.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/core/src/middleware/koa-consent-guard.ts#L163)：
+
+```
+ctx.redirect(buildExperienceUrl(experience.routes.oneTimeToken, token, loginHint))
+```
+
+### 8.5 错误页跳转
+
+错误页路由：`/one-time-token/error`（在 AppLayout 内）
+
+组件在 [Error.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/experience/src/pages/OneTimeToken/Error.tsx)。
+
+支持三种错误信息展示方式：
+
+| state 字段 | 类型 | 说明 |
+|-----------|------|------|
+| `title` | i18n key | 错误标题 |
+| `message` | i18n key | 错误描述 |
+| `errorMessage` | string | 后端原始错误消息（rawMessage） |
+
+默认展示：`error.invalid_link` / `error.invalid_link_description`
+
+触发错误跳转的场景：
+
+1. **后端预检查失败**：令牌过期/已消费/已撤销/邮箱不匹配/不存在
+2. **前端参数缺失**：URL 中缺少 `one_time_token` 或 `login_hint`
+3. **令牌验证 API 报错**：任何非 `user.user_not_exist` 的错误
+4. **条款拒绝**：Manual 策略下用户拒绝条款
+
+### 8.6 SwitchAccount 账户切换页面
+
+路由：`/switch-account`
+
+组件在 [SwitchAccount/index.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/experience/src/pages/SwitchAccount/index.tsx)。
+
+**触发条件**：用户已有活跃会话，但魔法链接的 `login_hint` 与当前登录用户邮箱不匹配。
+
+页面展示：
+- 当前登录用户的头像和邮箱
+- "Continue as [login_hint]" 按钮 → 跳转到 OneTimeToken 页面继续验证
+- "Back to current account" 链接 → 返回上一页
+
+### 8.7 完整链路图
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│                    魔法链接完整链路（从点击到登录）                    │
+├────────────────────────────────────────────────────────────────────┤
+│                                                                    │
+│  用户点击魔法链接                                                    │
+│  https://logto.dev/oidc/auth?...&one_time_token=xxx&login_hint=yy │
+│                                                                    │
+│                          ↓                                         │
+│                                                                    │
+│  [后端 koaConsentGuard]                                            │
+│    ├── 提取 one_time_token + login_hint                            │
+│    ├── 无效参数 → 正常授权流程                                      │
+│    ├── 已有会话 + 邮箱不匹配 + 无 prompt=login → /switch-account    │
+│    ├── checkOneTimeToken 失败 → /one-time-token?errorMessage=xxx  │
+│    │     └── token_consumed + 当前邮箱匹配 → 放行(next)             │
+│    └── 预检查通过 → 重定向到 /one-time-token                        │
+│                                                                    │
+│                          ↓                                         │
+│                                                                    │
+│  [前端 OneTimeToken 页面]                                          │
+│    ├── 参数缺失 → /one-time-token/error                            │
+│    ├── errorMessage 存在 → /one-time-token/error                   │
+│    ├── Manual 条款 → 用户拒绝 → /one-time-token/error              │
+│    └── 参数合法 → 继续                                              │
+│                                                                    │
+│                          ↓                                         │
+│                                                                    │
+│  [signInWithOneTimeToken API 调用]                                 │
+│    1. initInteraction(SignIn) → PUT /experience                    │
+│    2. POST /experience/verification/one-time-token/verify          │
+│       → 校验并消费令牌 → 返回 verificationId                       │
+│                                                                    │
+│                          ↓                                         │
+│                                                                    │
+│  [submit: 尝试登录]                                                 │
+│    identifyAndSubmitInteraction({ verificationId })                │
+│      → POST /experience/identification                            │
+│      → POST /experience/submit                                    │
+│    ├── 成功 → redirectTo → 完成登录                                 │
+│    └── user.user_not_exist → 注册兜底                               │
+│                                                                    │
+│                          ↓ (注册兜底)                               │
+│                                                                    │
+│  [registerWithOneTimeToken]                                        │
+│    1. 条款校验（Manual 策略）                                       │
+│    2. updateInteractionEvent(Register)                             │
+│       → PUT /experience/interaction-event                          │
+│       → guardInteractionEvent: 即使 signInMode=SignIn 也允许注册    │
+│    3. identifyAndSubmitInteraction({ verificationId })             │
+│       → POST /experience/identification                            │
+│       → POST /experience/submit                                    │
+│    └── 成功 → redirectTo → 完成注册并登录                           │
+│                                                                    │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 九、核心文件索引
 
 ### 8.1 One-Time Token 相关
 
