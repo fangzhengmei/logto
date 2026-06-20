@@ -122,13 +122,30 @@ API 响应
 
 ### 2.1 核心模块
 
+#### 共用模块（社交连接器 + 企业 SSO 连接器共用）
+
 | 模块 | 文件路径 | 职责 |
 |------|---------|------|
-| Secret Encryption | [secret-encryption.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/utils/secret-encryption.ts) | AES-256-GCM 加密/解密、Token 序列化 |
-| Secret Queries | [secret.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/queries/secret.ts) | Secrets 表与关联表的数据库操作 |
-| Social Library | [social.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/libraries/social.ts) | 社交连接器 Token 存储与刷新 |
-| Third-Party Tokens API | [third-party-tokens.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/account/third-party-tokens.ts) | 用户获取第三方 Access Token 的接口 |
+| Secret Encryption | [secret-encryption.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/utils/secret-encryption.ts) | AES-256-GCM 加密/解密、Token 序列化（两种连接器完全共用） |
+| Secret Queries | [secret.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/queries/secret.ts) | Secrets 主表及两张关联表的数据库 CRUD 操作 |
+| Third-Party Tokens API | [third-party-tokens.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/account/third-party-tokens.ts) | 用户获取第三方 Access Token 的统一接口（内部根据类型分发） |
+| Provision Library | [provision-library.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/experience/classes/libraries/provision-library.ts) | 新用户注册时，将暂存的 Token 写入 secrets 表（两种连接器都走这里） |
+
+#### 社交连接器专属模块
+
+| 模块 | 文件路径 | 职责 |
+|------|---------|------|
+| Social Library | [social.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/libraries/social.ts) | 社交连接器 Token 存储、读取与刷新 |
 | Social Verification | [social-verification.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/experience/classes/verifications/social-verification.ts) | 社交登录验证流程中的 Token 暂存 |
+
+#### 企业 SSO 连接器专属模块
+
+| 模块 | 文件路径 | 职责 |
+|------|---------|------|
+| SSO Connector Library | [sso-connector.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/libraries/sso-connector.ts) | 企业 SSO 连接器 Token 存储与刷新 |
+| Enterprise SSO Verification | [enterprise-sso-verification.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/experience/classes/verifications/enterprise-sso-verification.ts) | 企业 SSO 登录验证流程中的 Token 暂存 |
+| SSO Verification Helper | [single-sign-on.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/libraries/verification-helpers/single-sign-on.ts) | SSO 身份验证、Token 获取与加密 |
+| Admin User Enterprise SSO API | [enterprise-sso.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/admin-user/enterprise-sso.ts) | 管理员查询用户 SSO 身份及脱敏 Token 信息 |
 
 ### 2.2 数据存储：`secrets` 表及关联表
 
@@ -150,17 +167,52 @@ create table secrets (
 );
 ```
 
-关联表 1：`secret_social_connector_relations`（社交连接器关联）
+#### 连接器配置表
+
+社交连接器和企业 SSO 连接器使用**两张独立的配置表**，但都有 `enable_token_storage` 开关字段：
+
+**社交连接器配置表**：`connectors`（详见 1.2 节）
+- 敏感配置 `config` 字段明文存储在 JSONB 中
+
+**企业 SSO 连接器配置表**：[sso_connectors.sql](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/schemas/tables/sso_connectors.sql)
+```sql
+create table sso_connectors (
+  tenant_id varchar(21) not null references tenants,
+  id varchar(128) not null primary key,
+  provider_name varchar(128) not null,                 -- OIDC / SAML / AzureAD / Okta 等
+  connector_name varchar(128) not null,
+  config jsonb not null default '{}'::jsonb,            -- 连接器配置（明文存储）
+  domains jsonb not null default '[]'::jsonb,           -- SSO 邮箱域名
+  branding jsonb not null default '{}'::jsonb,          -- SSO 品牌配置
+  sync_profile boolean not null default FALSE,
+  enable_token_storage boolean not null default FALSE,  -- 是否启用 Token 存储（仅 OIDC 类型有效）
+  created_at timestamptz not null default(now())
+);
+```
+
+#### 关联表（两张关联表共用 `secrets` 主表）
+
+**关联表 1**：`secret_social_connector_relations`（社交连接器关联）
 - `secret_id` → 关联 `secrets.id`
-- `connector_id` → 关联 `connectors.id`
+- `connector_id` → 关联 `connectors.id`（社交连接器实例 ID）
 - `target` → 社交连接器目标标识（如 `github`、`google`）
 - `identity_id` → 第三方用户 ID
 
-关联表 2：`secret_enterprise_sso_connector_relations`（企业 SSO 连接器关联）
-- `secret_id` → 关联 `secrets.id`
-- `sso_connector_id` → 关联企业 SSO 连接器
-- `issuer` → IdP Issuer
-- `identity_id` → 第三方用户 ID
+**关联表 2**：[secret_enterprise_sso_connector_relations.sql](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/schemas/tables/secret_enterprise_sso_connector_relations.sql)（企业 SSO 连接器关联）
+```sql
+create table secret_enterprise_sso_connector_relations (
+  tenant_id varchar(21) not null references tenants,
+  secret_id varchar(21) not null references secrets (id),
+  sso_connector_id varchar(128) not null references sso_connectors (id),
+  issuer varchar(256) not null,                         -- IdP Issuer
+  identity_id varchar(128) not null,                    -- 第三方用户 ID
+  primary key (tenant_id, secret_id),
+  -- 级联删除触发器：删除 SSO 连接器时自动删除关联的 secrets
+  -- 级联删除触发器：删除用户 SSO 身份时自动删除关联的 secrets
+);
+```
+
+> 🔑 **关键共用点**：社交连接器和企业 SSO 连接器共享同一张 `secrets` 主表（相同的加密字段结构），区别仅在于关联表不同。
 
 ### 2.3 加密算法：信封加密（Envelope Encryption）
 
@@ -295,21 +347,133 @@ queries.secrets.findSocialTokenSetSecretByUserIdAndTarget(userId, target)
 - `decryptTokens`：[secret-encryption.ts#L89-L92](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/utils/secret-encryption.ts#L89-L92)
 - `refreshTokenSetSecret`：[social.ts#L213-L271](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/libraries/social.ts#L213-L271)
 
+#### 流程三：用户企业 SSO 登录时存储 Token
+
+> 与社交连接器相比，企业 SSO 的 Token 加密、序列化、反序列化逻辑**完全共用**，区别在于：
+> - 仅 OIDC 类型的企业 SSO 连接器支持 Token 存储（SAML 不支持）
+> - Token 存储在用户**注册/登录流程中自动完成**，无需用户额外主动请求
+> - 关联表使用 `secret_enterprise_sso_connector_relations`
+
+```
+用户完成企业 SSO 登录回调
+    ↓
+[EnterpriseSsoVerification.verify()] 验证 SSO 身份
+    ↓
+[verifySsoIdentity()] 内部处理：
+    ├─ 检查 connectorInstance instanceof OidcConnector（SAML 跳过）
+    ├─ 检查 connectorData.enable_token_storage
+    ├─ 调用 OidcConnector.getUserInfo() 获取 userInfo + tokenResponse
+    ├─ 检查 tokenResponse.access_token 存在
+    └─ 加密 Token：encryptAndSerializeTokenResponse(tokenResponse)
+        └─ 输出：{ encryptedTokenSetBase64, metadata }（与社交连接器共用加密逻辑）
+    ↓
+Token 暂存到 EnterpriseSsoVerification.encryptedTokenSet 字段
+    ↓
+（用户提交交互，创建新用户或登录现有用户时）
+    ↓
+[ProvisionLibrary.createUser()] 或交互提交时：
+    ├─ 读取 enterpriseSsoConnectorTokenSetSecret
+    └─ [ssoConnectors.upsertEnterpriseSsoTokenSetSecret()] 写入数据库
+        ├─ deserializeEncryptedSecret(encryptedTokenSetBase64)
+        │   └─ 反序列化得到 { iv, authTag, ciphertext, encryptedDek }（共用）
+        └─ queries.secrets.upsertEnterpriseSsoTokenSetSecret()
+            ├─ 事务：删除同 user + ssoConnectorId + issuer + identityId 的旧 secret
+            ├─ 插入 secrets 表（共用主表）
+            └─ 插入 secret_enterprise_sso_connector_relations 表（企业 SSO 专属关联表）
+```
+
+**核心代码**：
+- `verifySsoIdentity`：[single-sign-on.ts#L157-L221](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/libraries/verification-helpers/single-sign-on.ts#L157-L221)
+- `upsertEnterpriseSsoTokenSetSecret`：[sso-connector.ts#L229-L256](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/libraries/sso-connector.ts#L229-L256)
+- `ProvisionLibrary.createUser`：[provision-library.ts#L58-L136](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/experience/classes/libraries/provision-library.ts#L58-L136)
+- `getTokenSetSecret`：[enterprise-sso-verification.ts#L222-L236](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/experience/classes/verifications/enterprise-sso-verification.ts#L222-L236)
+
+#### 流程四：管理员/用户读取企业 SSO Access Token
+
+> 与社交连接器共用 `decryptTokens`、`encryptTokenResponse` 及刷新策略，差异在于查询入口和关联表。
+
+```
+管理员请求：GET /api/users/:userId/sso-identities/:ssoConnectorId?includeTokenSecret=true
+    或
+用户请求：GET /api/account/identities/:ssoConnectorId/access-token
+    ↓
+[enterprise-sso.ts / third-party-tokens.ts]
+    ↓
+queries.secrets.findEnterpriseSsoTokenSetSecretByUserIdAndConnectorId(userId, ssoConnectorId)
+    └─ JOIN secrets + secret_enterprise_sso_connector_relations
+    ↓
+[获取 Access Token]
+    ├─ decryptTokens({ iv, encryptedDek, ciphertext, authTag })
+    │   └─ 共用解密逻辑：使用 KEK 解密得到明文 TokenSet
+    ├─ 检查 access_token 是否过期（metadata.expiresAt）
+    │   ├─ 未过期：直接返回
+    │   └─ 已过期：
+    │       ├─ 有 refresh_token → 调用 ssoConnectors.refreshTokenSetSecret()
+    │       │   ├─ 校验 OidcConnector && enableTokenStorage
+    │       │   ├─ OidcConnector.getTokenByRefreshToken() 刷新 Token
+    │       │   ├─ encryptTokenResponse() 重新加密（共用）
+    │       │   ├─ 保留原 refresh_token（若新响应未返回）
+    │       │   └─ secrets.updateById() 更新数据库
+    │       └─ 无 refresh_token → 删除 secret，返回 401
+    └─ 返回格式化的 Access Token 响应（或 desensitizeTokenSetSecret 脱敏后返回）
+```
+
+**核心代码**：
+- `refreshTokenSetSecret`（企业 SSO 版）：[sso-connector.ts#L265-L314](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/libraries/sso-connector.ts#L265-L314)
+- `findEnterpriseSsoTokenSetSecretByUserIdAndConnectorId`：数据库查询层
+- `desensitizeTokenSetSecret`：管理员端脱敏返回，隐藏 refresh_token 和 ciphertext
+- Admin User SSO Identities API：[enterprise-sso.ts#L29-L162](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/admin-user/enterprise-sso.ts#L29-L162)
+
+#### 社交连接器 vs 企业 SSO 连接器：共用 vs 差异汇总
+
+| 模块/逻辑 | 社交连接器 | 企业 SSO 连接器 | 是否共用 |
+|----------|-----------|-----------------|---------|
+| `secrets` 主表 | ✅ 使用 | ✅ 使用 | **完全共用** |
+| AES-256-GCM 信封加密 | ✅ `encryptTokenResponse` | ✅ 同一函数 | **完全共用** |
+| Token 解密 | ✅ `decryptTokens` | ✅ 同一函数 | **完全共用** |
+| Token 序列化/反序列化 | ✅ `encryptAndSerializeTokenResponse` / `deserializeEncryptedSecret` | ✅ 同一函数 | **完全共用** |
+| Refresh Token 保留策略 | ✅ 保留原 refresh_token | ✅ 同一策略 | **完全共用** |
+| TokenSet 结构（access_token/refresh_token/id_token） | ✅ | ✅ | **完全共用** |
+| 连接器配置表 | `connectors` 表 | `sso_connectors` 表（独立） | ❌ 独立表 |
+| 关联表 | `secret_social_connector_relations` | `secret_enterprise_sso_connector_relations`（独立） | ❌ 独立表 |
+| Token 存储触发时机 | 用户主动 PUT 请求 | 用户注册/登录时自动完成 | ❌ 不同 |
+| Token 存储支持的协议类型 | OAuth 2.0 / OIDC 社交连接器 | **仅 OIDC**（SAML 不支持） | ❌ 不同 |
+| Token 刷新入口 | `socials.refreshTokenSetSecret()` | `ssoConnectors.refreshTokenSetSecret()`（独立实现） | ❌ 独立函数（逻辑相同） |
+| 查询入口（按用户查找） | `findSocialTokenSetSecretByUserIdAndTarget` | `findEnterpriseSsoTokenSetSecretByUserIdAndConnectorId` | ❌ 独立查询 |
+
 ---
 
 ## 三、职责边界对比
+
+### 3.1 Connector Helper vs Secret Vault
 
 | 维度 | Connector Helper（连接器配置） | Secret Vault（用户凭据加密） |
 |------|-------------------------------|-----------------------------|
 | **存储对象** | 连接器配置参数（`clientId`、`clientSecret`、SMTP 账号密码、API Key 等） | 用户登录后获取的第三方 Token（`access_token`、`refresh_token`、`id_token`） |
 | **所属主体** | Tenant 级（连接器是租户配置） | User 级（每个用户的第三方凭据） |
-| **存储方式** | `connectors.config` JSONB **明文**存储 | `secrets` 表 **AES-256-GCM 信封加密**存储 |
+| **存储方式** | `connectors.config` / `sso_connectors.config` JSONB **明文**存储 | `secrets` 表 **AES-256-GCM 信封加密**存储 |
 | **使用时机** | 连接器运行时（发送邮件、获取授权 URL、换取 Token） | 用户需要调用第三方 API 时 |
-| **配置开关** | 无需开关，创建连接器即存储配置 | `connectors.enable_token_storage` 控制是否启用 |
+| **配置开关** | 无需开关，创建连接器即存储配置 | `enable_token_storage` 控制是否启用 |
 | **前置依赖** | 无（创建连接器即可） | 需要配置 `SECRET_VAULT_KEK` 环境变量 |
 | **读取方式** | 通过 `getConnectorConfig()` 直接读取 JSON 明文 | 通过 `decryptTokens()` 解密后使用 |
 | **前端敏感标记** | `ConnectorConfigFormItem.isConfidential`（仅 UI 掩码） | 无（后端完全加密，前端不可见） |
-| **数据生命周期** | 随连接器创建/删除 | 随用户社交身份绑定/解除绑定 |
+| **数据生命周期** | 随连接器创建/删除 | 随用户社交/SSO 身份绑定/解除绑定 |
+
+### 3.2 社交连接器 vs 企业 SSO 连接器（Secret Vault 内部分层）
+
+| 维度 | 社交连接器 | 企业 SSO 连接器 |
+|------|-----------|-----------------|
+| **连接器配置表** | `connectors` | `sso_connectors`（独立表） |
+| **Token 关联表** | `secret_social_connector_relations` | `secret_enterprise_sso_connector_relations`（独立表） |
+| **Token 加密主表** | `secrets`（共用） | `secrets`（共用） |
+| **加密算法** | AES-256-GCM 信封加密（共用） | AES-256-GCM 信封加密（共用） |
+| **Token 结构** | `{access_token, refresh_token?, id_token?}`（共用） | 相同结构（共用） |
+| **支持协议** | OAuth 2.0 / OIDC | **仅 OIDC**（SAML 不支持 Token 存储） |
+| **Token 存储触发** | 用户主动调用 PUT API | 用户注册/登录时自动写入 |
+| **Token 刷新入口** | `socials.refreshTokenSetSecret()` | `ssoConnectors.refreshTokenSetSecret()`（独立实现，逻辑相同） |
+| **Refresh Token 保留** | 保留原 refresh_token（共用策略） | 相同策略（共用） |
+| **级联删除** | 连接器/身份删除时删除 secret | 数据库触发器自动删除关联 secret |
+| **管理员查询 API** | `/users/:userId/all-identities?includeTokenSecret=true` | `/users/:userId/sso-identities/:ssoConnectorId?includeTokenSecret=true` |
 
 ---
 
@@ -326,22 +490,34 @@ queries.secrets.findSocialTokenSetSecretByUserIdAndTarget(userId, target)
 | 字段 | 表 | 说明 |
 |------|-----|------|
 | `enable_token_storage` | `connectors` | 是否为该社交连接器启用用户 Token 持久化存储 |
-| `metadata.isTokenStorageSupported` | 连接器工厂元数据 | 连接器实现是否支持 Token 存储（需实现 `getTokenResponseAndUserInfo` 和 `getAccessTokenByRefreshToken`） |
+| `enable_token_storage` | `sso_connectors` | 是否为该企业 SSO 连接器启用用户 Token 持久化存储（仅 OIDC 类型有效） |
+| `metadata.isTokenStorageSupported` | 连接器工厂元数据（社交） | 连接器实现是否支持 Token 存储（需实现 `getTokenResponseAndUserInfo` 和 `getAccessTokenByRefreshToken`） |
+| `connectorInstance instanceof OidcConnector` | SSO 连接器运行时判断 | 企业 SSO 连接器仅 OIDC 类型支持 Token 存储，SAML 类型跳过 |
 
 ---
 
 ## 五、易错点与注意事项
 
-1. **Connector `config` 明文存储**：`clientSecret` 等敏感配置直接存储在 `connectors.config` JSONB 中，没有加密。如需加密需要额外处理。
+1. **Connector `config` 明文存储**：`clientSecret` 等敏感配置直接存储在 `connectors.config` 和 `sso_connectors.config` JSONB 中，没有加密。如需加密需要额外处理。
 
 2. **`isConfidential` ≠ 加密**：配置表单项的 `isConfidential` 字段仅影响前端 UI 展示（密码输入框掩码），不影响后端存储方式。
 
 3. **两套独立的敏感信息系统**：连接器配置和用户 Token 是完全独立的两套系统，使用不同的存储表和安全策略。
 
-4. **Token 存储的双重开关**：需要同时满足 `connectors.enable_token_storage=true` 和连接器元数据 `isTokenStorageSupported=true`，以及配置了 `SECRET_VAULT_KEK`，Token 才会被存储。
+4. **Token 存储的双重/三重开关**：
+   - 社交连接器：`connectors.enable_token_storage=true` + 连接器元数据 `isTokenStorageSupported=true` + `SECRET_VAULT_KEK` 已配置
+   - 企业 SSO 连接器：`sso_connectors.enable_token_storage=true` + 连接器是 `OidcConnector` 实例 + `SECRET_VAULT_KEK` 已配置
 
-5. **Demo 连接器配置隐藏**：在 API 响应中，Demo 连接器的 `config` 字段被置为空对象 `{}`，不返回真实配置。
+5. **SAML 企业 SSO 不支持 Token 存储**：即使 `enable_token_storage=true`，SAML 类型的企业 SSO 连接器也会跳过 Token 存储逻辑（`connectorInstance instanceof OidcConnector` 校验不通过）。
 
-6. **Well-Known 查询不含 config**：`findAllConnectorsWellKnown` 查询只返回 `id`、`metadata`、`connectorId`，不包含敏感的 `config` 字段。
+6. **社交 vs SSO Token 存储触发时机不同**：
+   - 社交连接器：用户需额外调用 `PUT /api/account/identities/:target/access-token` 主动存储
+   - 企业 SSO 连接器：在用户注册/登录流程中由 `ProvisionLibrary.createUser()` 自动完成存储
 
-7. **Refresh Token 的保留策略**：刷新 Token 时，如果第三方未返回新的 refresh_token，会保留原有 refresh_token（如 Google 的一次性 refresh_token 策略）。
+7. **Demo 连接器配置隐藏**：在 API 响应中，Demo 连接器的 `config` 字段被置为空对象 `{}`，不返回真实配置。
+
+8. **Well-Known 查询不含 config**：`findAllConnectorsWellKnown` 查询只返回 `id`、`metadata`、`connectorId`，不包含敏感的 `config` 字段。
+
+9. **Refresh Token 的保留策略**：刷新 Token 时，如果第三方未返回新的 refresh_token，会保留原有 refresh_token（如 Google 的一次性 refresh_token 策略）。社交连接器和企业 SSO 连接器共用此策略。
+
+10. **企业 SSO 级联删除通过触发器实现**：`secret_enterprise_sso_connector_relations` 表有两个 PL/pgSQL 触发器，分别在删除 `sso_connectors` 和 `user_sso_identities` 时自动清理关联的 `secrets` 记录。
