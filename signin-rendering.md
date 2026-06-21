@@ -390,9 +390,101 @@ enum SignInIdentifier {
 
 本章聚焦三个问题：**URL 标识符过滤的传输与生效链路**、**`isPasswordOnly` 与 `isPasswordPrimary` 的协同机制**、**配置组合 → 表单输出 → 提交后路由**的完整映射真值表。
 
+### 9.0 先厘清架构：两套首页、两条数据链
+
+Logto 有两个登录首页路由，它们对 URL `identifier` 参数的处理方式截然不同。理解这一点是后续所有分析的前提。
+
+| 路由 | 组件 | methods 来源 | URL identifier 过滤 | `isPasswordOnly` 数据源 |
+|------|------|-------------|-------------------|------------------------|
+| `/sign-in` | `SignIn` | `useSieMethods()` → **全部配置方法** | ❌ **完全不生效** | 全部配置方法 |
+| `/identifier-sign-in` | `IdentifierSignIn` | `useIdentifierSignInMethods()` → **URL 过滤后方法** | ✅ 生效（交集逻辑） | 全部配置方法（**注意不是过滤后方法**） |
+
+代码证明：
+
+**`/sign-in` 链路（不做 URL 过滤）**：
+
+[SignIn/index.tsx L105](file:///d:/fz/0601-2/solo-dogfeeding/code/69-logto/packages/experience/src/pages/SignIn/index.tsx#L105-L105)：
+```typescript
+const { signInMethods, socialConnectors, signInMode } = useSieMethods();
+// ↑ signInMethods 是全部配置方法，未经 URL 过滤
+```
+
+[SignIn/index.tsx L131](file:///d:/fz/0601-2/solo-dogfeeding/code/69-logto/packages/experience/src/pages/SignIn/index.tsx#L131-L131)：
+```typescript
+<Main signInMethods={signInMethods} socialConnectors={socialConnectors} />
+// ↑ 把全部方法直接传给 Main 组件作为 props
+```
+
+[SignIn/Main.tsx L18-L20](file:///d:/fz/0601-2/solo-dogfeeding/code/69-logto/packages/experience/src/pages/SignIn/Main.tsx#L18-L20)：
+```typescript
+const Main = ({ signInMethods, socialConnectors }: Props) => {
+  // signInMethods 是父组件传入的 props —— 全部方法
+  const { isPasswordOnly } = useIdentifierSignInMethods();
+  // 只从 hook 取 isPasswordOnly，不取过滤后的 methods
+```
+
+[SignIn/Main.tsx L39-L49](file:///d:/fz/0601-2/solo-dogfeeding/code/69-logto/packages/experience/src/pages/SignIn/Main.tsx#L39-L49)：
+```typescript
+if (isPasswordOnly) {
+  return <PasswordSignInForm signInMethods={signInMethods.map(({ identifier }) => identifier)} />;
+  //                                                  ↑ props（全部方法）
+}
+if (signInMethods.length > 0) {
+  return <IdentifierSignInForm signInMethods={signInMethods} />;
+  //                                          ↑ props（全部方法）
+}
+```
+
+**结论**：访问 `/sign-in?identifier=username` 时，`identifier=username` 参数对方法过滤**完全没有效果**。SmartInputField 仍然接受全部配置的标识符类型。
+
+---
+
+**`/identifier-sign-in` 链路（做 URL 过滤，但 `isPasswordOnly` 不过滤）**：
+
+[IdentifierSignIn/index.tsx L28](file:///d:/fz/0601-2/solo-dogfeeding/code/69-logto/packages/experience/src/pages/IdentifierSignIn/index.tsx#L28-L28)：
+```typescript
+const { signInMethods, isPasswordOnly } = useIdentifierSignInMethods();
+// ↑ signInMethods 是 URL 过滤后的结果
+// ↑ isPasswordOnly 是基于全部配置方法计算的
+```
+
+[use-identifier-sign-in-methods.ts L16-L47](file:///d:/fz/0601-2/solo-dogfeeding/code/69-logto/packages/experience/src/pages/IdentifierSignIn/use-identifier-sign-in-methods.ts#L16-L47)：
+```typescript
+const useIdentifierSignInMethods = () => {
+  const { signInMethods, passkeySignIn } = useSieMethods();
+  // ↑ 全局方法（全部配置）
+
+  const { identifiers } = useIdentifierParams();
+  // ↑ URL 参数解析出的标识符列表
+
+  // ① URL 过滤后的方法，赋值给局部变量 methods
+  const methods = useMemo(() => {
+    if (identifiers.length === 0) return signInMethods;
+    const filtered = signInMethods.filter(({ identifier }) => identifiers.includes(identifier));
+    return filtered.length === 0 ? signInMethods : filtered;
+  }, [identifiers, signInMethods]);
+
+  // ② isPasswordOnly 的计算——用的是全局 signInMethods，不是过滤后的 methods！
+  const isPasswordOnly = useMemo(
+    () =>
+      signInMethods.length > 0 &&
+      signInMethods.every(({ password, verificationCode }) => password && !verificationCode) &&
+      !isIdentifierFirstPasskeySignInConfig,
+    [signInMethods, isIdentifierFirstPasskeySignInConfig]  // ← 依赖的是全局 signInMethods
+  );
+
+  return { signInMethods: methods, isPasswordOnly, ... };
+  //       ↑ 返回值重命名为 signInMethods，实际是过滤后的 methods
+};
+```
+
+**关键发现**：在返回对象中，`signInMethods` 是过滤后的（赋值为局部变量 `methods`），但 `isPasswordOnly` 依赖的是**全局** `signInMethods`。两者数据源不一致。
+
+这意味着在 `/identifier-sign-in?identifier=username` 场景下，若全局配置中有任何 method 启用了 `verificationCode`，即使 URL 过滤后只剩纯密码的 username，`isPasswordOnly` 仍然是 `false`。页面仍会走两步流程（先输入标识符再输入密码），而不是直接显示密码表单。
+
 ### 9.1 URL 参数传递与标识符过滤的完整链路
 
-URL 参数在登录流程中扮演"外部引导器"的角色，涉及四类参数：`first_screen`（路由选择）、`identifier`（标识符过滤）、`login_hint`（预填）、`organization_id`/`app_id`（配置覆盖）。
+URL 参数在登录流程中扮演"外部引导器"的角色，涉及四类参数：`first_screen`（路由选择）、`identifier`（标识符过滤，仅 IdentifierSignIn 生效）、`login_hint`（预填）、`organization_id`/`app_id`（配置覆盖）。
 
 #### 9.1.1 URL 参数的生命周期
 
@@ -447,7 +539,7 @@ ky.get('/api/.well-known/sign-in-exp', {
 
 #### 9.1.3 `identifier` 参数的生效链路
 
-`identifier` 参数（如 `?identifier=email+phone`）只在聚焦首页生效，使用 **hook 级** 的交集逻辑，而非修改全局配置。
+`identifier` 参数（如 `?identifier=email+phone`）**只在聚焦首页 `/identifier-sign-in` 生效**，在 `/sign-in` 上完全被忽略。生效方式为 **hook 级** 的交集逻辑，不修改全局配置。
 
 [`useIdentifierParams`](file:///d:/fz/0601-2/solo-dogfeeding/code/69-logto/packages/experience/src/hooks/use-identifier-params.ts#L31-L37) 读取 URL 参数：
 
@@ -478,7 +570,10 @@ const methods = useMemo(() => {
 }, [identifiers, signInMethods]);
 ```
 
-**重要**：URL 过滤只作用于 `methods` 数组，不影响其它配置（如 socialConnectors、ssoConnectors、passkey 等）。因此在 IdentifierSignIn 页面上仍然可以通过 footer 的 "所有登录选项" 回到 `/sign-in` 看到完整配置。
+**重要**：
+1. URL 过滤只作用于返回值中的 `signInMethods` 字段，**不影响**同 hook 中的 `isPasswordOnly` 计算（见 §9.0）
+2. URL 过滤也不影响其它配置（如 socialConnectors、ssoConnectors、passkey 等）
+3. 在 IdentifierSignIn 页面上可以通过 footer 的 "所有登录选项" 回到 `/sign-in` 看到完整配置
 
 #### 9.1.4 `login_hint` 预填的生效链路
 
@@ -497,6 +592,8 @@ SmartInputField 的默认值来源：
 
 这个 hook 被 `IdentifierSignInForm`（[L47-L49](file:///d:/fz/0601-2/solo-dogfeeding/code/69-logto/packages/experience/src/components/IdentifierSignInForm/index.tsx#L47-L49)）和 `PasswordSignInForm`（[L46](file:///d:/fz/0601-2/solo-dogfeeding/code/69-logto/packages/experience/src/components/PasswordSignInForm/index.tsx#L46)）使用。
 
+`login_hint` 在两个首页路由上都生效，因为它不依赖 method 过滤，只依赖 SmartInputField 传入的 `enabledTypes`。
+
 ### 9.2 `isPasswordOnly` 与 `isPasswordPrimary` 的本质差异
 
 登录方式选择中，**两个布尔变量** 决定了表单输出的形态。它们作用于不同层级、服务于不同目标：
@@ -504,20 +601,20 @@ SmartInputField 的默认值来源：
 | 维度 | `isPasswordOnly` | `isPasswordPrimary` |
 |------|-----------------|---------------------|
 | **作用层级** | 页面级（`Main` 组件选择哪个表单） | method 级（提交后选择哪个验证方式） |
-| **作用域** | 所有 method 的组合判断 | 单个 method 的内部判断 |
+| **作用域** | **全部 method** 的组合判断（即使 URL 过滤也用全部） | 单个 method 的内部判断 |
 | **控制范围** | 首次渲染表单类型 | 用户点击提交后的路由 |
-| **数据源** | 所有 method 的 `password` 和 `verificationCode` 字段 | 单个 method 的 `password`、`verificationCode`、`isPasswordPrimary` 字段 |
+| **数据源** | **全局** `signInMethods` 的 `password` 和 `verificationCode` 字段 | 单个 method 的 `password`、`verificationCode`、`isPasswordPrimary` 字段 |
 | **额外条件** | 需排除 passkey 两步流程模式 | 无需额外条件 |
 | **代码位置** | [use-identifier-sign-in-methods.ts L41-L47](file:///d:/fz/0601-2/solo-dogfeeding/code/69-logto/packages/experience/src/pages/IdentifierSignIn/use-identifier-sign-in-methods.ts#L41-L47) | [use-on-submit.ts L76-L84](file:///d:/fz/0601-2/solo-dogfeeding/code/69-logto/packages/experience/src/components/IdentifierSignInForm/use-on-submit.ts#L76-L84) |
 
 #### 9.2.1 `isPasswordOnly`：决定首屏表单类型
 
 ```typescript
-// 页面级
+// 注意：此处 signInMethods 来自 useSieMethods()，是全局全部方法
 const isPasswordOnly = signInMethods.length > 0
-  // 条件 A：所有 method 都启用 password
+  // 条件 A：所有全局 method 都启用 password
   && signInMethods.every(({ password }) => password === true)
-  // 条件 B：所有 method 都禁用 verificationCode
+  // 条件 B：所有全局 method 都禁用 verificationCode
   && signInMethods.every(({ verificationCode }) => verificationCode === false)
   // 条件 C：不是 "passkey 两步流程" 模式
   && !isIdentifierFirstPasskeySignInConfig;
@@ -528,6 +625,8 @@ const isIdentifierFirstPasskeySignInConfig =
 ```
 
 **效果**：`isPasswordOnly = true` → `Main` 渲染 `PasswordSignInForm`（首屏直接显示密码框），否则渲染 `IdentifierSignInForm`（首屏只显示标识符框）。
+
+**对 `/identifier-sign-in` 页面的特殊影响**：即使 URL 过滤后只剩纯密码 method，只要全局配置中有任何 method 开启了 `verificationCode`，`isPasswordOnly` 就是 `false`，页面仍走两步流程。具体示例见 §9.3.4。
 
 #### 9.2.2 `isPasswordPrimary`：决定提交后的默认验证方式
 
@@ -566,6 +665,7 @@ password  verificationCode  isPasswordPrimary  →  提交后路由
 - 假设 passkey 配置为 `{ enabled: false }`（即 `isIdentifierFirstPasskeySignInConfig = false`），否则所有 case 都强制走 IdentifierSignInForm
 - `methods[].isPasswordPrimary` 简写为 `PP`
 - 对每个 method，`password` 简写为 `P`，`verificationCode` 简写为 `VC`
+- 对于 `/sign-in` 路由，URL `identifier` 参数不生效，不单独列
 
 #### 情形一：单一标识符 + 单一验证方式
 
@@ -603,20 +703,64 @@ password  verificationCode  isPasswordPrimary  →  提交后路由
 
 **多标识符下的 `isPasswordOnly` 判定**：只有 **全部** method 都是 `P=T, VC=F` 才成立。只要有一个 method 开启了 VC，整页就降级为 IdentifierSignInForm。即使大部分标识符都是纯密码模式，一个例外就足以改变整个页面的首屏布局。
 
-#### 情形四：URL identifier 参数过滤后的方法集
+#### 情形四：`/identifier-sign-in` 页面上 URL identifier 参数的效果
 
-假设后端配置：`[{email,P=T,VC=T}, {phone,P=T,VC=T}, {username,P=T,VC=F}]`，PP 全部为 T。
+**全局配置**：`[{email,P=T,VC=T,PP=T}, {phone,P=T,VC=T,PP=F}, {username,P=T,VC=F,PP=T}]`
 
-| URL 参数 | 过滤后 methods | `isPasswordOnly` | 首屏表单 |
-|----------|---------------|-----------------|----------|
-| （无） | email + phone + username | ❌ false（email/phone 有 VC） | IdentifierSignInForm |
-| `?identifier=email` | `[{email,P=T,VC=T}]` | ❌ false（email 有 VC） | IdentifierSignInForm |
-| `?identifier=username` | `[{username,P=T,VC=F}]` | ✅ true | PasswordSignInForm |
-| `?identifier=email+phone` | email + phone（都有 VC） | ❌ false | IdentifierSignInForm |
-| `?identifier=username+email` | username + email（email 有 VC） | ❌ false | IdentifierSignInForm |
-| `?identifier=invalid` | 回退：全部 3 个 | ❌ false | IdentifierSignInForm |
+| URL 参数 | 路由 | 过滤后 methods（传给表单） | `isPasswordOnly`（全局判定） | 首屏表单（实际渲染） | SmartInputField 接受的标识符 |
+|----------|------|--------------------------|---------------------------|---------------------|---------------------------|
+| （无） | `/sign-in` | **全部 3 个** | ❌ false（email/phone 有 VC） | IdentifierSignInForm | email + phone + username |
+| `?identifier=email` | `/sign-in` | **全部 3 个**（URL 参数被忽略） | ❌ false | IdentifierSignInForm | email + phone + username |
+| `?identifier=username` | `/sign-in` | **全部 3 个**（URL 参数被忽略） | ❌ false | IdentifierSignInForm | email + phone + username |
+| （无） | `/identifier-sign-in` | **全部 3 个**（未传 URL 参数） | ❌ false | IdentifierSignInForm | email + phone + username |
+| `?identifier=email` | `/identifier-sign-in` | `[{email,P=T,VC=T,PP=T}]` | ❌ false（全局 email 仍有 VC） | IdentifierSignInForm | email 仅 |
+| `?identifier=username` | `/identifier-sign-in` | `[{username,P=T,VC=F,PP=T}]` | ❌ **false（全局 email/phone 有 VC！）** | **IdentifierSignInForm**（两步） | **username 仅** |
+| `?identifier=email+phone` | `/identifier-sign-in` | email + phone | ❌ false | IdentifierSignInForm | email + phone |
+| `?identifier=username+email` | `/identifier-sign-in` | username + email | ❌ false | IdentifierSignInForm | username + email |
+| `?identifier=invalid` | `/identifier-sign-in` | 回退：全部 3 个 | ❌ false | IdentifierSignInForm | email + phone + username |
 
-**注意 `?identifier=username` 这一行**：原来全局有 email/phone 的 VC，导致 `isPasswordOnly=false`。但 URL 过滤后只剩下 username（纯密码），此时 `isPasswordOnly=true` → 页面从 IdentifierSignInForm 切换为 PasswordSignInForm。URL 过滤不仅改变了可选标识符的范围，**还能改变首屏表单的类型**。
+**最重要的一行：`/identifier-sign-in?identifier=username`**
+
+这是最容易误判的场景。配置分析：
+
+```
+全局配置：
+  email:    P=T, VC=T  → 不是纯密码
+  phone:    P=T, VC=T  → 不是纯密码
+  username: P=T, VC=F  → 是纯密码
+
+URL 过滤后只剩 username（纯密码）。
+但 isPasswordOnly 计算的是全局 3 个 method：
+  signInMethods.every(m => m.password && !m.verificationCode)
+  = (email:P=T,VC=F? 否) AND (phone:P=T,VC=F? 否) AND (username:P=T,VC=F? 是)
+  = false
+
+实际行为：
+  ① SmartInputField 只接受 username（来自过滤后的 methods）
+  ② 首屏是 IdentifierSignInForm（因为 isPasswordOnly=false）
+  ③ 用户输入 username → 提交
+  ④ IdentifierSignInForm.useOnSubmit 判断 username 强制走密码
+  ⑤ Navigate("/sign-in/password")
+  ⑥ SignInPassword.PasswordForm 显示密码框
+
+即使用户能输入的标识符只有纯密码的 username，仍然必须走两步流程。
+```
+
+**为什么会这样？** 从代码设计意图推断：`isPasswordOnly` 的职责是判断"当前系统整体登录方式配置是否可以简化为一步密码表单"，它是基于全局配置的粗粒度判断。URL 过滤只影响 SmartInputField 的 `enabledTypes`（细粒度控制输入选项），不改变系统级的一步/两步流程判定。
+
+如果希望 URL 过滤后 username 能直接显示 PasswordSignInForm，需要把 `isPasswordOnly` 的依赖从全局 `signInMethods` 改为过滤后的 `methods`。但当前代码不是这么实现的。
+
+#### 情形五：全局纯密码时 URL 过滤的效果
+
+**全局配置**：`[{email,P=T,VC=F,PP=T}, {username,P=T,VC=F,PP=T}]`（全部都是纯密码）
+
+| URL 参数 | 路由 | 过滤后 methods | `isPasswordOnly` | 首屏表单 | SmartInputField 接受的标识符 |
+|----------|------|--------------|-----------------|----------|---------------------------|
+| （无） | `/sign-in` | 全部 2 个 | ✅ true | PasswordSignInForm | email + username |
+| `?identifier=username` | `/sign-in` | 全部 2 个（URL 参数被忽略） | ✅ true | PasswordSignInForm | email + username |
+| `?identifier=username` | `/identifier-sign-in` | `[{username,P=T,VC=F}]` | ✅ **true（全局全部都是纯密码）** | PasswordSignInForm | username 仅 |
+
+只有当全局配置本身就是全部纯密码，且 URL 过滤也聚焦到纯密码标识符时，`/identifier-sign-in` 才会一步显示 PasswordSignInForm。此时 SmartInputField 的 enabledTypes 也被正确限制。
 
 ### 9.4 验证方式间的切换机制
 
@@ -656,42 +800,65 @@ password  verificationCode  isPasswordPrimary  →  提交后路由
 前端: SettingsProvider → setExperienceSettings() → PageContext.experienceSettings
   │
   ├─ useSieMethods()
-  │    ├─ signInMethods = 过滤空配置后的 methods[]
-  │    ├─ signInMode
-  │    ├─ socialConnectors, ssoConnectors, passkeySignIn, forgotPassword
+  │    ├─ signInMethods = 过滤空配置后的全局 methods[]  ← 全局使用
+  │    ├─ signInMode, socialConnectors, ssoConnectors, passkeySignIn, forgotPassword
   │    └─ ...
   │
   ▼
-路由组件: SignIn / IdentifierSignIn
-  │
-  ├─ useIdentifierSignInMethods()
-  │    ├─ 若 URL 有 identifier 参数 → methods = URL 交集 ∩ 配置 methods
-  │    ├─ isIdentifierFirstPasskeySignInConfig = passkey.enabled && !passkey.showPasskeyButton
-  │    └─ isPasswordOnly = 全部 method 纯密码 && 非 passkey 两步流程
-  │
-  ▼
-Main 组件（三路分支）
-  │
-  ├─ signInMethods 为空 && socialConnectors 有 → SocialSignInList
-  │
-  ├─ isPasswordOnly = true → PasswordSignInForm
-  │    ├─ SmartInputField（enabledTypes = 全部 identifiers）
-  │    ├─ PasswordInputField
-  │    ├─ 提交后: usePasswordSignIn → 直接调用密码登录 API
-  │    └─ SwitchToVerificationMethodsLink（如果 method 有 VC，显示"用验证码登录"）
-  │
-  └─ 其它 → IdentifierSignInForm
-       ├─ SmartInputField（enabledTypes = 全部 identifiers）
-       ├─ 实时监测 SSO: useSingleSignOnWatch
-       │    └─ 若邮箱命中 SSO → 按钮文案变 SSO → 提交走 SSO
-       └─ 提交后: useOnSubmit
-            ├─ SSO 检测（Email + ssoConnectors.length > 0）
-            ├─ Passkey 尝试（passkeySignIn.enabled）
-            ├─ Username → /sign-in/password（强制）
-            └─ 按当前 method 的 PP / VC / P
-                 ├─ P && (PP || !VC) → /sign-in/password
-                 └─ VC → /sign-in/verification-code
+┌─────────────────────────────────────────────────────────────────┐
+│                     路由分支（浏览器 URL）                        │
+│                                                                  │
+│  /sign-in                                          /identifier-sign-in
+│      │                                                   │
+│      ▼                                                   ▼
+│  SignIn 组件                                     IdentifierSignIn 组件
+│      │                                                   │
+│      ├─ signInMethods = useSieMethods() 全局              ├─ useIdentifierSignInMethods()
+│      │         (不做 URL 过滤)                             │     ├─ methods = URL ∩ 全局 signInMethods
+│      └─ <Main signInMethods={全局} />                      │     ├─ isPasswordOnly = 全局 signInMethods.every(...)
+│                  │                                         │     └─ 返回 { signInMethods: methods, isPasswordOnly }
+│                  ▼                                         │
+│              Main 组件                                     └─ { signInMethods: 过滤后, isPasswordOnly: 全局 }
+│                  │                                                   │
+│                  ├─ isPasswordOnly（来自 hook，基于全局）              │
+│                  │                                                   ▼
+│                  ├─ signInMethods（props，全局）                  条件渲染：
+│                  │                                                   ├─ 过滤后 methods 为空 → Navigate("/sign-in")
+│                  ▼                                                   └─ isPasswordOnly ?
+│              三路分支：                                                   PasswordSignInForm(过滤后 identifiers)
+│                ├─ 仅社交方法 → SocialSignInList                            : IdentifierSignInForm(过滤后 methods)
+│                ├─ isPasswordOnly → PasswordSignInForm(全局 identifiers)
+│                └─ 其它 → IdentifierSignInForm(全局 methods)
+└─────────────────────────────────────────────────────────────────┘
+                  │
+                  ▼
+         IdentifierSignInForm 或 PasswordSignInForm
+              │                  │
+              │                  ├─ SmartInputField（enabledTypes = 传入的 identifiers）
+              │                  ├─ PasswordInputField
+              │                  └─ 提交后: usePasswordSignIn → 直接调用密码登录 API
+              │
+              ├─ SmartInputField（enabledTypes = methods 中的 identifiers）
+              ├─ 实时监测 SSO: useSingleSignOnWatch
+              │    └─ 若邮箱命中 SSO → 按钮文案变 SSO → 提交走 SSO
+              └─ 提交后: useOnSubmit
+                   ├─ SSO 检测（Email + ssoConnectors.length > 0）
+                   ├─ Passkey 尝试（passkeySignIn.enabled）
+                   ├─ Username → /sign-in/password（强制）
+                   └─ 按当前 method 的 PP / VC / P
+                        ├─ P && (PP || !VC) → /sign-in/password
+                        └─ VC → /sign-in/verification-code
 ```
+
+### 9.6 关键设计决策总结
+
+| 决策点 | 设计选择 | 代码位置 | 影响 |
+|--------|---------|---------|------|
+| URL 过滤作用域 | 仅 IdentifierSignIn 页面 | `SignIn/index.tsx` 用 `useSieMethods` 而非 `useIdentifierSignInMethods` | `/sign-in` 忽略 identifier 参数 |
+| `isPasswordOnly` 数据源 | 始终用全局方法 | `useIdentifierSignInMethods` L43 用 `signInMethods`（全局）而非 `methods`（过滤后） | URL 过滤到纯密码也可能走两步 |
+| `isPasswordPrimary` 条件 | 仅双方式都开时生效 | `useOnSubmit` L76: `password && (PP \|\| !VC)` | 单方式时 PP 不参与判断 |
+| Username 提交后路由 | 强制走密码 | `useOnSubmit` L70-L74 | 忽略 username method 的 VC/PP |
+| Passkey 两步模式 | 强制 IdentifierSignInForm | `isIdentifierFirstPasskeySignInConfig` | passkey.enabled 但无按钮 → 全局两步 |
 
 ---
 
