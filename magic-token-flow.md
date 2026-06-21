@@ -393,48 +393,50 @@ Management API 调用
 
 ### 7.2 第一步：OIDC 授权交互与 consent 路由
 
-用户点击魔法链接后，请求并非直接进入 consent 检查，而是先经过 OIDC 授权交互流程，随后 consent 路由读取交互参数：
+用户点击魔法链接后，请求并非直接进入 consent 检查，而是先经过 OIDC Provider 处理授权请求，创建交互，再由 `interactions.url` 函数根据 `prompt.name` 重定向到对应页面。`koaConsentGuard` 只挂载在 `/consent` 路由上，不挂在授权端点上：
 
 ```
 用户点击魔法链接
 GET /oidc/auth?one_time_token=xxx&login_hint=yyy&...
 ↓
 OIDC Provider 处理授权请求
-  ├── 校验 client_id、redirect_uri 等 OIDC 参数
-  ├── 将 one_time_token + login_hint 存入 OIDC 交互参数 (params)
-  └── 判断需要交互（未登录、无有效会话等）
+  ├── 校验 client_id、redirect_uri、scope 等 OIDC 参数
+  ├── 将 one_time_token + login_hint 存入 OIDC 交互的 params
+  ├── 创建 OIDC interaction 并存入 session
+  └── 触发交互重定向 → 调用 interactions.url 回调
       ↓
-调用 interactions.url 函数 [init.ts#L228-L271]
-  按 prompt.name 决定重定向方向：
-  ├── prompt.name === 'login'
-  │   → buildLoginPromptUrl(params, sharedParams) [utils.ts#L334-L381]
-  │   → 将 one_time_token + login_hint 拼接到 URL searchParams
-  │   → 重定向到 /sign-in?one_time_token=xxx&login_hint=yyy
-  │     （前端 SignIn 页会检测到 one_time_token 并 Navigate 到 OneTimeToken 页）
-  │
-  └── prompt.name === 'consent'
-      → buildConsentPromptUrl(appId) [utils.ts#L383-L391]
-      → 重定向到 /consent?app_id=xxx
-        ↓
-        ┌─ 只有进入 /consent 路由时，koaConsentGuard 才被触发 ─┐
-        │  挂载点：[Tenant.ts#L247-L254]                        │
-        │  GET /consent?app_id=xxx                              │
-        │    ↓                                                  │
-        │  koaInteractionDetails(provider)                      │
-        │    → 从 OIDC session 中恢复 interactionDetails        │
-        │    → ctx.interactionDetails.params 包含                │
-        │      { one_time_token, login_hint, ... }              │
-        │    ↓                                                  │
-        │  koaConsentGuard(libraries, queries)                  │
-        │    ├── 从 interactionDetails.params 提取参数           │
-        │    ├── 账户切换检测                                   │
-        │    │   └── 已有会话 + 邮箱不匹配 → 重定向 /switch-account│
-        │    ├── checkOneTimeToken 预检查                       │
-        │    │   ├── token_consumed + 当前用户匹配 → 放行 next() │
-        │    │   └── 其他错误 → 重定向 /one-time-token?error=... │
-        │    └── 预检查通过 → 重定向到 SPA                       │
-        │        → /one-time-token?login_hint=<email>&one_time_token=<token>
-        └───────────────────────────────────────────────────────┘
+调用 interactions.url(ctx, { params, prompt }) [init.ts#L228-L271]
+  ↓
+解析 ctx.oidc.params → extraParamsObjectGuard 解析
+  ↓
+按 prompt.name 分流：
+
+  ┌─ prompt.name === 'login' ───────────────────────────────────────┐
+  │ buildLoginPromptUrl(params, sharedParams) [utils.ts#L334-L381]  │
+  │   ├── firstScreen = SignIn                                      │
+  │   └── appendExtraParam(): 拼 one_time_token + login_hint        │
+  │   → 重定向到 /sign-in?one_time_token=xxx&login_hint=yyy         │
+  │   → 前端 SignIn 页检测到 one_time_token → Navigate 到 OneTimeToken页│
+  └─────────────────────────────────────────────────────────────────┘
+
+  ┌─ prompt.name === 'consent' ─────────────────────────────────────┐
+  │ buildConsentPromptUrl(appId) [utils.ts#L383-L391]                │
+  │   → 重定向到 /consent?app_id=xxx                                  │
+  │     ↓                                                            │
+  │   /consent 路由中间件链 [Tenant.ts#L247-L254]                     │
+  │     ┌─ koaInteractionDetails(provider)                           │
+  │     │  → 从 OIDC session 恢复 interactionDetails                 │
+  │     │  → ctx.interactionDetails.params = { one_time_token, ... } │
+  │     ├─ koaConsentGuard(libraries, queries)                       │
+  │     │  ├── 从 interactionDetails.params 提取参数                  │
+  │     │  ├── 账户切换检测：已有会话+邮箱不匹配 → 重定向 /switch-account│
+  │     │  ├── checkOneTimeToken 预检查                              │
+  │     │  │   ├── token_consumed + 当前用户匹配 → 放行 next()        │
+  │     │  │   └── 其他错误 → 重定向 /one-time-token?errorMessage=... │
+  │     │  └── 预检查通过 → 重定向到 SPA                               │
+  │     │        /one-time-token?login_hint=<email>&one_time_token=<token>│
+  │     └─ koaAutoConsent                                            │
+  └─────────────────────────────────────────────────────────────────┘
 ```
 
 OIDC 交互配置在 [init.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/core/src/oidc/init.ts#L228-L271)，URL 构建在 [utils.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/core/src/oidc/utils.ts#L334-L391)，consent 路由挂载在 [Tenant.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/core/src/tenants/Tenant.ts#L247-L254)。
@@ -635,14 +637,28 @@ https://<logto-domain>/oidc/auth?
 
 ### 8.2 后端入口：koa-consent-guard 中间件
 
-当用户点击魔法链接，OIDC 授权端点接收请求后，会经过 `koaConsentGuard` 中间件处理。这是魔法链接进入 Experience SPA 的**后端网关**。
+`koaConsentGuard` 并非直接挂载在 OIDC 授权端点上，而是挂载在 `/consent` 路由上。当 OIDC 授权交互判断需要 consent 时，才会重定向到 `/consent` 路由，此时 `koaConsentGuard` 才会被触发。这是魔法链接进入 Experience SPA 的**后端网关**之一（另一条路径是 `prompt=login` → 重定向到 `/sign-in` → 前端 Navigate 到 OneTimeToken 页）。
+
+挂载点在 [Tenant.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/core/src/tenants/Tenant.ts#L247-L254)：
+```
+mount(
+  `/${experience.routes.consent}`,
+  compose([
+    koaInteractionDetails(provider),
+    koaConsentGuard(libraries, queries),
+    koaAutoConsent(provider, queries, libraries),
+  ])
+)
+```
 
 核心逻辑在 [koa-consent-guard.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/core/src/middleware/koa-consent-guard.ts)。
 
 #### 8.2.1 参数提取与校验
 
+`koaConsentGuard` 从 `ctx.interactionDetails.params`（OIDC 交互参数，由 `koaInteractionDetails` 从 OIDC session 中恢复）中读取参数，而非直接从 URL query 读取：
+
 ```
-从 OIDC params 中提取 one_time_token + login_hint
+从 interactionDetails.params 中提取 one_time_token + login_hint
   ↓
 getOneTimeTokenParams() 校验
   ├── 两个参数必须同时存在且为 string 类型
