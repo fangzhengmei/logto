@@ -9,6 +9,46 @@ Logto 的连接器（Connector）系统涉及两套不同职责的敏感信息�
 
 ---
 
+## 快速导航：最容易混淆的对外 API 总览
+
+> ⚠️ 以下是代码中真实存在的完整 HTTP 路径，务必注意前缀、路径段、参数含义的细微差异。
+
+### API 前缀
+
+| 前缀常量 | 实际值 | 说明 | 代码位置 |
+|---------|--------|------|---------|
+| `accountApiPrefix` | `/my-account` | 用户端（登录态用户自己操作自己的数据）的 API 前缀 | [constants.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/account/constants.ts#L1) |
+| Management API | `/api/users` 等 | 管理端（管理员操作用户数据）的 API | 各管理路由文件 |
+
+### 社交连接器：Token 存储 API（PUT 主动触发）
+
+| 方法 | 完整路径 | 说明 | 代码位置 |
+|------|---------|------|---------|
+| `POST` | `/my-account/identities` | 新增社交身份（顺便存储 Token） | [identities.ts#L107-L138](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/account/identities.ts#L107-L138) |
+| `PUT` | `/my-account/identities` | 替换已有社交身份（顺便存储/更新 Token） | [identities.ts#L140-L171](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/account/identities.ts#L140-L171) |
+| `DELETE` | `/my-account/identities/:target` | 删除社交身份（通过触发器级联删除 Token） | [identities.ts#L173-L206](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/account/identities.ts#L173-L206) |
+| `GET` | `/my-account/identities/:target/access-token` | 读取社交连接器 Token（自动刷新） | [third-party-tokens.ts#L47-L92](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/account/third-party-tokens.ts#L47-L92) |
+
+### 企业 SSO 连接器：Token 存储 API（**无独立 API**，在交互流程中自动入库）
+
+| 方法 | 完整路径 | 说明 | 代码位置 |
+|------|---------|------|---------|
+| `GET` | `/my-account/sso-identities/:connectorId/access-token` | 读取企业 SSO Token（自动刷新） | [third-party-tokens.ts#L133-L163](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/account/third-party-tokens.ts#L133-L163) |
+| `GET` | `/api/users/:userId/sso-identities/:ssoConnectorId?includeTokenSecret=true` | 管理员查询用户 SSO 身份及脱敏 Token | [enterprise-sso.ts#L29-L162](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/admin-user/enterprise-sso.ts#L29-L162) |
+
+> 💡 **关键区别**：企业 SSO Token 没有独立的存储 API。企业 SSO Token 在以下两条**交互提交链路**中被自动写入数据库：
+> 1. 🔗 **新用户注册链路**：`ExperienceInteraction.createUser()` → `ProvisionLibrary.createUser()`
+> 2. 🔗 **现有用户登录链路**：`ExperienceInteraction.identifyUser()` → `ExperienceInteraction.submit()`
+
+### 社交 vs SSO：路径参数含义完全不同
+
+| 连接器类型 | GET Token 路径 | 参数名 | 参数含义 | 关联字段 |
+|-----------|---------------|--------|---------|---------|
+| 社交连接器 | `/my-account/identities/:target/access-token` | `:target` | 社交目标标识（如 `github`、`google`） | `secret_social_connector_relations.target` |
+| 企业 SSO | `/my-account/sso-identities/:connectorId/access-token` | `:connectorId` | SSO 连接器实例 ID（UUID 风格） | `secret_enterprise_sso_connector_relations.sso_connector_id` |
+
+---
+
 ## 一、Connector Helper 职责边界
 
 ### 1.1 核心模块
@@ -298,23 +338,38 @@ export const tokenSetMetadataGuard = z.object({
     ↓
 Token 暂存到 SocialVerification 实例的 encryptedTokenSet 字段
     ↓
-（后续用户提交交互时）
+（社交连接器 Token 存储有 3 条入库链路，任选其一）
     ↓
-用户主动请求存储 Token：PUT /api/account/identities/:target/access-token
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 链路 1：新用户注册（自动完成）                                           │
+│   ExperienceInteraction.createUser()                                     │
+│     → getNewUserProfileFromVerificationRecord() → profile.data          │
+│     → ProvisionLibrary.createUser() → upsertSocialTokenSetSecret()      │
+├─────────────────────────────────────────────────────────────────────────┤
+│ 链路 2：现有用户登录（自动完成）                                         │
+│   ExperienceInteraction.identifyUser()                                   │
+│     → identifyUserByVerificationRecord() → profile.unsafeSet()          │
+│     → ExperienceInteraction.submit() → upsertSocialTokenSetSecret()     │
+├─────────────────────────────────────────────────────────────────────────┤
+│ 链路 3：用户个人中心主动绑定/替换身份                                     │
+│   POST /my-account/identities（新增）                                    │
+│   PUT  /my-account/identities（替换）                                    │
+│     → linkSocialIdentityCore()                                           │
+│       → newVerificationRecord.getTokenSetSecret()                       │
+│       → upsertSocialTokenSetSecret()                                    │
+└─────────────────────────────────────────────────────────────────────────┘
     ↓
-[thirdPartyTokensRoutes]
-    ├─ 从 SocialVerificationRecord 读取 tokenSecret
-    └─ [socials.upsertSocialTokenSetSecret()] 写入数据库
-        ├─ deserializeEncryptedSecret(encryptedTokenSetBase64)
-        │   └─ 反序列化得到 { iv, authTag, ciphertext, encryptedDek }
-        └─ queries.secrets.upsertSocialTokenSetSecret()
-            ├─ 事务：删除同 user + target 的旧 secret
-            │   SQL: DELETE FROM secrets USING secret_social_connector_relations
-            │        WHERE secrets.id = secretId
-            │          AND secrets.user_id = userId
-            │          AND secret_social_connector_relations.target = :target
-            ├─ 插入 secrets 表（type = 'FederatedTokenSet'）
-            └─ 插入 secret_social_connector_relations 表
+写入数据库：
+├─ deserializeEncryptedSecret(encryptedTokenSetBase64)
+│   └─ 反序列化得到 { iv, authTag, ciphertext, encryptedDek }
+└─ queries.secrets.upsertSocialTokenSetSecret()
+    ├─ 事务：删除同 user + target 的旧 secret
+    │   SQL: DELETE FROM secrets USING secret_social_connector_relations
+    │        WHERE secrets.id = secretId
+    │          AND secrets.user_id = userId
+    │          AND secret_social_connector_relations.target = :target
+    ├─ 插入 secrets 表（type = 'FederatedTokenSet'）
+    └─ 插入 secret_social_connector_relations 表
 ```
 
 **核心代码**：
@@ -326,7 +381,7 @@ Token 暂存到 SocialVerification 实例的 encryptedTokenSet 字段
 #### 流程二：用户读取第三方 Access Token
 
 ```
-用户请求：GET /api/account/identities/:target/access-token
+用户请求：GET /my-account/identities/:target/access-token
     ↓
 [thirdPartyTokensRoutes]
     ↓
@@ -358,12 +413,15 @@ queries.secrets.findSocialTokenSetSecretByUserIdAndTarget(userId, target)
 - `decryptTokens`：[secret-encryption.ts#L89-L92](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/utils/secret-encryption.ts#L89-L92)
 - `refreshTokenSetSecret`（社交版）：[social.ts#L213-L271](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/libraries/social.ts#L213-L271)
 
-#### 流程三：用户企业 SSO 登录时存储 Token
+#### 流程三：企业 SSO Token 入库的两条完整链路
 
 > 与社交连接器相比，企业 SSO 的 Token 加密、序列化、反序列化逻辑**完全共用**，区别在于：
 > - 仅 OIDC 类型的企业 SSO 连接器支持 Token 存储（SAML 不支持）
-> - Token 存储在用户**注册/登录流程中自动完成**，无需用户额外主动请求
+> - **没有独立的 Token 存储 API**，Token 入库在用户注册/登录的交互提交流程中**自动完成**
+> - 共有**两条独立的入库链路**，分别对应新用户注册和现有用户登录
 > - 关联表使用 `secret_enterprise_sso_connector_relations`
+
+##### 前置步骤（两条链路共用）：Token 获取与加密暂存
 
 ```
 用户完成企业 SSO 登录回调
@@ -379,29 +437,112 @@ queries.secrets.findSocialTokenSetSecretByUserIdAndTarget(userId, target)
         └─ 输出：{ encryptedTokenSetBase64, metadata }（与社交连接器共用加密逻辑）
     ↓
 Token 暂存到 EnterpriseSsoVerification.encryptedTokenSet 字段
-    ↓
-（用户提交交互，创建新用户或登录现有用户时）
-    ↓
-[ProvisionLibrary.createUser()] 或交互提交时：
-    ├─ 读取 enterpriseSsoConnectorTokenSetSecret
-    └─ [ssoConnectors.upsertEnterpriseSsoTokenSetSecret()] 写入数据库
-        ├─ deserializeEncryptedSecret(encryptedTokenSetBase64)
-        │   └─ 反序列化得到 { iv, authTag, ciphertext, encryptedDek }（共用）
-        └─ queries.secrets.upsertEnterpriseSsoTokenSetSecret()
-            ├─ 事务：删除同 user + issuer 的旧 secret（⚠️ 只按 userId + issuer 删除，不区分 ssoConnectorId）
-            │   SQL: DELETE FROM secrets USING secret_enterprise_sso_connector_relations
-            │        WHERE secrets.id = secretId
-            │          AND secrets.user_id = userId
-            │          AND secret_enterprise_sso_connector_relations.issuer = :issuer
-            ├─ 插入 secrets 表（共用主表，type = 'FederatedTokenSet'）
-            └─ 插入 secret_enterprise_sso_connector_relations 表（企业 SSO 专属关联表）
 ```
 
 **核心代码**：
 - `verifySsoIdentity`：[single-sign-on.ts#L157-L221](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/libraries/verification-helpers/single-sign-on.ts#L157-L221)
-- `upsertEnterpriseSsoTokenSetSecret`：[sso-connector.ts#L229-L256](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/libraries/sso-connector.ts#L229-L256)
-- `ProvisionLibrary.createUser`：[provision-library.ts#L58-L136](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/experience/classes/libraries/provision-library.ts#L58-L136)
 - `getTokenSetSecret`：[enterprise-sso-verification.ts#L222-L236](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/experience/classes/verifications/enterprise-sso-verification.ts#L222-L236)
+
+##### 链路 A：新用户注册 → `ExperienceInteraction.createUser()`
+
+适用场景：用户首次通过企业 SSO 注册新账号
+
+```
+前端调用 POST /api/interaction/:id/create-user（注册提交）
+    ↓
+[ExperienceInteraction.createUser(verificationId)]
+    ├─ [Step 1] 从 VerificationRecordsMap 取到 EnterpriseSsoVerificationRecord
+    ├─ [Step 2] getNewUserProfileFromVerificationRecord(record)
+    │   └─ verificationRecord.getTokenSetSecret()
+    │       └─ 输出 { enterpriseSsoConnectorTokenSetSecret: ... }
+    ├─ [Step 3] this.profile.setProfileWithValidation(profile)
+    │       └─ enterpriseSsoConnectorTokenSetSecret 写入 profile.data
+    └─ [Step 4] this.provisionLibrary.createUser()
+            ↓
+        [ProvisionLibrary.createUser()]
+            ├─ 创建 users 表记录
+            ├─ 创建 user_sso_identities 表记录
+            ├─ 读取 profile.data.enterpriseSsoConnectorTokenSetSecret
+            └─ 存在则调用 ssoConnectors.upsertEnterpriseSsoTokenSetSecret()
+                    ↓
+                写入数据库：
+                ├─ deserializeEncryptedSecret() → 反序列化
+                └─ queries.secrets.upsertEnterpriseSsoTokenSetSecret()
+                    ├─ 事务：DELETE FROM secrets USING ...
+                    │        WHERE user_id = ? AND issuer = ?
+                    │        （⚠️ 只按 userId + issuer 删除）
+                    ├─ INSERT INTO secrets（type = 'FederatedTokenSet'）
+                    └─ INSERT INTO secret_enterprise_sso_connector_relations
+```
+
+**关键代码**：
+- `getNewUserProfileFromVerificationRecord`：[helpers.ts#L33-L68](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/experience/classes/helpers.ts#L33-L68)
+- `ExperienceInteraction.createUser()`：[experience-interaction.ts#L273-L360](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/experience/classes/experience-interaction.ts#L273-L360)
+- `ProvisionLibrary.createUser()`：[provision-library.ts#L58-L136](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/experience/classes/libraries/provision-library.ts#L58-L136)
+- `upsertEnterpriseSsoTokenSetSecret`（业务层）：[sso-connector.ts#L229-L256](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/libraries/sso-connector.ts#L229-L256)
+- `upsertEnterpriseSsoTokenSetSecret`（数据库层）：[secret.ts#L93-L124](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/queries/secret.ts#L93-L124)
+
+##### 链路 B：现有用户登录 → `ExperienceInteraction.identifyUser()` → `submit()`
+
+适用场景：已有用户通过企业 SSO 登录
+
+```
+前端调用 POST /api/interaction/:id/identify（登录识别）
+    ↓
+[ExperienceInteraction.identifyUser(verificationId)]
+    ├─ [Step 1] 从 VerificationRecordsMap 取到 EnterpriseSsoVerificationRecord
+    ├─ [Step 2] identifyUserByVerificationRecord(record)
+    │   ├─ 分支 1：verificationRecord.identifyUser() → 找到已有 SSO 身份
+    │   │   └─ syncedProfile = {
+    │   │          syncedEnterpriseSsoIdentity: ...,
+    │   │          enterpriseSsoConnectorTokenSetSecret: record.getTokenSetSecret()
+    │   │        }
+    │   └─ 分支 2：identifyUser() 抛错 user.sso_identity_not_exist
+    │       └─ fallback: verificationRecord.identifyRelatedUser() → 通过邮箱等匹配用户
+    │           └─ syncedProfile = {
+    │                  enterpriseSsoIdentity: ...,          // 新 SSO 身份
+    │                  enterpriseSsoConnectorTokenSetSecret: record.getTokenSetSecret()
+    │                }
+    ├─ [Step 3] 设置 this.userId（用户已识别）
+    └─ [Step 4] this.profile.unsafeSet(syncedProfile)
+            └─ enterpriseSsoConnectorTokenSetSecret 写入 profile.data
+    ↓
+（前端完成 MFA 等验证后，调用 POST /api/interaction/:id/submit）
+    ↓
+[ExperienceInteraction.submit()]
+    ├─ [Step 1] await this.getIdentifiedUser() → 确保用户已识别
+    ├─ [Step 2] MFA / Profile 校验
+    ├─ [Step 3] 从 this.profile.data 解构 enterpriseSsoConnectorTokenSetSecret
+    ├─ [Step 4] 更新 users 表、同步 SSO 身份详情、更新 SSO 身份
+    └─ [Step 5] if (enterpriseSsoConnectorTokenSetSecret) {
+            await upsertEnterpriseSsoTokenSetSecret(userId, tokenSet, ctx)
+          }
+                ↓
+            写入数据库（与链路 A 相同）：
+            ├─ deserializeEncryptedSecret()
+            └─ queries.secrets.upsertEnterpriseSsoTokenSetSecret()
+                ├─ DELETE WHERE user_id = ? AND issuer = ?
+                ├─ INSERT INTO secrets
+                └─ INSERT INTO secret_enterprise_sso_connector_relations
+```
+
+**关键代码**：
+- `identifyUserByVerificationRecord`（EnterpriseSso 分支）：[helpers.ts#L160-L185](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/experience/classes/helpers.ts#L160-L185)
+- `ExperienceInteraction.identifyUser()`：[experience-interaction.ts#L212-L258](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/experience/classes/experience-interaction.ts#L212-L258)
+- `ExperienceInteraction.submit()`（Token 入库部分）：[experience-interaction.ts#L539-L619](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/experience/classes/experience-interaction.ts#L539-L619)
+
+##### 链路 A vs 链路 B：核心差异
+
+| 维度 | 链路 A：新用户注册 `createUser()` | 链路 B：现有用户登录 `identifyUser()` → `submit()` |
+|------|-----------------------------------|--------------------------------------------------|
+| **交互类型** | `InteractionEvent.Register` | `InteractionEvent.SignIn` |
+| **触发接口** | `POST /api/interaction/:id/create-user` | 先 `POST /api/interaction/:id/identify`，再 `POST /api/interaction/:id/submit` |
+| **TokenSetSecret 注入 profile 的位置** | `getNewUserProfileFromVerificationRecord()` | `identifyUserByVerificationRecord()` → `profile.unsafeSet(syncedProfile)` |
+| **调用 upsert 的函数** | `ProvisionLibrary.createUser()` | `ExperienceInteraction.submit()` |
+| **是否创建新 SSO 身份** | ✅ 创建 `user_sso_identities` 新记录 | 分支 1：❌ 同步现有身份详情；分支 2：✅ 新增身份记录 |
+| **是否需要用户主动请求** | ❌ 注册自动完成 | ❌ 登录自动完成 |
+
+> 💡 **重要共同点**：两条链路中 `enterpriseSsoConnectorTokenSetSecret` 都必须先写入 `ExperienceInteraction.profile.data`，才能在后续的 `ProvisionLibrary.createUser()` 或 `submit()` 中被读取并入库。如果 profile 中没有这个字段，Token 就不会被存储。
 
 #### 流程四：管理员/用户读取企业 SSO Access Token
 
@@ -410,7 +551,7 @@ Token 暂存到 EnterpriseSsoVerification.encryptedTokenSet 字段
 ```
 管理员请求：GET /api/users/:userId/sso-identities/:ssoConnectorId?includeTokenSecret=true
     或
-用户请求：GET /api/account/sso-identities/:connectorId/access-token
+用户请求：GET /my-account/sso-identities/:connectorId/access-token
     ↓
 [enterprise-sso.ts / third-party-tokens.ts]
     ↓
@@ -497,7 +638,7 @@ queries.secrets.findEnterpriseSsoTokenSetSecretByUserIdAndConnectorId(userId, co
 | **加密算法** | AES-256-GCM 信封加密（共用） | AES-256-GCM 信封加密（共用） |
 | **Token 结构** | `{access_token, refresh_token?, id_token?}`（共用） | 相同结构（共用） |
 | **支持协议** | OAuth 2.0 / OIDC | **仅 OIDC**（SAML 不支持 Token 存储） |
-| **Token 存储触发** | 用户主动调用 PUT API | 用户注册/登录时自动写入 |
+| **Token 存储触发** | 3 条链路：① 新用户注册（自动）② 现有用户登录（自动）③ 个人中心绑定身份（POST/PUT `/my-account/identities`） | 2 条链路：① 新用户注册（自动）② 现有用户登录（自动） **（无独立 API）** |
 | **Token 刷新入口** | `socials.refreshTokenSetSecret()` | `ssoConnectors.refreshTokenSetSecret()`（独立实现，逻辑相同） |
 | **Refresh Token 保留** | 保留原 refresh_token（共用策略） | 相同策略（共用） |
 | **级联删除** | 连接器/身份删除时删除 secret | 数据库触发器自动删除关联 secret |
@@ -538,25 +679,33 @@ queries.secrets.findEnterpriseSsoTokenSetSecretByUserIdAndConnectorId(userId, co
 
 5. **SAML 企业 SSO 不支持 Token 存储**：即使 `enable_token_storage=true`，SAML 类型的企业 SSO 连接器也会跳过 Token 存储逻辑（`connectorInstance instanceof OidcConnector` 校验不通过）。
 
-6. **社交 vs SSO Token 存储触发时机不同**：
-   - 社交连接器：用户需额外调用 `PUT /api/account/identities/:target/access-token` 主动存储
-   - 企业 SSO 连接器：在用户注册/登录流程中由 `ProvisionLibrary.createUser()` 自动完成存储
+6. **⚠️ 用户端 API 前缀不是 `/api/account/`，而是 `/my-account/`**：
+   - `accountApiPrefix` 常量值为 `/my-account`，定义在 `packages/core/src/routes/account/constants.ts`
+   - 所有用户自服务的 Token、身份、个人资料 API 都以 `/my-account/` 开头
+   - `/api/users/...` 开头的是管理员（Management API）路径
+   - 文档中遇到 `/my-account/...` 路径时不要误以为写错了，它和 `/api/users/...` 是两套完全不同的入口
 
-7. **Demo 连接器配置隐藏**：在 API 响应中，Demo 连接器的 `config` 字段被置为空对象 `{}`，不返回真实配置。
+7. **社交 vs SSO Token 入库链路数量不同**：
+   - 社交连接器：**3 条入库链路**（① 新用户注册自动 ② 现有用户登录自动 ③ 个人中心 POST/PUT `/my-account/identities` 绑定/替换身份时顺带）
+   - 企业 SSO 连接器：**2 条入库链路**（① 新用户注册自动 ② 现有用户登录自动），**没有独立的存储 API**，只能在交互提交流程中自动完成
 
-8. **Well-Known 查询不含 config**：`findAllConnectorsWellKnown` 查询只返回 `id`、`metadata`、`connectorId`，不包含敏感的 `config` 字段。
+8. **⚠️ 所有入库链路必经 profile.data**：无论社交还是 SSO，`enterpriseSsoConnectorTokenSetSecret` / `socialConnectorTokenSetSecret` 都必须先写入 `ExperienceInteraction.profile.data`，才能在后续的 `ProvisionLibrary.createUser()`、`ExperienceInteraction.submit()` 或 `linkSocialIdentityCore()` 中被读取并入库。如果 profile 中没有这个字段，Token 就不会被存储。
 
-9. **Refresh Token 的保留策略**：刷新 Token 时，如果第三方未返回新的 refresh_token，会保留原有 refresh_token（如 Google 的一次性 refresh_token 策略）。社交连接器和企业 SSO 连接器共用此策略。
+9. **Demo 连接器配置隐藏**：在 API 响应中，Demo 连接器的 `config` 字段被置为空对象 `{}`，不返回真实配置。
 
-10. **企业 SSO 级联删除通过触发器实现**：`secret_enterprise_sso_connector_relations` 表有两个 PL/pgSQL 触发器，分别在删除 `sso_connectors` 和 `user_sso_identities` 时自动清理关联的 `secrets` 记录。
+10. **Well-Known 查询不含 config**：`findAllConnectorsWellKnown` 查询只返回 `id`、`metadata`、`connectorId`，不包含敏感的 `config` 字段。
 
-11. **⚠️ 企业 SSO upsert 删除条件较粗**：`upsertEnterpriseSsoTokenSetSecret` 删除旧记录时只按 `userId + issuer` 删除，不区分 `ssoConnectorId`。这意味着如果同一用户通过同一 issuer（如同一 Azure AD 租户）的不同 SSO 连接器登录，后登录的会覆盖先登录的 Token。
+11. **Refresh Token 的保留策略**：刷新 Token 时，如果第三方未返回新的 refresh_token，会保留原有 refresh_token（如 Google 的一次性 refresh_token 策略）。社交连接器和企业 SSO 连接器共用此策略。
 
-12. **社交与企业 SSO Token 读取路由完全独立**：
-    - 社交连接器：`GET /api/account/identities/:target/access-token`（`target` 是社交目标标识，如 `github`）
-    - 企业 SSO 连接器：`GET /api/account/sso-identities/:connectorId/access-token`（路径是 `/sso-identities/`，参数是 `connectorId`）
-    - 两者参数含义不同，不能混用。
+12. **企业 SSO 级联删除通过触发器实现**：`secret_enterprise_sso_connector_relations` 表有两个 PL/pgSQL 触发器，分别在删除 `sso_connectors` 和 `user_sso_identities` 时自动清理关联的 `secrets` 记录。
 
-13. **查询必须包含 `type = 'FederatedTokenSet'` 条件**：两个 `find*` 查询函数都会显式加上 `secrets.type = 'FederatedTokenSet'` 过滤条件，确保只查询 Token 类型的 secret，不与其他类型的 secret 混淆。
+13. **⚠️ 企业 SSO upsert 删除条件较粗**：`upsertEnterpriseSsoTokenSetSecret` 删除旧记录时只按 `userId + issuer` 删除，不区分 `ssoConnectorId`。这意味着如果同一用户通过同一 issuer（如同一 Azure AD 租户）的不同 SSO 连接器登录，后登录的会覆盖先登录的 Token。
 
-14. **`getAccessToken` 是共用函数，通过类型守卫分发**：社交和企业 SSO 的 Token 读取和刷新逻辑都走同一个 `getAccessToken` 函数，内部通过 `isSocialTokenSetSecret()` 类型守卫（检查是否包含 `target` 和 `connectorId` 字段）来区分，调用不同的 `refreshTokenSetSecret` 实现。
+14. **社交与企业 SSO Token 读取路由完全独立，路径段和参数含义都不同**：
+    - 社交连接器：`GET /my-account/identities/:target/access-token`，参数 `:target` 是社交目标标识（如 `github`、`google`），关联 `secret_social_connector_relations.target`
+    - 企业 SSO 连接器：`GET /my-account/sso-identities/:connectorId/access-token`，路径段是 `/sso-identities/`，参数 `:connectorId` 是 SSO 连接器实例 ID（UUID 风格），关联 `secret_enterprise_sso_connector_relations.sso_connector_id`
+    - 两者路径前缀 `/my-account/identities` vs `/my-account/sso-identities` 差一个 `sso-`，参数含义完全不同，不能混用
+
+15. **查询必须包含 `type = 'FederatedTokenSet'` 条件**：两个 `find*` 查询函数都会显式加上 `secrets.type = 'FederatedTokenSet'` 过滤条件，确保只查询 Token 类型的 secret，不与其他类型的 secret 混淆。
+
+16. **`getAccessToken` 是共用函数，通过类型守卫分发**：社交和企业 SSO 的 Token 读取和刷新逻辑都走同一个 `getAccessToken` 函数，内部通过 `isSocialTokenSetSecret()` 类型守卫（检查是否包含 `target` 和 `connectorId` 字段）来区分，调用不同的 `refreshTokenSetSecret` 实现。
