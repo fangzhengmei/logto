@@ -1027,6 +1027,151 @@ const isValidVerificationCodeIdentifier = (
 
 两相对比，useOnSubmit L70-L74 的 Username 无条件跳转是唯一将"正常配置路径"变为"死路"的代码点。
 
+### 9.8 三个验证页对 Username 验证码的控制细节
+
+`SwitchToVerificationMethodsLink` 是三个验证页（密码页、验证码页、Passkey 验证页）共用的切换入口组件。每个页面调用它时传入的参数不同，对 Username 验证码的控制策略也不同。本小节逐一拆解三个调用点。
+
+#### 9.8.1 调用点一：密码页 PasswordForm
+
+**调用位置**：[PasswordForm/index.tsx L121-L126](file:///d:/fz/0601-2/solo-dogfeeding/code/69-logto/packages/experience/src/pages/SignInPassword/PasswordForm/index.tsx#L121-L126)
+
+```jsx
+<SwitchToVerificationMethodsLink
+  hasVerificationCode={identifier !== SignInIdentifier.Username && isVerificationCodeEnabled}
+  className={styles.switch}
+  identifier={cond(identifier !== SignInIdentifier.Username && identifier)}
+  value={value}
+/>
+```
+
+控制 Username 验证码的有三个参数：
+
+| 参数 | Username 时的值 | 作用 |
+|------|----------------|------|
+| `hasVerificationCode` | `false`（因为 `identifier !== Username` 为 false） | 告诉组件"验证码方式不可用"，验证码链接不会渲染 |
+| `identifier` | `undefined`（`cond(...)` 返回 undefined） | `VerificationCodeLink` 的必填 prop，undefined 时验证码链接不渲染 |
+| `value` | 正常传值 | 验证码链接的参数，但 identifier 为 undefined 时整体不生效 |
+
+**双重保险**：`hasVerificationCode` 是功能开关，`identifier` 是类型约束。两者都对 Username 做了硬编码排除，任何一个为假都会导致验证码切换入口不出现。
+
+**前置条件**：能到达 PasswordForm 意味着 `methodSetting?.password === true`（SignInPassword/index.tsx L29 的校验已通过）。所以 Username 场景下，密码页本身是可正常使用的，只是底部没有验证码切换链接。
+
+#### 9.8.2 调用点二：Passkey 验证页 SignInPasskeyVerification
+
+**调用位置**：[SignInPasskeyVerification/index.tsx L74-L80](file:///d:/fz/0601-2/solo-dogfeeding/code/69-logto/packages/experience/src/pages/SignInPasskeyVerification/index.tsx#L74-L80)
+
+```jsx
+<SwitchToVerificationMethodsLink
+  className={styles.switchLink}
+  identifier={cond(type !== SignInIdentifier.Username && type)}
+  value={identifierInputValue.value}
+  hasPassword={methodSetting?.password}
+  hasVerificationCode={type !== SignInIdentifier.Username && methodSetting?.verificationCode}
+/>
+```
+
+| 参数 | Username 时的值 | 作用 |
+|------|----------------|------|
+| `identifier` | `undefined` | 验证码链接和 Passkey 链接都需要它 |
+| `hasPassword` | `methodSetting?.password`（正常读取配置） | 密码链接照常显示 |
+| `hasVerificationCode` | `false`（`type !== Username` 为 false） | 验证码方式标记为不可用 |
+
+**特点**：
+- 密码入口不受影响（`hasPassword` 正常从配置读取）
+- 验证码入口被两层条件同时排除（`identifier` 为 undefined + `hasVerificationCode` 为 false）
+- Passkey 入口也受影响，因为 `identifier` 为 undefined 时 PasskeySignInLink 不渲染（`identifier` 是 VerificationCodeIdentifier 类型）
+
+#### 9.8.3 调用点三：验证码页 VerificationCodeContainer
+
+**调用位置**：[VerificationCode/index.tsx L54](file:///d:/fz/0601-2/solo-dogfeeding/code/69-logto/packages/experience/src/pages/VerificationCode/index.tsx#L54-L54) → [VerificationCode/index.tsx L76](file:///d:/fz/0601-2/solo-dogfeeding/code/69-logto/packages/experience/src/pages/VerificationCode/index.tsx#L76-L76) → [VerificationCode/index.tsx L132-L139](file:///d:/fz/0601-2/solo-dogfeeding/code/69-logto/packages/experience/src/containers/VerificationCode/index.tsx#L132-L139)
+
+```jsx
+// VerificationCode 页面
+const methodSettings = signInMethods.find((method) => method.identifier === type);
+const hasPasswordButton = userFlow === UserFlow.SignIn && methodSettings?.password;
+
+<VerificationCodeContainer
+  flow={userFlow}
+  identifier={cachedIdentifierInputValue}  // 类型是 VerificationCodeIdentifier
+  verificationId={verificationId}
+  hasPasswordButton={hasPasswordButton}
+/>
+
+// VerificationCodeContainer 内部
+<SwitchToVerificationMethodsLink
+  hasPassword={hasPasswordButton}
+  identifier={identifier.type}
+  value={identifier.value}
+  className={styles.switch}
+/>
+```
+
+**关键点**：Username 根本到不了这个调用点。
+
+**第一层保护：页面入口类型守卫**
+
+[VerificationCode/index.tsx L22-L29](file:///d:/fz/0601-2/solo-dogfeeding/code/69-logto/packages/experience/src/pages/VerificationCode/index.tsx#L22-L29)：
+
+```typescript
+const isValidVerificationCodeIdentifier = (
+  identifierInputValue: IdentifierInputValue | undefined
+): identifierInputValue is VerificationCodeIdentifier =>
+  Boolean(
+    identifierInputValue?.type &&
+      identifierInputValue.type !== SignInIdentifier.Username &&
+      identifierInputValue.value
+  );
+
+if (!isValidVerificationCodeIdentifier(cachedIdentifierInputValue)) {
+  return <ErrorPage title="error.invalid_session" />;
+}
+```
+
+`type !== Username` 直接把 Username 拦在门外。通过这个守卫后，`cachedIdentifierInputValue` 的 TypeScript 类型被收窄为 `VerificationCodeIdentifier`（即 `Email | Phone`）。
+
+**第二层保护：TypeScript 类型系统**
+
+[VerificationCodeContainer 的 Props](file:///d:/fz/0601-2/solo-dogfeeding/code/69-logto/packages/experience/src/containers/VerificationCode/index.tsx#L18-L18) 中 `identifier` 的类型是 `VerificationCodeIdentifier`（即 `Email | Phone`），编译期就不接受 Username。
+
+**第三层保护：SwitchToVerificationMethodsLink 的参数**
+
+- `identifier` 是 `VerificationCodeIdentifier` 类型，天然排除 Username
+- `hasPassword` 正常从配置读取，不受 Username 影响
+- 未传 `hasVerificationCode`（因为用户已经在验证码页了），但这不影响 Username 的判断——Username 根本进不来
+
+#### 9.8.4 三个调用点的对比表
+
+| 维度 | 密码页 PasswordForm | Passkey 验证页 | 验证码页 VerificationCode |
+|------|--------------------|--------------|-------------------------|
+| `hasVerificationCode` | `identifier !== Username && isVCEnabled` | `type !== Username && method.verificationCode` | **未传**（用户已在验证码页） |
+| `identifier` prop | `cond(identifier !== Username && identifier)` | `cond(type !== Username && type)` | `VerificationCodeIdentifier` 类型，天然排除 |
+| 有几层保护？ | 2 层（hasVerificationCode + identifier） | 2 层（hasVerificationCode + identifier） | 3 层（入口守卫 + 类型系统 + identifier 类型） |
+| Username 能否到达该页面？ | ✅ 能（但底部无验证码链接） | ✅ 能（但无验证码/无Passkey切换链接） | ❌ 不能（入口处 ErrorPage） |
+| 密码入口是否受影响？ | 不受影响（当前页就是密码页） | 不受影响（hasPassword 正常读配置） | 不受影响（hasPasswordButton 正常读配置） |
+
+#### 9.8.5 设计模式解读
+
+Username 验证码的排除遵循**分层防御**模式：
+
+```
+Layer 1: 提交路由层（useOnSubmit L70-L74）
+  └─ Username 无条件跳密码页，根本不进验证码分支
+
+Layer 2: 页面入口层（SignInPassword / VerificationCode 各自的保护）
+  ├─ SignInPassword: P=F → ErrorPage
+  └─ VerificationCode: type===Username → ErrorPage
+
+Layer 3: 组件 Props 层（SwitchToVerificationMethodsLink 的调用参数）
+  ├─ 密码页: hasVerificationCode=false, identifier=undefined
+  ├─ Passkey 页: hasVerificationCode=false, identifier=undefined
+  └─ 验证码页: identifier 类型是 VerificationCodeIdentifier
+
+Layer 4: 类型系统层（VerificationCodeIdentifier = Email | Phone）
+  └─ 编译期排除 Username
+```
+
+每一层都独立有效，即使上一层出现漏洞（比如配置下发了 Username+VC=T），下一层也能兜住。代价是多层防御的组合产生了 §9.7 描述的死路——用户被第一层送进密码页，第二层因为 P=F 显示 ErrorPage，而第三层（SwitchToVerificationMethodsLink）因为 ErrorPage 替代了 PasswordForm 而不存在。
+
 ---
 
 ## 十、关键文件索引（补充）
@@ -1043,4 +1188,7 @@ const isValidVerificationCodeIdentifier = (
 | 验证码页 | [VerificationCode](file:///d:/fz/0601-2/solo-dogfeeding/code/69-logto/packages/experience/src/pages/VerificationCode/index.tsx) | 第二屏验证码验证 |
 | 验证方式选择页 | [SignInVerificationMethods](file:///d:/fz/0601-2/solo-dogfeeding/code/69-logto/packages/experience/src/pages/SignInVerificationMethods/index.tsx) | >2 种方式时的选择页 |
 | 验证方式切换链接 | [SwitchToVerificationMethodsLink](file:///d:/fz/0601-2/solo-dogfeeding/code/69-logto/packages/experience/src/components/SwitchToVerificationMethodsLink/index.tsx#L30-L73) | 密码/验证码/passkey 互跳 |
+| Passkey 验证页 | [SignInPasskeyVerification](file:///d:/fz/0601-2/solo-dogfeeding/code/69-logto/packages/experience/src/pages/SignInPasskeyVerification/index.tsx) | Passkey 验证第二屏 |
+| 验证码容器 | [VerificationCodeContainer](file:///d:/fz/0601-2/solo-dogfeeding/code/69-logto/packages/experience/src/containers/VerificationCode/index.tsx) | 验证码输入 + 切换密码 |
+| 类型定义 | [types/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/69-logto/packages/experience/src/types/index.ts#L31-L31) | `VerificationCodeIdentifier = Email \| Phone` |
 
