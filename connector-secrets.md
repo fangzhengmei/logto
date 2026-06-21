@@ -309,13 +309,18 @@ Token 暂存到 SocialVerification 实例的 encryptedTokenSet 字段
         │   └─ 反序列化得到 { iv, authTag, ciphertext, encryptedDek }
         └─ queries.secrets.upsertSocialTokenSetSecret()
             ├─ 事务：删除同 user + target 的旧 secret
-            ├─ 插入 secrets 表
+            │   SQL: DELETE FROM secrets USING secret_social_connector_relations
+            │        WHERE secrets.id = secretId
+            │          AND secrets.user_id = userId
+            │          AND secret_social_connector_relations.target = :target
+            ├─ 插入 secrets 表（type = 'FederatedTokenSet'）
             └─ 插入 secret_social_connector_relations 表
 ```
 
 **核心代码**：
 - `getUserInfoWithOptionalTokenResponse`：[social.ts#L95-L152](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/libraries/social.ts#L95-L152)
-- `upsertSocialTokenSetSecret`：[social.ts#L183-L204](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/libraries/social.ts#L183-L204)
+- `upsertSocialTokenSetSecret`（业务层）：[social.ts#L183-L204](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/libraries/social.ts#L183-L204)
+- `upsertSocialTokenSetSecret`（数据库层，含删除逻辑）：[secret.ts#L40-L73](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/queries/secret.ts#L40-L73)
 - `encryptAndSerializeTokenResponse`：[secret-encryption.ts#L179-L192](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/utils/secret-encryption.ts#L179-L192)
 
 #### 流程二：用户读取第三方 Access Token
@@ -327,14 +332,18 @@ Token 暂存到 SocialVerification 实例的 encryptedTokenSet 字段
     ↓
 queries.secrets.findSocialTokenSetSecretByUserIdAndTarget(userId, target)
     └─ JOIN secrets + secret_social_connector_relations
+       WHERE secrets.user_id = userId
+         AND secrets.type = 'FederatedTokenSet'
+         AND target = :target
     ↓
-[getAccessToken()]
+[getAccessToken()] 共用函数（通过类型守卫区分社交/SSO）
+    ├─ isSocialTokenSetSecret() 检查（判断是否包含 target 和 connectorId 字段）
     ├─ decryptTokens({ iv, encryptedDek, ciphertext, authTag })
     │   └─ 使用 KEK 解密得到明文 TokenSet
     ├─ 检查 access_token 是否过期（metadata.expiresAt）
     │   ├─ 未过期：直接返回
     │   └─ 已过期：
-    │       ├─ 有 refresh_token → 调用 refreshTokenSetSecret()
+    │       ├─ 有 refresh_token → 调用 socials.refreshTokenSetSecret()（社交）
     │       │   ├─ 连接器 getAccessTokenByRefreshToken() 刷新 Token
     │       │   ├─ encryptTokenResponse() 重新加密
     │       │   └─ secrets.updateById() 更新数据库
@@ -343,9 +352,11 @@ queries.secrets.findSocialTokenSetSecretByUserIdAndTarget(userId, target)
 ```
 
 **核心代码**：
-- `getAccessToken`：[third-party-tokens.ts#L47-L88](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/account/third-party-tokens.ts#L47-L88)
+- `getAccessToken`（共用函数）：[third-party-tokens.ts#L47-L88](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/account/third-party-tokens.ts#L47-L88)
+- `isSocialTokenSetSecret`（类型守卫，社交/SSO 分发）：[third-party-tokens.ts#L25-L28](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/account/third-party-tokens.ts#L25-L28)
+- `findSocialTokenSetSecretByUserIdAndTarget`：[secret.ts#L78-L91](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/queries/secret.ts#L78-L91)
 - `decryptTokens`：[secret-encryption.ts#L89-L92](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/utils/secret-encryption.ts#L89-L92)
-- `refreshTokenSetSecret`：[social.ts#L213-L271](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/libraries/social.ts#L213-L271)
+- `refreshTokenSetSecret`（社交版）：[social.ts#L213-L271](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/libraries/social.ts#L213-L271)
 
 #### 流程三：用户企业 SSO 登录时存储 Token
 
@@ -377,8 +388,12 @@ Token 暂存到 EnterpriseSsoVerification.encryptedTokenSet 字段
         ├─ deserializeEncryptedSecret(encryptedTokenSetBase64)
         │   └─ 反序列化得到 { iv, authTag, ciphertext, encryptedDek }（共用）
         └─ queries.secrets.upsertEnterpriseSsoTokenSetSecret()
-            ├─ 事务：删除同 user + ssoConnectorId + issuer + identityId 的旧 secret
-            ├─ 插入 secrets 表（共用主表）
+            ├─ 事务：删除同 user + issuer 的旧 secret（⚠️ 只按 userId + issuer 删除，不区分 ssoConnectorId）
+            │   SQL: DELETE FROM secrets USING secret_enterprise_sso_connector_relations
+            │        WHERE secrets.id = secretId
+            │          AND secrets.user_id = userId
+            │          AND secret_enterprise_sso_connector_relations.issuer = :issuer
+            ├─ 插入 secrets 表（共用主表，type = 'FederatedTokenSet'）
             └─ 插入 secret_enterprise_sso_connector_relations 表（企业 SSO 专属关联表）
 ```
 
@@ -395,20 +410,24 @@ Token 暂存到 EnterpriseSsoVerification.encryptedTokenSet 字段
 ```
 管理员请求：GET /api/users/:userId/sso-identities/:ssoConnectorId?includeTokenSecret=true
     或
-用户请求：GET /api/account/identities/:ssoConnectorId/access-token
+用户请求：GET /api/account/sso-identities/:connectorId/access-token
     ↓
 [enterprise-sso.ts / third-party-tokens.ts]
     ↓
-queries.secrets.findEnterpriseSsoTokenSetSecretByUserIdAndConnectorId(userId, ssoConnectorId)
+queries.secrets.findEnterpriseSsoTokenSetSecretByUserIdAndConnectorId(userId, connectorId)
     └─ JOIN secrets + secret_enterprise_sso_connector_relations
+       WHERE secrets.user_id = userId
+         AND secrets.type = 'FederatedTokenSet'
+         AND sso_connector_id = :connectorId
     ↓
-[获取 Access Token]
+[getAccessToken()] 共用函数（通过类型守卫区分社交/SSO）
+    ├─ isSocialTokenSetSecret() 检查（SSO 类型包含 ssoConnectorId、issuer 字段）
     ├─ decryptTokens({ iv, encryptedDek, ciphertext, authTag })
     │   └─ 共用解密逻辑：使用 KEK 解密得到明文 TokenSet
     ├─ 检查 access_token 是否过期（metadata.expiresAt）
     │   ├─ 未过期：直接返回
     │   └─ 已过期：
-    │       ├─ 有 refresh_token → 调用 ssoConnectors.refreshTokenSetSecret()
+    │       ├─ 有 refresh_token → 调用 ssoConnectors.refreshTokenSetSecret()（企业 SSO 版）
     │       │   ├─ 校验 OidcConnector && enableTokenStorage
     │       │   ├─ OidcConnector.getTokenByRefreshToken() 刷新 Token
     │       │   ├─ encryptTokenResponse() 重新加密（共用）
@@ -419,27 +438,36 @@ queries.secrets.findEnterpriseSsoTokenSetSecretByUserIdAndConnectorId(userId, ss
 ```
 
 **核心代码**：
+- `getAccessToken`（共用函数）：[third-party-tokens.ts#L47-L88](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/account/third-party-tokens.ts#L47-L88)
+- `isSocialTokenSetSecret`（类型守卫，社交/SSO 分发）：[third-party-tokens.ts#L25-L28](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/account/third-party-tokens.ts#L25-L28)
+- `findEnterpriseSsoTokenSetSecretByUserIdAndConnectorId`：[secret.ts#L129-L145](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/queries/secret.ts#L129-L145)
+- `upsertEnterpriseSsoTokenSetSecret`（upsert 删除逻辑）：[secret.ts#L93-L124](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/queries/secret.ts#L93-L124)
 - `refreshTokenSetSecret`（企业 SSO 版）：[sso-connector.ts#L265-L314](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/libraries/sso-connector.ts#L265-L314)
-- `findEnterpriseSsoTokenSetSecretByUserIdAndConnectorId`：数据库查询层
 - `desensitizeTokenSetSecret`：管理员端脱敏返回，隐藏 refresh_token 和 ciphertext
 - Admin User SSO Identities API：[enterprise-sso.ts#L29-L162](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/admin-user/enterprise-sso.ts#L29-L162)
+- User SSO Identities API：[third-party-tokens.ts#L133-L163](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/account/third-party-tokens.ts#L133-L163)
 
 #### 社交连接器 vs 企业 SSO 连接器：共用 vs 差异汇总
 
 | 模块/逻辑 | 社交连接器 | 企业 SSO 连接器 | 是否共用 |
 |----------|-----------|-----------------|---------|
 | `secrets` 主表 | ✅ 使用 | ✅ 使用 | **完全共用** |
+| `secrets.type` 过滤条件 | `type = 'FederatedTokenSet'` | `type = 'FederatedTokenSet'` | **完全共用** |
 | AES-256-GCM 信封加密 | ✅ `encryptTokenResponse` | ✅ 同一函数 | **完全共用** |
 | Token 解密 | ✅ `decryptTokens` | ✅ 同一函数 | **完全共用** |
 | Token 序列化/反序列化 | ✅ `encryptAndSerializeTokenResponse` / `deserializeEncryptedSecret` | ✅ 同一函数 | **完全共用** |
 | Refresh Token 保留策略 | ✅ 保留原 refresh_token | ✅ 同一策略 | **完全共用** |
 | TokenSet 结构（access_token/refresh_token/id_token） | ✅ | ✅ | **完全共用** |
+| `getAccessToken()` 刷新逻辑分发 | ✅ 通过 `isSocialTokenSetSecret()` 类型守卫判断 | ✅ 同一类型守卫判断 | **完全共用** |
 | 连接器配置表 | `connectors` 表 | `sso_connectors` 表（独立） | ❌ 独立表 |
 | 关联表 | `secret_social_connector_relations` | `secret_enterprise_sso_connector_relations`（独立） | ❌ 独立表 |
 | Token 存储触发时机 | 用户主动 PUT 请求 | 用户注册/登录时自动完成 | ❌ 不同 |
 | Token 存储支持的协议类型 | OAuth 2.0 / OIDC 社交连接器 | **仅 OIDC**（SAML 不支持） | ❌ 不同 |
 | Token 刷新入口 | `socials.refreshTokenSetSecret()` | `ssoConnectors.refreshTokenSetSecret()`（独立实现） | ❌ 独立函数（逻辑相同） |
-| 查询入口（按用户查找） | `findSocialTokenSetSecretByUserIdAndTarget` | `findEnterpriseSsoTokenSetSecretByUserIdAndConnectorId` | ❌ 独立查询 |
+| 查询入口（按用户查找） | `findSocialTokenSetSecretByUserIdAndTarget(userId, target)` | `findEnterpriseSsoTokenSetSecretByUserIdAndConnectorId(userId, connectorId)` | ❌ 独立查询 |
+| 查询条件（WHERE 子句） | `user_id = ? AND target = ?` | `user_id = ? AND sso_connector_id = ?` | ❌ 不同 |
+| **Upsert 旧记录删除条件** | `user_id = ? AND target = ?`（按 userId + target） | `user_id = ? AND issuer = ?`（⚠️ 仅按 userId + issuer，不区分 ssoConnectorId） | ❌ 不同 |
+| 用户读取 Token 路由 | `GET /api/account/identities/:target/access-token` | `GET /api/account/sso-identities/:connectorId/access-token` | ❌ 不同路径和参数 |
 
 ---
 
@@ -521,3 +549,14 @@ queries.secrets.findEnterpriseSsoTokenSetSecretByUserIdAndConnectorId(userId, ss
 9. **Refresh Token 的保留策略**：刷新 Token 时，如果第三方未返回新的 refresh_token，会保留原有 refresh_token（如 Google 的一次性 refresh_token 策略）。社交连接器和企业 SSO 连接器共用此策略。
 
 10. **企业 SSO 级联删除通过触发器实现**：`secret_enterprise_sso_connector_relations` 表有两个 PL/pgSQL 触发器，分别在删除 `sso_connectors` 和 `user_sso_identities` 时自动清理关联的 `secrets` 记录。
+
+11. **⚠️ 企业 SSO upsert 删除条件较粗**：`upsertEnterpriseSsoTokenSetSecret` 删除旧记录时只按 `userId + issuer` 删除，不区分 `ssoConnectorId`。这意味着如果同一用户通过同一 issuer（如同一 Azure AD 租户）的不同 SSO 连接器登录，后登录的会覆盖先登录的 Token。
+
+12. **社交与企业 SSO Token 读取路由完全独立**：
+    - 社交连接器：`GET /api/account/identities/:target/access-token`（`target` 是社交目标标识，如 `github`）
+    - 企业 SSO 连接器：`GET /api/account/sso-identities/:connectorId/access-token`（路径是 `/sso-identities/`，参数是 `connectorId`）
+    - 两者参数含义不同，不能混用。
+
+13. **查询必须包含 `type = 'FederatedTokenSet'` 条件**：两个 `find*` 查询函数都会显式加上 `secrets.type = 'FederatedTokenSet'` 过滤条件，确保只查询 Token 类型的 secret，不与其他类型的 secret 混淆。
+
+14. **`getAccessToken` 是共用函数，通过类型守卫分发**：社交和企业 SSO 的 Token 读取和刷新逻辑都走同一个 `getAccessToken` 函数，内部通过 `isSocialTokenSetSecret()` 类型守卫（检查是否包含 `target` 和 `connectorId` 字段）来区分，调用不同的 `refreshTokenSetSecret` 实现。
