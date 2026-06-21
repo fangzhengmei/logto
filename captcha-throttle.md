@@ -13,13 +13,283 @@
 - **支持操作**：密码、验证码、一次性令牌、MFA 各因素
 - **隐私保护**：标识符使用 SHA256 哈希存储，不直接存储手机号/邮箱明文
 
+### 1.3 Passcode (短信/邮件验证码)
+- **作用**：一次性随机码，通过短信或邮件发送给用户完成身份验证
+- **存储表**：`passcodes`（包含 `interactionJti`、`type`、`code`、`email`/`phone`、`consumed`、`tryCount`、`createdAt`）
+- **与 Captcha/Sentinel 的关系**：发送前受 Captcha 守卫，校验时受 Sentinel + 单码 tryCount 双重保护
+
 ---
 
-## 二、各入口 Captcha 与 Sentinel 的执行顺序
+## 二、Passcode 控制层详解
+
+### 2.1 旧码失效（创建新码时物理删除旧码）
+
+**代码**：[passcode.ts L65-L88](file:///d:/fz/0601-2/solo-dogfeeding/code/64-logto/packages/core/src/libraries/passcode.ts#L65-L88)
+
+```typescript
+const createPasscode = async (jti, type, payload) => {
+  // 1. 查找未消费的旧码
+  const passcodes = jti
+    ? await findUnconsumedPasscodesByJtiAndType(jti, type)       // 会话级：按 jti + type
+    : await findUnconsumedPasscodesByIdentifierAndType({ type, ...payload }); // 全局级：按 identifier + type
+
+  // 2. 物理删除旧码（不是置 consumed，是 DELETE）
+  if (passcodes.length > 0) {
+    await deletePasscodesByIds(passcodes.map(({ id }) => id));
+  }
+
+  // 3. 插入新码
+  return insertPasscode({
+    id: nanoid(),
+    interactionJti: jti,
+    type,
+    code: randomCode(),  // 6 位纯数字
+    ...payload,
+  });
+};
+```
+
+**关键点**：
+- **失效方式**：物理删除（`DELETE`），不是置 `consumed = true`
+- **两种查找维度**：
+  - 会话级（有 `jti`）：按 `interaction_jti + template_type` 查，覆盖 SignIn/Register/MFA 等场景
+  - 全局级（无 `jti`）：按 `email/phone + template_type` 查，覆盖管理 API 触发的场景
+- **防重复**：每次发送新码都会删除同一会话/同一标识的未消费旧码，确保永远只有一条有效验证码
+- **数据库查询**：[queries/passcode.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/64-logto/packages/core/src/queries/passcode.ts) 中 `findUnconsumedPasscodesByJtiAndType` 通过 `consumed = false` 过滤
+
+### 2.2 单码过期（时间窗口）
+
+**代码**：[passcode.ts L147-L157](file:///d:/fz/0601-2/solo-dogfeeding/code/64-logto/packages/core/src/libraries/passcode.ts#L147-L157)
+
+```typescript
+const { verificationCodePolicy } = await queries.signInExperiences.findDefaultSignInExperience();
+const expirationMs =
+  (verificationCodePolicy.expirationDuration ?? defaultVerificationCodePolicy.expirationDuration) * 1000;
+// 默认 600 秒 = 10 分钟
+
+if (passcode.createdAt + expirationMs < Date.now()) {
+  throw new RequestError('verification_code.expired');
+}
+```
+
+**关键点**：
+- 过期阈值来自 `sign_in_experiences.verificationCodePolicy.expirationDuration`，默认 600 秒
+- **过期后**：passcode 记录仍在数据库中，但校验时抛 `verification_code.expired`
+- 过期的 passcode 不会被自动清理，而是在下次创建新码时被 `createPasscode` 的删除逻辑清理
+
+### 2.3 单码重试次数（tryCount）
+
+**代码**：[passcode.ts L159-L168](file:///d:/fz/0601-2/solo-dogfeeding/code/64-logto/packages/core/src/libraries/passcode.ts#L159-L168)
+
+```typescript
+const maxTryCount =
+  verificationCodePolicy.maxRetryAttempts ?? defaultVerificationCodePolicy.maxRetryAttempts;
+// 默认 10 次
+
+// 先检查是否超限
+if (passcode.tryCount >= maxTryCount) {
+  throw new RequestError('verification_code.exceed_max_try');
+}
+
+// 验证码错误 → tryCount + 1
+if (code !== passcode.code) {
+  await increasePasscodeTryCount(passcode.id);  // UPDATE passcodes SET tryCount = tryCount + 1
+  throw new RequestError('verification_code.code_mismatch');
+}
+
+// 验证码正确 → consumed = true
+await consumePasscode(passcode.id);  // UPDATE passcodes SET consumed = true
+```
+
+**关键点**：
+- 重试次数阈值来自 `sign_in_experiences.verificationCodePolicy.maxRetryAttempts`，默认 10 次
+- **tryCount 是单码级计数器**：每条 passcode 记录独立计数，重置通过重发新码实现（旧码被删，新码 tryCount 从 0 开始）
+- **校验顺序**：先查过期 → 再查 tryCount 超限 → 最后比对 code
+- **code 错误**：`tryCount++` 并抛 `code_mismatch`
+- **code 正确**：`consumed = true`，该码永久失效
+
+### 2.4 忘记密码跳过投递（skipDelivery）
+
+**代码**：[verification-code-helpers.ts L76-L144](file:///d:/fz/0601-2/solo-dogfeeding/code/64-logto/packages/core/src/routes/experience/verification-routes/verification-code-helpers.ts#L76-L144)
+
+```typescript
+// 判断用户是否存在
+const hasUserWithIdentifier = async (queries, identifier): Promise<boolean> => {
+  const { type, value } = identifier;
+  if (type === SignInIdentifier.Email) {
+    return queries.users.hasUserWithEmail(value);
+  }
+  return queries.users.hasUserWithNormalizedPhone(value);
+};
+
+// sendCode 主逻辑
+const skipDelivery =
+  interactionEvent === InteractionEvent.ForgotPassword &&
+  !(await hasUserWithIdentifier(queries, identifier));
+
+const payload = skipDelivery
+  ? undefined
+  : {
+      ...ctx.emailI18n,
+      ...(await buildVerificationCodeTemplateContext(...)),
+      ...(ctx.request.ip && { ip: ctx.request.ip }),
+    };
+
+await codeVerification.sendVerificationCode(payload, { skipDelivery });
+```
+
+**`sendVerificationCode()` 内部分支** ([code-verification.ts L102-L119](file:///d:/fz/0601-2/solo-dogfeeding/code/64-logto/packages/core/src/routes/experience/classes/verifications/code-verification.ts#L102-L119))：
+
+```typescript
+async sendVerificationCode(payload?, options?: { skipDelivery?: boolean }) {
+  const { createPasscode, sendPasscode } = this.libraries.passcodes;
+
+  // ① 无论 skipDelivery 是否为 true，都创建 passcode 记录（旧码失效）
+  const verificationCode = await createPasscode(
+    this.id,
+    this.templateType,
+    getPasscodeIdentifierPayload(this.identifier)
+  );
+
+  // ② skipDelivery = true 时，不调用 sendPasscode（不发短信/邮件）
+  if (options?.skipDelivery) {
+    return;
+  }
+
+  // ③ 正常调用连接器发送
+  await sendPasscode(verificationCode, payload);
+}
+```
+
+**关键点**：
+- **触发条件**：`ForgotPassword` 事件 + 用户不存在
+- **数据库仍写记录**：即使不投递，`createPasscode` 也会执行——删除旧码、插入新码、tryCount=0
+- **目的 1 — 防止账号枚举**：攻击者输入不存在的邮箱，接口返回与正常一致（都是 200，`verificationId` 相同），无法通过响应差异判断账号是否存在
+- **目的 2 — 防止配置泄露**：`payload = undefined` 跳过 connector 和 template 校验，避免因模板/连接器配置错误泄露信息
+- **用户体验**：真实用户（账号存在）会收到邮件；攻击者（账号不存在）不会收到任何邮件，但接口表现完全一样
+- **与 Captcha 的关系**：`guardCaptcha()` 在 `sendCode()` 之前执行，所以即使用户不存在、不实际投递，仍需先过 Captcha
+
+---
+
+## 三、Passcode 与 Captcha、Sentinel 的配合时序
+
+### 3.1 验证码发送（sendCode）完整执行顺序
+
+```
+POST /experience/verification/verification-code
+Body: { identifier, interactionEvent }
+        ↓
+① guardCaptcha()                                              ← 【Captcha 检查】
+  │  └─ !identifiedUserId && captchaPolicy.enabled → 抛 captcha_required
+  │     注意：ForgotPassword 也走这里，即使用户不存在也要先过 Captcha
+        ↓
+② sendCode()
+  ├─ 2a. createVerificationRecord()                           ← 构建 CodeVerification 对象
+  ├─ 2b. Register + Email → guardEmailBlocklist()             ← 注册邮件黑名单
+  ├─ 2c. 计算 skipDelivery:
+  │       ForgotPassword && !hasUserWithIdentifier(queries, identifier)
+  ├─ 2d. codeVerification.sendVerificationCode(payload, { skipDelivery })
+  │     ├─ createPasscode(id, templateType, payload)          ← 【旧码失效：物理删除旧码，插入新码】
+  │     ├─ if (skipDelivery) return;                          ← 【跳过投递】
+  │     └─ sendPasscode() → 调用短信/邮件连接器发送
+  └─ 2e. setVerificationRecord() + save()                     ← 保存到交互会话
+        ↓
+返回 { verificationId }
+```
+
+**配合关系**：
+| 检查 | 位置 | 触发时机 |
+|------|------|----------|
+| Captcha | ① | **最先执行**，sendCode 之前，所有 interactionEvent 都需要 |
+| 旧码失效 | 2d createPasscode | 创建新码时物理删除旧码，即使 skipDelivery 也执行 |
+| 邮件黑名单 | 2b | 仅 Register + Email |
+| skipDelivery | 2c-2d | 仅 ForgotPassword + 用户不存在 |
+
+### 3.2 验证码校验（verifyCode）完整执行顺序
+
+```
+POST /experience/verification/verification-code/verify
+Body: { verificationId, identifier, code }
+        ↓
+① getVerificationRecordByTypeAndId()                          ← 从交互会话取 CodeVerification
+        ↓
+② withSentinel(SentinelActivityAction.VerificationCode,       ← 【Sentinel 包裹】
+     codeVerificationRecord.verify(identifier, code))
+  │
+  ├─ 2a. verifyPasscode(jti, templateType, code, payload)     ← 【Passcode 校验】
+  │     ├─ 查找 passcode（按 interactionJti + type）
+  │     │   └─ 不存在 → verification_code.not_found
+  │     ├─ 校验 identifier（email/phone 匹配）
+  │     ├─ 加载 verificationCodePolicy（expirationDuration, maxRetryAttempts）
+  │     ├─ 【过期检查】 createdAt + expirationMs < now
+  │     │   └─ expired → verification_code.expired
+  │     ├─ 【tryCount 检查】 passcode.tryCount >= maxRetryAttempts
+  │     │   └─ 超限 → verification_code.exceed_max_try
+  │     ├─ 【code 比对】
+  │     │   ├─ 错误 → increasePasscodeTryCount() → code_mismatch
+  │     │   └─ 正确 → consumePasscode() → consumed = true
+  │     └─ 通过 → verified = true
+  │
+  ├─ 2b. reportActivity(VerificationCode, Failed/Success)     ← 【Sentinel 计数】
+  │     ├─ 合并池（与 Password、OneTimeToken 共享）
+  │     ├─ 失败次数累计达 100 次/小时 → 抛 verification_blocked
+  │     └─ 目标标识符 SHA256 哈希存储
+  │
+  └─ 2c. withSentinel 结果：
+        ├─ Sentinel 锁定 → 抛 verification_blocked（优先级最高）
+        ├─ 验证失败 → 抛原错误（code_mismatch / expired / exceed_max_try）
+        └─ 成功 → 返回
+        ↓
+③ experienceInteraction.save()
+        ↓
+返回 { verificationId }
+```
+
+**配合关系**（双重保护）：
+| 检查 | 计数器范围 | 默认阈值 | 错误码 |
+|------|-----------|---------|--------|
+| **单码 tryCount** | 单条 passcode 记录 | 10 次 | `verification_code.exceed_max_try` |
+| **Sentinel 合并池** | 同标识符 1 小时内所有验证码失败 | 100 次 | `session.verification_blocked_too_many_attempts` |
+| **过期时间** | 单条 passcode 记录 | 600 秒 | `verification_code.expired` |
+
+> **三层防护**：
+> 1. 过期时间（时间窗口）
+> 2. 单码 tryCount（微观粒度，防一个码被猜 10 次以上）
+> 3. Sentinel 合并池（宏观粒度，防重发新码绕过 tryCount，累计达 100 次后锁定）
+
+### 3.3 ForgotPassword 场景下的完整链路
+
+```
+ForgotPassword: 用户输入不存在的邮箱
+        ↓
+[POST /experience/verification/verification-code]
+  ├─ ① guardCaptcha() → 必须通过 Captcha
+  ├─ ② sendCode()
+  │     ├─ interactionEvent = ForgotPassword
+  │     ├─ hasUserWithIdentifier(email) → false
+  │     ├─ skipDelivery = true
+  │     ├─ createPasscode() → 物理删除旧码 + 插入新码（数据库有记录）
+  │     ├─ if (skipDelivery) return; → 不实际发送邮件
+  │     └─ save() → 保存 verificationId
+  └─ 返回 { verificationId }（与正常发送完全相同的响应）
+        ↓
+[POST /experience/verification/verification-code/verify]
+  ├─ ① withSentinel(VerificationCode, verify())
+  │     ├─ verifyPasscode() → code 错误（因为用户没收到邮件，输入的是瞎猜的）
+  │     │   └─ tryCount++ + 抛 code_mismatch
+  │     └─ reportActivity(Failed) → Sentinel 合并池 +1
+  └─ 返回 code_mismatch（同样的错误码，攻击者无法区分）
+```
+
+**防枚举效果**：整个流程中接口响应与真实用户场景完全一致，攻击者无法判断该邮箱是否注册过账号。同时 Captcha 防止枚举请求被自动化发起，Sentinel 防止同一邮箱被反复尝试。
+
+---
+
+## 四、各入口 Captcha 与 Sentinel 的执行顺序
 
 > **核心结论**：只有「验证码发送」入口**先做人机校验**（guardCaptcha）；密码验证、验证码校验、一次性令牌入口都**先记录失败次数**（withSentinel），Captcha 校验延迟到最终 submit。
 
-### 2.1 密码验证：先 Sentinel，无前置 Captcha
+### 4.1 密码验证：先 Sentinel，无前置 Captcha
 
 **路由**：`POST /experience/verification/password`
 **代码**：[password-verification.ts L36-L73](file:///d:/fz/0601-2/solo-dogfeeding/code/64-logto/packages/core/src/routes/experience/verification-routes/password-verification.ts#L36-L73)
@@ -44,7 +314,7 @@
 - **Sentinel 先于 Captcha 生效**：密码错误先被 Sentinel 记录，Captcha 仅在最终提交时守卫
 - **设计原因**：密码验证是「凭证提交」，不存在资源消耗（不发短信/邮件），先记录失败更合理
 
-### 2.2 验证码发送：先 Captcha，无 Sentinel
+### 4.2 验证码发送：先 Captcha，无 Sentinel
 
 **路由**：`POST /experience/verification/verification-code`
 **代码**：[verification-code.ts L47-L84](file:///d:/fz/0601-2/solo-dogfeeding/code/64-logto/packages/core/src/routes/experience/verification-routes/verification-code.ts#L47-L84)
@@ -57,43 +327,48 @@
   ↓
 ② sendCode()                                  ← 发送验证码
   ├─ 2a. guardEmailBlocklist()                ← 注册邮件黑名单检查
-  ├─ 2b. sendVerificationCode()               ← 实际发送（消耗资源）
-  └─ 2c. setVerificationRecord + save()
+  ├─ 2b. createPasscode() → 旧码物理删除 + 新码插入
+  ├─ 2c. ForgotPassword + 用户不存在 → skipDelivery（不实际发送）
+  ├─ 2d. sendPasscode()（非 skipDelivery 时）
+  └─ 2e. setVerificationRecord + save()
 ```
 
 **关键点**：
-- **先 Captcha 后发送**：`guardCaptcha()` 在发送验证码之前执行，防止自动化脚本消耗短信/邮件配额
+- **先 Captcha 后发送**：`guardCaptcha()` 在 sendCode 之前执行，防止自动化脚本消耗短信/邮件配额
 - **无 Sentinel**：发送验证码不涉及凭证校验，不记录失败次数
 - **条件守卫**：仅当 `!identifiedUserId` 时才检查 Captcha，已识别用户（如 MFA 流程中）无需再次验证
-- **设计原因**：发送验证码是「资源消耗」操作，必须先拦截机器人，否则验证码可被无限发送
+- **ForgotPassword 也过 Captcha**：即使用户不存在、最终 skipDelivery，仍需先过 Captcha
 
-### 2.3 验证码校验：先 Sentinel，无前置 Captcha
+### 4.3 验证码校验：先 Sentinel（内嵌套三层 passcode 校验），无前置 Captcha
 
 **路由**：`POST /experience/verification/verification-code/verify`
-**代码**：[verification-code.ts L101-L114](file:///d:/fz/0601-2/solo-dogfeeding/code/64-logto/packages/core/src/routes/experience/verification-routes/verification-code.ts#L101-L114) → [verification-code-helpers.ts L172-L223](file:///d:/fz/0601-2/solo-dogfeeding/code/64-logto/packages/core/src/routes/experience/verification-routes/verification-code-helpers.ts#L172-L223)
+**代码**：[verification-code-helpers.ts L172-L223](file:///d:/fz/0601-2/solo-dogfeeding/code/64-logto/packages/core/src/routes/experience/verification-routes/verification-code-helpers.ts#L172-L223)
 
 ```
 请求进入
   ↓
-① getVerificationRecordByTypeAndId()           ← 取出验证码记录
+① withSentinel(VerificationCode,
+     codeVerificationRecord.verify(identifier, code))
+  │
+  ├─ 内层 verifyPasscode()：
+  │   ├─ 过期检查（600s）
+  │   ├─ tryCount 检查（10 次）→ 超限抛 exceed_max_try
+  │   └─ code 比对 → 错误时 tryCount++ 抛 code_mismatch
+  │
+  ├─ reportActivity(VerificationCode, Failed/Success)
+  │   └─ 合并池累计（跨多码）达 100 次/小时 → 抛 verification_blocked
+  │
+  └─ withSentinel 返回：Sentinel 锁定 > 原验证错误 > 成功
   ↓
-② withSentinel(VerificationCode, codeVerificationRecord.verify(identifier, code))
-  ├─ 2a. 执行 verify()                         ← 校验验证码
-  │   ├─ 检查过期（默认 600 秒）
-  │   ├─ 检查单码重试次数（默认 10 次）
-  │   └─ 验证码错误 → code_mismatch
-  ├─ 2b. reportActivity(VerificationCode, Failed/Success) ← 记录失败/成功
-  └─ 2c. 如达阈值 → 抛 verification_blocked    ← Sentinel 阻止
-  ↓
-③ experienceInteraction.save()                 ← 保存到交互会话
+② save()
 ```
 
 **关键点**：
 - **无前置 guardCaptcha**：验证码校验路由中不调用 `guardCaptcha()`
-- **Sentinel 记录失败**：验证码输入错误会被 Sentinel 记录到合并池（与密码失败共享计数器）
-- **双重保护**：单验证码有重试次数限制（默认 10 次），Sentinel 则跨验证码累计失败
+- **三层校验嵌套**：Sentinel 包裹，内层 verifyPasscode 依次做过期 → tryCount → code 比对
+- **双重计数器**：单码 tryCount（10 次/码）+ Sentinel 合并池（100 次/小时/标识符）
 
-### 2.4 一次性令牌验证：先 Sentinel，成功后 skipCaptcha
+### 4.4 一次性令牌验证：先 Sentinel，成功后 skipCaptcha
 
 **路由**：`POST /experience/verification/one-time-token/verify`
 **代码**：[one-time-token.ts L37-L75](file:///d:/fz/0601-2/solo-dogfeeding/code/64-logto/packages/core/src/routes/experience/verification-routes/one-time-token.ts#L37-L75)
@@ -121,7 +396,7 @@
 - **Sentinel 失败 → Captcha 不跳过**：攻击者即使拿到令牌也需过 Captcha，因为 skipCaptcha 在 withSentinel 之后
 - **设计意图**：一次性令牌（Magic Link）通过邮箱点击获取，本身已是人机验证；但令牌验证失败仍需 Sentinel 计数
 
-### 2.5 最终提交：先 Captcha，再 MFA 守卫
+### 4.5 最终提交：先 Captcha，再 MFA 守卫
 
 **路由**：`POST /experience/submit`
 **代码**：[index.ts L169-L194](file:///d:/fz/0601-2/solo-dogfeeding/code/64-logto/packages/core/src/routes/experience/index.ts#L169-L194) → [experience-interaction.ts L474-L653](file:///d:/fz/0601-2/solo-dogfeeding/code/64-logto/packages/core/src/routes/experience/classes/experience-interaction.ts#L474-L653)
@@ -150,13 +425,13 @@
 
 ---
 
-## 三、执行顺序总览表
+## 五、执行顺序总览表
 
 | 入口 | Captcha 守卫 | Sentinel 记录 | 执行顺序 | 原因 |
 |------|-------------|--------------|----------|------|
 | **密码验证** `/verification/password` | ❌ 无 | ✅ 先执行 | **Sentinel → （submit 时 Captcha）** | 密码验证不消耗外部资源，先记录失败即可 |
-| **验证码发送** `/verification/verification-code` | ✅ 先执行 | ❌ 无 | **Captcha → 发送** | 发送验证码消耗短信/邮件配额，必须先拦截机器人 |
-| **验证码校验** `/verification/verification-code/verify` | ❌ 无 | ✅ 先执行 | **Sentinel → （submit 时 Captcha）** | 凭证校验场景，记录失败比 Captcha 更重要 |
+| **验证码发送** `/verification/verification-code` | ✅ 先执行 | ❌ 无 | **Captcha → 旧码失效 → 发送/skipDelivery** | 发送消耗短信/邮件配额，必须先拦截机器人 |
+| **验证码校验** `/verification/verification-code/verify` | ❌ 无 | ✅ 先执行 | **Sentinel(过期 → tryCount → code) → （submit 时 Captcha）** | 三层校验嵌套，双重计数器 |
 | **一次性令牌** `/verification/one-time-token/verify` | ❌ 无 | ✅ 先执行 | **Sentinel → 成功后 skipCaptcha** | Sentinel 先判断，通过后 Captcha 自动跳过 |
 | **社交登录** `/verification/social/:connectorId/verify` | ❌ 无 | ❌ 无 | **验证 → 成功后 skipCaptcha** | 第三方已验证身份，两者都不需要 |
 | **企业 SSO** `/verification/sso/:connectorId/verify` | ❌ 无 | ❌ 无 | **验证 → 成功后 skipCaptcha** | 企业 IdP 已验证身份，两者都不需要 |
@@ -166,12 +441,12 @@
 ### 执行顺序分类
 
 **A 类：先 Captcha（人机校验优先）**
-- 验证码发送：防止机器人消耗资源
+- 验证码发送：防止机器人消耗资源（即使 skipDelivery 也先过 Captcha）
 - 最终提交：防止未通过人机校验的请求完成登录
 
 **B 类：先 Sentinel（失败计数优先）**
 - 密码验证：记录失败次数，延迟 Captcha 到提交
-- 验证码校验：记录失败次数，延迟 Captcha 到提交
+- 验证码校验：Sentinel 包裹内层三层校验（过期 → tryCount → code），双重计数器
 - 一次性令牌：先记录失败次数，成功后自动跳过 Captcha
 
 **C 类：两者都不需要**
@@ -179,9 +454,9 @@
 
 ---
 
-## 四、Captcha 验证代码路径
+## 六、Captcha 验证代码路径
 
-### 4.1 核心类与文件
+### 6.1 核心类与文件
 
 | 类/文件 | 位置 | 职责 |
 |--------|------|------|
@@ -189,7 +464,7 @@
 | `ExperienceInteraction` | [experience-interaction.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/64-logto/packages/core/src/routes/experience/classes/experience-interaction.ts) | 管理交互会话中的 captcha 状态 |
 | `SignInExperienceValidator` | [sign-in-experience-validator.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/64-logto/packages/core/src/routes/experience/classes/libraries/sign-in-experience-validator.ts) | 检查 captcha 策略是否要求验证 |
 
-### 4.2 Captcha 状态管理
+### 6.2 Captcha 状态管理
 
 在 `ExperienceInteraction` 中维护 captcha 状态（[L74-L77](file:///d:/fz/0601-2/solo-dogfeeding/code/64-logto/packages/core/src/routes/experience/classes/experience-interaction.ts#L74-L77)）：
 
@@ -203,7 +478,7 @@ private readonly captcha = {
 - `verified`: 前端在创建交互时主动提交 captchaToken 并验证通过
 - `skipped`: 后端在第三方验证成功后自动标记（skipCaptcha）
 
-### 4.3 Captcha 验证入口
+### 6.3 Captcha 验证入口
 
 **交互创建时可选验证** ([index.ts L62-L96](file:///d:/fz/0601-2/solo-dogfeeding/code/64-logto/packages/core/src/routes/experience/index.ts#L62-L96))
 
@@ -216,7 +491,7 @@ Body: { interactionEvent, captchaToken? }
 - 这是**主动验证**入口，captchaToken 由前端根据策略决定是否提交
 - 验证通过后 `captcha.verified = true`
 
-### 4.4 Captcha 校验守卫
+### 6.4 Captcha 校验守卫
 
 **`guardCaptcha()`** ([experience-interaction.ts L655-L661](file:///d:/fz/0601-2/solo-dogfeeding/code/64-logto/packages/core/src/routes/experience/classes/experience-interaction.ts#L655-L661))
 
@@ -233,7 +508,7 @@ async guardCaptcha() {
 
 - 仅当 `captchaPolicy.enabled = true` 且 `!verified && !skipped` 时抛 `captcha_required`
 
-### 4.5 guardCaptcha 调用点
+### 6.5 guardCaptcha 调用点
 
 | 调用位置 | 代码路径 | 触发条件 |
 |---------|----------|----------|
@@ -241,7 +516,7 @@ async guardCaptcha() {
 | 创建用户时 | [experience-interaction.ts L303](file:///d:/fz/0601-2/solo-dogfeeding/code/64-logto/packages/core/src/routes/experience/classes/experience-interaction.ts#L303) | 注册流程 createUser 前检查 |
 | 提交交互时 | [experience-interaction.ts L483](file:///d:/fz/0601-2/solo-dogfeeding/code/64-logto/packages/core/src/routes/experience/classes/experience-interaction.ts#L483) | 登录/注册最终 submit 前检查 |
 
-### 4.6 skipCaptcha 调用点
+### 6.6 skipCaptcha 调用点
 
 `skipCaptcha()` 定义于 [experience-interaction.ts L440-L442](file:///d:/fz/0601-2/solo-dogfeeding/code/64-logto/packages/core/src/routes/experience/classes/experience-interaction.ts#L440-L442)。
 
@@ -254,7 +529,7 @@ async guardCaptcha() {
 
 > **关键时序**：skipCaptcha 全部在「验证成功后」触发。一次性令牌场景中，如果 withSentinel 因验证失败或被锁定而抛出异常，skipCaptcha 不会执行——这意味着失败路径仍需在 submit 时过 Captcha。
 
-### 4.7 Captcha 第三方验证实现
+### 6.7 Captcha 第三方验证实现
 
 **Turnstile** ([captcha-validator.ts L43-L76](file:///d:/fz/0601-2/solo-dogfeeding/code/64-logto/packages/core/src/routes/experience/classes/libraries/captcha-validator.ts#L43-L76))
 - Cloudflare API，检查 `success` 字段
@@ -264,9 +539,9 @@ async guardCaptcha() {
 
 ---
 
-## 五、Sign-in 节流 (Sentinel) 代码路径
+## 七、Sign-in 节流 (Sentinel) 代码路径
 
-### 5.1 核心类与文件
+### 7.1 核心类与文件
 
 | 类/文件 | 位置 | 职责 |
 |--------|------|------|
@@ -274,7 +549,7 @@ async guardCaptcha() {
 | `withSentinel()` | [sentinel-guard.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/64-logto/packages/core/src/routes/experience/classes/libraries/sentinel-guard.ts) | 验证操作包装器，自动报告活动结果 |
 | `defaultSentinelPolicy` | [sentinel.ts L9-L12](file:///d:/fz/0601-2/solo-dogfeeding/code/64-logto/packages/schemas/src/consts/sentinel.ts#L9-L12) | 默认阈值定义 |
 
-### 5.2 Sentinel 策略配置与默认阈值
+### 7.2 Sentinel 策略配置与默认阈值
 
 ```typescript
 type SentinelPolicy = {
@@ -290,7 +565,7 @@ export const defaultSentinelPolicy = Object.freeze({
 } satisfies SentinelPolicy);
 ```
 
-### 5.3 活动类型与计数池
+### 7.3 活动类型与计数池
 
 **计数池分组** 定义于 [basic-sentinel.ts L30-L45](file:///d:/fz/0601-2/solo-dogfeeding/code/64-logto/packages/core/src/sentinel/basic-sentinel.ts#L30-L45)：
 
@@ -303,7 +578,7 @@ export const defaultSentinelPolicy = Object.freeze({
 - 独立池：TOTP 错 100 次只锁定 TOTP，不影响密码登录
 - 注意：MFA 的邮箱/手机验证码也使用 `VerificationCode`，同样计入合并池
 
-### 5.4 withSentinel 内部执行顺序
+### 7.4 withSentinel 内部执行顺序
 
 **代码**：[sentinel-guard.ts L28-L78](file:///d:/fz/0601-2/solo-dogfeeding/code/64-logto/packages/core/src/routes/experience/classes/libraries/sentinel-guard.ts#L28-L78)
 
@@ -335,7 +610,7 @@ withSentinel(action, identifier, verificationPromise)
 - **阻止优先于原错误**：如果 Sentinel 决定阻止，抛出的是 `verification_blocked` 而非原验证错误
 - **成功时无感**：验证成功时 reportActivity 记录成功，不抛异常
 
-### 5.5 Sentinel 应用位置一览表
+### 7.5 Sentinel 应用位置一览表
 
 | 验证类型 | 代码位置 | Sentinel Action | 计数池 |
 |----------|----------|-----------------|--------|
@@ -351,9 +626,9 @@ withSentinel(action, identifier, verificationPromise)
 
 ---
 
-## 六、完整登录流程详解
+## 八、完整登录流程详解
 
-### 6.1 密码登录流程
+### 8.1 密码登录流程
 
 ```
 用户输入用户名密码
@@ -378,7 +653,7 @@ withSentinel(action, identifier, verificationPromise)
 
 **执行顺序**：Sentinel（步骤①）→ Captcha（步骤⑤）
 
-### 6.2 验证码登录流程
+### 8.2 验证码登录流程
 
 ```
 用户输入手机号/邮箱
@@ -387,12 +662,15 @@ withSentinel(action, identifier, verificationPromise)
         ↓
 [POST /experience/verification/verification-code]
   ├─ ① guardCaptcha() → 未识别用户且策略启用 → 422 captcha_required  ← 先 Captcha
-  └─ ② sendCode() → 发送验证码
+  └─ ② sendCode()
+        ├─ createPasscode() → 旧码物理删除 + 新码插入
+        └─ sendPasscode() → 发送验证码
         ↓
 用户输入验证码
         ↓
 [POST /experience/verification/verification-code/verify]
   ├─ ③ withSentinel(VerificationCode, verify(code))               ← 后 Sentinel
+  │     ├─ 内层：过期 → tryCount → code 比对（三层）
   │     ├─ 验证码错误 → reportActivity(Failed) → 合并池 +1
   │     └─ 验证码正确 → reportActivity(Success) → 继续
   └─ ④ save()
@@ -405,9 +683,9 @@ withSentinel(action, identifier, verificationPromise)
   └─ ⑦ 完成登录
 ```
 
-**执行顺序**：Captcha（步骤①）→ Sentinel（步骤③）→ Captcha 再次确认（步骤⑥）
+**执行顺序**：Captcha（步骤①）→ Sentinel + 三层 passcode 校验（步骤③）→ Captcha 再次确认（步骤⑥）
 
-### 6.3 一次性令牌 (Magic Link) 流程
+### 8.3 一次性令牌 (Magic Link) 流程
 
 ```
 [POST /experience/verification/one-time-token/verify]
@@ -427,36 +705,18 @@ withSentinel(action, identifier, verificationPromise)
 
 **执行顺序**：Sentinel（步骤①）→ skipCaptcha（步骤②）→ Captcha 确认（步骤⑤自动通过）
 
-### 6.4 社交登录流程
-
-```
-[POST /experience/verification/social/:connectorId/verify]
-  ├─ ① socialVerificationRecord.verify() → 验证第三方回调
-  ├─ ② skipCaptcha() → 验证成功后跳过
-  └─ ③ save()
-        ↓
-[POST /experience/identification]
-  └─ ④ identifyUser()
-        ↓
-[POST /experience/submit]
-  ├─ ⑤ guardCaptcha() → captcha.skipped = true → 通过
-  └─ ⑥ 完成登录
-```
-
-**执行顺序**：无 Sentinel → 验证成功后 skipCaptcha → Captcha 确认自动通过
-
 ---
 
-## 七、关键配置与默认值
+## 九、关键配置与默认值
 
-### 7.1 CaptchaPolicy
+### 9.1 CaptchaPolicy
 ```typescript
 type CaptchaPolicy = {
   enabled?: boolean;  // 默认 undefined（不启用）
 };
 ```
 
-### 7.2 SentinelPolicy
+### 9.2 SentinelPolicy
 ```typescript
 type SentinelPolicy = {
   maxAttempts?: number;      // 默认 100 次/小时
@@ -464,17 +724,19 @@ type SentinelPolicy = {
 };
 ```
 
-### 7.3 VerificationCodePolicy
+### 9.3 VerificationCodePolicy
 ```typescript
 type VerificationCodePolicy = {
   expirationDuration?: number;  // 默认 600 秒（10分钟）
-  maxRetryAttempts?: number;    // 默认 10 次
+  maxRetryAttempts?: number;    // 默认 10 次（单码 tryCount）
 };
 ```
 
+默认值定义于 [verification-code.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/64-logto/packages/schemas/src/consts/verification-code.ts#L9-L12)。
+
 ---
 
-## 八、错误码汇总
+## 十、错误码汇总
 
 | 错误码 | 触发场景 | HTTP 状态 |
 |--------|----------|-----------|
@@ -482,21 +744,43 @@ type VerificationCodePolicy = {
 | `session.captcha_failed` | captchaToken 第三方验证未通过 | 422 |
 | `session.verification_blocked_too_many_attempts` | Sentinel 失败次数超阈值 | 422 |
 | `session.invalid_credentials` | 密码错误 | 422 |
-| `verification_code.code_mismatch` | 验证码错误 | 422 |
+| `verification_code.not_found` | Passcode 记录不存在（已被删/未创建） | 422 |
+| `verification_code.code_mismatch` | 验证码错误（tryCount++） | 422 |
 | `verification_code.expired` | 验证码超过有效期 | 422 |
-| `verification_code.exceed_max_try` | 单码重试次数超限 | 422 |
+| `verification_code.exceed_max_try` | 单码重试次数超限（默认 10 次） | 422 |
+| `verification_code.email_mismatch` | 邮箱与 passcode 记录不匹配 | 422 |
+| `verification_code.phone_mismatch` | 手机号与 passcode 记录不匹配 | 422 |
 
 ---
 
-## 九、设计要点总结
+## 十一、设计要点总结
 
-1. **执行顺序分两类**：
-   - **资源消耗型操作**（验证码发送）→ 先 Captcha 后执行，防止机器人消耗配额
-   - **凭证校验型操作**（密码/验证码/令牌校验）→ 先 Sentinel 后 Captcha，失败次数优先记录
-2. **Captcha 延迟到 submit**：密码验证和验证码校验不在自身路由检查 Captcha，而是在 `submit()` 统一守卫
-3. **skipCaptcha 时序保证**：一次性令牌场景中 skipCaptcha 在 withSentinel 之后，验证失败时不会跳过 Captcha
-4. **Sentinel 默认阈值 100 次/小时**：较高阈值与 Captcha 前置拦截互补
-5. **计数池双轨制**：合并池（Password+VerificationCode+OneTimeToken）vs 独立池（MFA 各因素）
-6. **隐私保护**：Sentinel 目标标识符以 SHA256 哈希存入数据库，不落明文
-7. **Captcha 状态持久化**：verified/skipped 随 OIDC interaction 会话存储，同一会话只需验证一次
-8. **灵活配置**：所有阈值均可通过 SignInExperience 配置调整
+### 11.1 执行顺序分两类
+- **资源消耗型操作**（验证码发送）→ 先 Captcha 后执行，防止机器人消耗配额
+- **凭证校验型操作**（密码/验证码/令牌校验）→ 先 Sentinel 后 Captcha，失败次数优先记录
+
+### 11.2 Passcode 三层防护
+1. **过期时间**（600s）：防止旧码被长期利用
+2. **单码 tryCount**（10 次/码）：防止单条验证码被暴力猜测
+3. **Sentinel 合并池**（100 次/小时）：防止重发新码绕过 tryCount，跨码累计失败次数
+
+### 11.3 Passcode 旧码失效机制
+- 创建新码时**物理删除**旧码（DELETE），不是置 consumed
+- 按 `interactionJti + templateType`（会话级）或 `identifier + templateType`（全局级）查找
+- ForgotPassword skipDelivery 场景同样触发旧码失效
+
+### 11.4 ForgotPassword skipDelivery
+- 忘记密码 + 用户不存在 → 仍写 passcode 记录，但不发送邮件/短信
+- 目的：防止账号枚举（接口响应与正常发送完全一致）
+- 配合：Captcha 仍需先过（防止自动化枚举），Sentinel 在校验时仍计数（防止反复尝试）
+
+### 11.5 Captcha 延迟到 submit
+- 密码验证和验证码校验不在自身路由检查 Captcha，而是在 `submit()` 统一守卫
+- skipCaptcha 时序保证：一次性令牌场景中 skipCaptcha 在 withSentinel 之后，验证失败时不会跳过 Captcha
+
+### 11.6 其他设计要点
+- Sentinel 默认阈值 100 次/小时：较高阈值与 Captcha 前置拦截互补
+- 计数池双轨制：合并池（Password+VerificationCode+OneTimeToken）vs 独立池（MFA 各因素）
+- 隐私保护：Sentinel 目标标识符以 SHA256 哈希存入数据库，不落明文
+- Captcha 状态持久化：verified/skipped 随 OIDC interaction 会话存储，同一会话只需验证一次
+- 灵活配置：所有阈值均可通过 SignInExperience 配置调整
