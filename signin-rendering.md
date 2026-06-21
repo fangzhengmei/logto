@@ -860,6 +860,173 @@ URL 过滤后只剩 username（纯密码）。
 | Username 提交后路由 | 强制走密码 | `useOnSubmit` L70-L74 | 忽略 username method 的 VC/PP |
 | Passkey 两步模式 | 强制 IdentifierSignInForm | `isIdentifierFirstPasskeySignInConfig` | passkey.enabled 但无按钮 → 全局两步 |
 
+### 9.7 Username 仅开启验证码时的死路分析
+
+配置 `[{username, P=F, VC=T}]` 在现实中不应出现（后端 Console 不允许 Username 开启验证码），但代码层面并无校验阻止它下发。一旦出现，用户会走进一条死路。逐行追踪如下。
+
+#### 9.7.1 首屏：IdentifierSignInForm
+
+```
+① useSieMethods 过滤：P=F, VC=T → password=F, verificationCode=T → 满足 P||VC → 保留
+② isPasswordOnly = signInMethods.every(m => m.password && !m.verificationCode)
+   = (P=F && !VC=T) = (F && F) = F → isPasswordOnly=false
+③ Main 渲染 IdentifierSignInForm
+④ SmartInputField enabledTypes = ['username']
+⑤ 用户输入 username → 点击继续
+```
+
+#### 9.7.2 提交后：useOnSubmit 的无条件跳转
+
+[use-on-submit.ts L70-L74](file:///d:/fz/0601-2/solo-dogfeeding/code/69-logto/packages/experience/src/components/IdentifierSignInForm/use-on-submit.ts#L70-L74)：
+
+```typescript
+if (identifier === SignInIdentifier.Username) {
+  navigateToPasswordPage();
+  return;  // ← 无条件返回，不看 method 的 password/verificationCode 配置
+}
+```
+
+**这里就是问题的根源**：对 Username 标识符，代码不看 method 的任何字段，直接跳密码页。即使 method 的 `password=false`、`verificationCode=true`，也照样跳。
+
+此后的 L76-L84（`password && (isPasswordPrimary || !verificationCode)` → 密码页 / `verificationCode` → 发验证码）对 Username **永远不执行**，因为 L70-L74 的 return 已经终止了函数。
+
+#### 9.7.3 第二屏：SignInPassword 的 ErrorPage
+
+[SignInPassword/index.tsx L26-L31](file:///d:/fz/0601-2/solo-dogfeeding/code/69-logto/packages/experience/src/pages/SignInPassword/index.tsx#L26-L31)：
+
+```typescript
+const methodSetting = signInMethods.find((method) => method.identifier === type);
+
+// Sign-in method not enabled
+if (!methodSetting?.password) {
+  return <ErrorPage />;
+}
+```
+
+SignInPassword 在渲染前做了**二次校验**：查找当前标识符对应的 method，若 `password` 未启用则直接显示 `ErrorPage`。对本场景 `methodSetting.password = false` → 用户看到错误页。
+
+**关键**：这个 `ErrorPage` 是 SignInPassword 自身的保护逻辑，不是全局路由守卫。它只拦截了"配置没有密码却进了密码页"的情况，但**无法阻止** useOnSubmit 把用户导航到这里。
+
+#### 9.7.4 死路：没有出口
+
+用户此时停留在 ErrorPage 上。我们来检查所有可能的出口：
+
+**出口一：SwitchToVerificationMethodsLink — 不存在**
+
+SwitchToVerificationMethodsLink 只出现在两个地方：
+- [PasswordForm](file:///d:/fz/0601-2/solo-dogfeeding/code/69-logto/packages/experience/src/pages/SignInPassword/PasswordForm/index.tsx#L121-L126)（第二屏密码表单）
+- [VerificationCode 页面](file:///d:/fz/0601-2/solo-dogfeeding/code/69-logto/packages/experience/src/pages/VerificationCode/index.tsx)
+
+但 SignInPassword 在 `!methodSetting?.password` 时直接 `return <ErrorPage />`，**不会渲染 PasswordForm**，因此 SwitchToVerificationMethodsLink **不会出现**。
+
+即使假设 SwitchToVerificationMethodsLink 能被渲染，它对 Username 也有硬性排除：
+
+[PasswordForm/index.tsx L122](file:///d:/fz/0601-2/solo-dogfeeding/code/69-logto/packages/experience/src/pages/SignInPassword/PasswordForm/index.tsx#L122-L122)：
+```typescript
+hasVerificationCode={identifier !== SignInIdentifier.Username && isVerificationCodeEnabled}
+```
+
+`identifier === Username` → `hasVerificationCode = false`。验证码入口被切断。
+
+**出口二：SignInVerificationMethods 页面 — 不存在**
+
+[SignInVerificationMethods/index.tsx L80](file:///d:/fz/0601-2/solo-dogfeeding/code/69-logto/packages/experience/src/pages/SignInVerificationMethods/index.tsx#L80-L80)：
+```typescript
+{hasVerificationCode && type !== SignInIdentifier.Username && (
+```
+
+`type === Username` → 验证码卡片不渲染。密码卡片需要 `hasPassword = Boolean(methodSetting?.password) = false` → 也不渲染。Passkey 卡片取决于用户是否绑定了 passkey。如果没有，页面显示空列表。
+
+**出口三：VerificationCodeIdentifier 类型 — 不包含 Username**
+
+[types/index.ts L31](file:///d:/fz/0601-2/solo-dogfeeding/code/69-logto/packages/experience/src/types/index.ts#L31-L31)：
+```typescript
+export type VerificationCodeIdentifier = SignInIdentifier.Email | SignInIdentifier.Phone;
+```
+
+`VerificationCodeLink`、`PasskeySignInLink` 的 props 类型是 `VerificationCodeIdentifier`，**编译期就不接受 Username**。即使想给 Username 显示验证码入口，TypeScript 也会报错。
+
+**出口四：VerificationCode 页面 — 不接受 Username**
+
+[VerificationCode/index.tsx L22-L29](file:///d:/fz/0601-2/solo-dogfeeding/code/69-logto/packages/experience/src/pages/VerificationCode/index.tsx#L22-L29)：
+```typescript
+const isValidVerificationCodeIdentifier = (
+  identifierInputValue: IdentifierInputValue | undefined
+): identifierInputValue is VerificationCodeIdentifier =>
+  Boolean(
+    identifierInputValue?.type &&
+      identifierInputValue.type !== SignInIdentifier.Username &&
+      identifierInputValue.value
+  );
+```
+
+如果有人用 URL 直接访问 `/sign-in/verification-code`，而 Context 中的标识符是 Username，该页面也会显示 `ErrorPage`。
+
+#### 9.7.5 完整死路图
+
+```
+配置：[{username, P=F, VC=T}]
+          │
+          ▼
+    首屏 IdentifierSignInForm
+    SmartInputField 接受 username
+          │
+          ▼ 用户输入 username，点继续
+    useOnSubmit L70: identifier === Username?
+          │
+          ├─ 是 → navigateToPasswordPage()  ← 无条件，不看 P/VC
+          │        return
+          │
+          ▼
+    SignInPassword 页面
+          │
+          ├─ methodSetting.password === false
+          │     │
+          │     ▼
+          │   ErrorPage  ← 用户被困在这里
+          │     │
+          │     ├─ 无 SwitchToVerificationMethodsLink（ErrorPage 替代了 PasswordForm）
+          │     ├─ 无 VerificationCodeLink（类型 VerificationCodeIdentifier 不含 Username）
+          │     ├─ SignInVerificationMethods 页面 Username 无验证码卡片
+          │     └─ VerificationCode 页面 Username 触发 ErrorPage
+          │
+          │  唯一出口：浏览器后退按钮
+          ▼
+```
+
+#### 9.7.6 代码中 Username 与验证码的三层隔离
+
+| 隔离层 | 代码位置 | 机制 | 效果 |
+|--------|---------|------|------|
+| 提交路由 | [use-on-submit.ts L70-L74](file:///d:/fz/0601-2/solo-dogfeeding/code/69-logto/packages/experience/src/components/IdentifierSignInForm/use-on-submit.ts#L70-L74) | Username 无条件 `navigateToPasswordPage()` | 即使 VC=T 也不走验证码分支 |
+| 密码页保护 | [SignInPassword/index.tsx L29-L31](file:///d:/fz/0601-2/solo-dogfeeding/code/69-logto/packages/experience/src/pages/SignInPassword/index.tsx#L29-L31) | `!methodSetting?.password` → ErrorPage | P=F 时密码页不可用 |
+| 类型系统 | [types/index.ts L31](file:///d:/fz/0601-2/solo-dogfeeding/code/69-logto/packages/experience/src/types/index.ts#L31-L31) | `VerificationCodeIdentifier = Email \| Phone` | 编译期排除 Username |
+| 切换链接 | [PasswordForm/index.tsx L122](file:///d:/fz/0601-2/solo-dogfeeding/code/69-logto/packages/experience/src/pages/SignInPassword/PasswordForm/index.tsx#L122-L122) | `identifier !== Username && isVCEnabled` | 运行时隐藏 Username 的验证码入口 |
+| 方式选择页 | [SignInVerificationMethods/index.tsx L80](file:///d:/fz/0601-2/solo-dogfeeding/code/69-logto/packages/experience/src/pages/SignInVerificationMethods/index.tsx#L80-L80) | `type !== Username && hasVC` | 运行时不渲染 Username 的验证码卡片 |
+| 验证码页 | [VerificationCode/index.tsx L27](file:///d:/fz/0601-2/solo-dogfeeding/code/69-logto/packages/experience/src/pages/VerificationCode/index.tsx#L27-L27) | `type !== Username` 类型守卫 | Username 进入验证码页 → ErrorPage |
+
+**结论**：Username 在代码中被设计为"只能密码登录"的标识符。这个设计假设贯穿了从提交路由到类型系统的每一层。当配置出现 `[{username, P=F, VC=T}]` 时，没有任何一层能纠正或降级——每层都只做了自己的防守（useOnSubmit 强制跳密码、SignInPassword 校验密码是否启用、类型系统排除 Username 的验证码），但它们组合起来产生了一条死路：useOnSubmit 把用户送进密码页，而密码页又因为 P=F 拒绝渲染，且不提供任何其它出口。
+
+#### 9.7.7 对比：Email 仅开启验证码的正常路径
+
+配置 `[{email, P=F, VC=T}]` 的走向完全不同：
+
+```
+① isPasswordOnly = false → IdentifierSignInForm
+② SmartInputField 接受 email
+③ 用户输入 email → 点继续
+④ useOnSubmit:
+    - identifier === Email（不是 Username）→ 不触发 L70-L74
+    - SSO 检测（若有 ssoConnectors）
+    - Passkey 检测
+    - password=F → 不触发 L76 的密码分支
+    - verificationCode=T → sendVerificationCode({ identifier: email, value })
+⑤ 验证码发送成功 → Navigate("/sign-in/verification-code")
+⑥ VerificationCode 页面正常渲染
+```
+
+两相对比，useOnSubmit L70-L74 的 Username 无条件跳转是唯一将"正常配置路径"变为"死路"的代码点。
+
 ---
 
 ## 十、关键文件索引（补充）
