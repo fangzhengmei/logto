@@ -4,6 +4,8 @@
 
 Logto 的 i18n 体系由**两套后端 i18n 系统**、**两个 phrases 资源包**和**前端 i18next 运行时**组成。体验端（登录页、账户中心）的词条由后端将内置短语与自定义短语合并后，通过 SSR 注入和 API 两种方式传递给前端。
 
+自定义短语的核心设计是**增量覆盖**：数据库只存与内置短语的差异，后端通过 `deepmerge` 合并后返回完整的语言包给前端。
+
 ---
 
 ## 一、两个 phrases 资源包
@@ -20,11 +22,12 @@ Logto 的 i18n 体系由**两套后端 i18n 系统**、**两个 phrases 资源�
 
 - **路径**：[packages/phrases-experience/](file:///d:/fz/0601-2/solo-dogfeeding/code/70-logto/packages/phrases-experience)
 - **用途**：登录注册页、账户中心等体验端 UI 的翻译
-- **命名空间**：`translation`（含 `input`、`action`、`error`、`mfa`、`profile`、`user_scopes`、`account_center` 等子树）
+- **命名空间**：仅 `translation` 一个命名空间（含 `input`、`action`、`error`、`mfa`、`profile`、`user_scopes`、`account_center` 等子树）
 - **入口**：[packages/phrases-experience/src/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/70-logto/packages/phrases-experience/src/index.ts#L64-L84)
 - **语言**：20 种内置语言（比 phrases 多 cs, uk-UA 等）
+- **类型定义**：`LocalePhrase = typeof en` — [types.ts#L11](file:///d:/fz/0601-2/solo-dogfeeding/code/70-logto/packages/phrases-experience/src/types.ts#L11)
 
-> **注意**：两个包独立维护，语言数量和结构均不同。
+> **注意**：两个包独立维护，语言数量和结构均不同。`@logto/phrases-experience` 只有 `translation` 一个 namespace，error 是 translation 下的子树，不是独立 namespace。
 
 ---
 
@@ -76,7 +79,7 @@ export default function koaI18next() {
 **核心实现**：[packages/core/src/libraries/phrase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/70-logto/packages/core/src/libraries/phrase.ts#L9-L23)
 
 ```typescript
-import type { LocalePhrase } from '@logto/phrases-experience';  // 用的是体验端短语包
+import type { LocalePhrase } from '@logto/phrases-experience';
 import resource, { isBuiltInLanguageTag } from '@logto/phrases-experience';
 import { trySafe } from '@silverhand/essentials';
 import cleanDeep from 'clean-deep';
@@ -107,25 +110,254 @@ export default class Libraries {
 }
 ```
 
-#### 自定义短语存储
+---
 
-- **数据表**：`custom_phrases`，字段：`id`、`tenantId`、`languageTag`、`translation`
-- **查询层**：[packages/core/src/queries/custom-phrase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/70-logto/packages/core/src/queries/custom-phrase.ts)
-- **管理 API（CRUD）**：[packages/core/src/routes/custom-phrase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/70-logto/packages/core/src/routes/custom-phrase.ts)
-  - PUT 时验证：翻译结构必须是 `resource.en.translation` 的**严格子集**（[isStrictlyPartial](file:///d:/fz/0601-2/solo-dogfeeding/code/70-logto/packages/core/src/utils/translation.ts#L9-L26)）
-  - 不允许删除 fallback language
+## 三、自定义短语合并与覆盖边界
 
-#### 缓存机制
+### 3.1 CustomPhrase 数据结构
 
-自定义短语查询通过 `WellKnownCache` 缓存：
+**类型定义**：[packages/schemas/src/foundations/jsonb-types/phrases.ts#L3-L5](file:///d:/fz/0601-2/solo-dogfeeding/code/70-logto/packages/schemas/src/foundations/jsonb-types/phrases.ts#L3-L5)
 
-- 缓存 key：`custom-phrases:{languageTag}`、`custom-phrases-tags`
-- 位置：[packages/core/src/caches/well-known.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/70-logto/packages/core/src/caches/well-known.ts#L27-L28)
-- upsert/delete 操作会自动失效对应缓存
+```typescript
+export type Translation = {
+  [key: string]: string | Translation;
+};
+```
+
+**数据库表**：`custom_phrases`
+- 字段：`id`、`tenantId`、`languageTag`、`translation`
+- `translation` 字段存的是 `translation` 命名空间下的内容（即 `LocalePhrase.translation` 的子集）
+
+**示例**（[mock 数据](file:///d:/fz/0601-2/solo-dogfeeding/code/70-logto/packages/core/src/__mocks__/custom-phrase.ts#L10-L23)）：
+
+```typescript
+const mockEnCustomPhrase = {
+  tenantId: 'fake_tenant',
+  id: mockId,
+  languageTag: 'en',
+  translation: {
+    input: {
+      username: 'Username 1',
+      password: 'Password 2',
+      email: 'Email 3',
+    },
+  },
+} satisfies CustomPhrase;
+```
+
+> **关键点**：`CustomPhrase.translation` 只对应 `LocalePhrase.translation` 这一个命名空间的内容，不包含其他 namespace。
+
+### 3.2 合并三步曲：trySafe → cleanDeep → deepmerge
+
+`getPhrases()` 的合并过程分三步：
+
+**Step 1: `trySafe(findCustomPhraseByLanguageTag(forLanguage))`**
+- 从数据库查询自定义短语
+- 用 `trySafe` 包裹，查询失败（如 404）时返回 `undefined`
+- `?? {}` 兜底为空对象
+
+**Step 2: `cleanDeep(...)`**
+- 清除空字符串 `''`、`null`、`undefined`、空对象 `{}`
+- 目的：用户设置空字符串表示"恢复默认"，不参与覆盖
+- 测试验证：[phrase.test.ts#L53-L87](file:///d:/fz/0601-2/solo-dogfeeding/code/70-logto/packages/core/src/libraries/phrase.test.ts#L53-L87)
+
+**Step 3: `deepmerge(base, customPhrase)`**
+- 深度合并，自定义短语优先级更高（后者覆盖前者）
+- 合并是递归的，只覆盖存在的 key，未覆盖的 key 保留基底值
+
+### 3.3 三种语言场景的合并行为
+
+根据单元测试 [phrase.test.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/70-logto/packages/core/src/libraries/phrase.test.ts)，`getPhrases()` 对不同语言有三种行为模式：
+
+#### 场景一：内置语言 + 有自定义短语
+
+```
+输入语言: 'zh-CN'（内置语言，且有自定义短语）
+
+基底: resource['zh-CN']  → 完整的中文内置短语
+覆盖: customPhrase        → 中文自定义短语（增量）
+结果: deepmerge(zh-CN内置, 中文自定义)
+     → 完整的中文短语，自定义部分覆盖内置
+```
+
+测试用例：[phrase.test.ts#L103-L107](file:///d:/fz/0601-2/solo-dogfeeding/code/70-logto/packages/core/src/libraries/phrase.test.ts#L103-L107)
+
+#### 场景二：内置语言 + 无自定义短语
+
+```
+输入语言: 'tr-TR'（内置语言，但没有自定义短语）
+
+基底: resource['tr-TR']  → 完整的土耳其语内置短语
+覆盖: {}                 → 空对象（查询失败或不存在）
+结果: 土耳其语内置短语（原样返回）
+```
+
+测试用例：[phrase.test.ts#L109-L113](file:///d:/fz/0601-2/solo-dogfeeding/code/70-logto/packages/core/src/libraries/phrase.test.ts#L109-L113)
+
+#### 场景三：非内置语言（custom-only）+ 有自定义短语
+
+```
+输入语言: 'fo-BA'（不在内置语言列表中，但有自定义短语）
+
+基底: resource['en']     → 完整的英文内置短语  ← 关键：回退到英文
+覆盖: customPhrase        → 自定义短语（增量）
+结果: deepmerge(英文内置, 自定义短语)
+     → 所有 key 都有英文值，自定义的 key 被覆盖为目标语言
+```
+
+测试用例：[phrase.test.ts#L115-L119](file:///d:/fz/0601-2/solo-dogfeeding/code/70-logto/packages/core/src/libraries/phrase.test.ts#L115-L119)
+
+> **核心结论**：custom-only language 的**基底永远是英文**，不是空的。自定义语言本质上是"英文打底 + 自定义翻译覆盖"。
+
+### 3.4 合并后的数据形态
+
+合并后的返回值类型标注为 `LocalePhrase`，但实际运行时包含额外字段：
+
+```typescript
+// 类型上：LocalePhrase = { translation: { ... } }
+// 实际上：deepmerge 把 CustomPhrase 的所有字段都合并进去了
+{
+  translation: { ... },    // 合并后的翻译内容（来自内置 + 自定义）
+  id: 'xxx',               // ← 来自 CustomPhrase 的元数据
+  tenantId: 'xxx',         // ← 来自 CustomPhrase 的元数据
+  languageTag: 'fo-BA',    // ← 来自 CustomPhrase 的元数据
+}
+```
+
+**这些额外字段的影响**：
+- 传给 i18next 时，i18next 只会识别 `translation` 等 namespace 对应的 key
+- `id`、`tenantId`、`languageTag` 等非 namespace 字段会被 i18next 忽略
+- 类型上虽然标注为 `LocalePhrase`，但运行时数据更"胖"
+
+### 3.5 覆盖边界
+
+**自定义短语能覆盖的范围**：
+- ✅ `translation` 命名空间下的任意子树（`input`、`action`、`error`、`mfa` 等）
+- ✅ 可以只覆盖部分 key，其他保留内置
+- ✅ 支持嵌套深度覆盖
+
+**自定义短语不能做的事**：
+- ❌ 不能新增命名空间（如新增一个 `errors` namespace）
+- ❌ 不能新增 `translation` 下不存在的顶级 key（必须是内置短语的严格子集，验证见 [isStrictlyPartial](file:///d:/fz/0601-2/solo-dogfeeding/code/70-logto/packages/core/src/utils/translation.ts#L9-L26)）
+- ❌ 空字符串会被 `cleanDeep` 清除，等同于"不覆盖"
 
 ---
 
-## 三、语言匹配流程
+## 四、对 i18next 资源的影响
+
+### 4.1 后端合并 vs 前端 fallback
+
+**关键设计**：后端已经保证了返回的语言包是**完整可用**的，前端不依赖 i18next 的 `fallbackLng` 机制。
+
+原因：
+1. 内置语言 → 返回完整的内置短语（本身就是完整的）
+2. 内置语言 + 自定义 → 返回 deepmerge 后的完整语言包
+3. 自定义语言（custom-only）→ 以英文为基底 + 自定义覆盖，也是完整的
+
+所以**每个 getPhrases 返回的语言包都是全量翻译**，没有"缺失的 key"需要 i18next 在运行时 fallback。
+
+### 4.2 三端的 i18next 配置对比
+
+| 端 | 初始 resources | fallbackLng | 短语来源 |
+|----|---------------|-------------|---------|
+| **Experience** | `{ [lng]: phrases }` 一个语言 | **未设置** | SSR 优先，fallback 到 API |
+| **Account** | `{}`（空） | `'en'` | 纯 API 加载 |
+| **Console** | 所有语言全量加载 | 未显式设置 | 直接从 npm 包加载 |
+
+#### Experience 端
+
+**初始化**：[packages/experience/src/i18n/init.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/70-logto/packages/experience/src/i18n/init.ts#L10-L19)
+
+```typescript
+const initI18n = async (initialLanguage?: string) => {
+  const { resources, lng } = await getI18nResource(initialLanguage);
+  const options: InitOptions = {
+    resources,    // { 'zh-CN': { translation: {...} } } — 只有一个语言
+    lng,          // 'zh-CN'
+    interpolation: { escapeValue: false },
+  };
+  await i18next.init(options);
+};
+```
+
+**特点**：
+- 没有显式 `fallbackLng`
+- 初始只加载一个语言的资源
+- 但因为后端返回的语言包已经是完整的（英文打底），所以不会出现 key 缺失
+
+**语言切换时**：`changeLanguage()` 会重新请求 API 获取新语言包，然后通过 `addResourceBundle` 添加到 i18next。
+
+#### Account 端
+
+**初始化**：[packages/account/src/i18n/init.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/70-logto/packages/account/src/i18n/init.ts#L15-L22)
+
+```typescript
+await i18next.init({
+  resources: {},       // 空！
+  fallbackLng: 'en',   // ← 有显式 fallback
+  interpolation: { escapeValue: false },
+});
+```
+
+**特点**：
+- 初始 resources 是空的
+- 有 `fallbackLng: 'en'`
+- 实际翻译资源在 `PageContextProvider` 中通过 `changeLanguage()` 异步加载
+- `fallbackLng: 'en'` 是防御性配置——如果 API 加载失败，至少还能显示英文 key 名？不对，实际上英文资源也没加载进来
+
+> **注意**：Account 端虽然设置了 `fallbackLng: 'en'`，但 `resources` 初始是空的，英文资源也没有内置。这个 fallback 更多是 i18next 的默认配置，实际英文翻译同样需要通过 API 获取。
+
+#### Console 端
+
+**初始化**：[packages/console/src/i18n/init.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/70-logto/packages/console/src/i18n/init.ts)
+
+- 直接从 npm 包加载所有语言的所有资源
+- 包含 `translation`、`errors`（来自 `@logto/phrases`）和 `experience` 命名空间
+- 不依赖后端注入，没有自定义短语的概念
+
+### 4.3 资源加载方式对比
+
+**Experience 端的资源加载**：
+
+```
+i18next 实例
+  └── 语言: 'zh-CN'
+       └── namespace: translation
+            ├── input: { ... }   ← 内置中文 + 自定义覆盖（已合并）
+            ├── action: { ... }
+            ├── error: { ... }
+            └── ...
+```
+
+只有一个语言，但这个语言的 translation namespace 是完整的。
+
+**语言切换后**：
+```
+i18next 实例
+  ├── 语言: 'zh-CN'
+  │    └── translation: { ... }
+  └── 语言: 'en'
+       └── translation: { ... }  ← 新增的语言包（也是完整的）
+```
+
+**Console 端的资源加载**：
+
+```
+i18next 实例
+  ├── 语言: 'en'
+  │    ├── translation: { ... }
+  │    ├── errors: { ... }
+  │    └── experience: { ... }
+  ├── 语言: 'zh-CN'
+  │    └── ...
+  └── ... （所有 17 种语言）
+```
+
+所有语言一次性加载，有多个 namespace。
+
+---
+
+## 五、语言匹配流程
 
 ### 语言检测（请求端）
 
@@ -191,11 +423,15 @@ export const getExperienceLanguage = ({
 都匹配不上时 → 返回内置语言的默认值（en）
 ```
 
+> **注意**：语言匹配（选哪个语言 tag）和 短语合并（用什么语言做基底）是**两个独立的步骤**。
+> - 语言匹配：决定 `getPhrases()` 接收什么 language 参数
+> - 短语合并：在 `getPhrases()` 内部，判断这个 language 是不是内置的，不是就用英文做基底
+
 语言匹配底层工具：[packages/toolkit/language-kit/src/utility.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/70-logto/packages/toolkit/language-kit/src/utility.ts)
 
 ---
 
-## 四、后端注入前端的两种方式
+## 六、后端注入前端的两种方式
 
 两种方式**都使用 Phrase Library 的 `getPhrases(language)`** 来获取合并后的体验端短语。
 
@@ -319,7 +555,7 @@ router.get('/.well-known/phrases',
 
 ---
 
-## 五、前端接收与使用
+## 七、前端接收与使用
 
 ### Experience 端
 
@@ -399,7 +635,7 @@ declare global {
 
 ---
 
-## 六、完整链路图
+## 八、完整链路图
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────┐
@@ -415,9 +651,10 @@ declare global {
 ┌──────────────────────────────┐  ┌──────────────────────────────────────┐
 │   全局 i18next 实例          │  │   Phrase Library (前端用)            │
 │   i18n/init.ts               │  │   libraries/phrase.ts                │
-│   - 仅 @logto/phrases        │  │   - @logto/phrases-experience 为基底 │
-│   - 无自定义短语              │  │   - deepmerge(内置, 自定义短语)       │
-│   - 供 koaI18next 中间件用    │  │   - 数据源: custom_phrases 表        │
+│   - 仅 @logto/phrases        │  │   - 内置短语为基底                    │
+│   - 无自定义短语              │  │   - custom-only 语言用英文打底        │
+│   - 供 koaI18next 中间件用    │  │   - deepmerge + cleanDeep 合并       │
+│                               │  │   - 数据源: custom_phrases 表        │
 └──────────────┬───────────────┘  │     + WellKnownCache 缓存            │
                │                  └───────────────┬──────────────────────┘
                │                                  │
@@ -440,29 +677,36 @@ declare global {
 │                                                                          │
 │  Experience:                              Account:                        │
 │    - 优先读 SSR (logtoSsr.phrases)         - 纯 API 加载                  │
-│    - 否则请求 /.well-known/phrases         - PageContextProvider 中异步    │
-│    - 支持运行时切换语言                                                     │
+│    - 否则请求 /.well-known/phrases         - 初始 resources 为空          │
+│    - 单语言加载，切换时新增                 - fallbackLng: 'en'（防御性）  │
+│    - 无显式 fallbackLng                    - PageContextProvider 中异步    │
 │                                                                          │
 │  Console:                                                                 │
 │    - 直接从 npm 包全量加载（无后端注入）                                    │
-│    - 含 experience namespace 供预览                                        │
+│    - 所有语言 + 多个 namespace                                            │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 七、关键设计要点
+## 九、关键设计要点
 
-1. **两套 i18n 系统分离**：后端自用的全局 i18next（用 `@logto/phrases`） vs 给前端体验端的 Phrase Library（用 `@logto/phrases-experience` + 自定义短语），两者互不干扰
+### 短语合并与覆盖
+1. **自定义短语 = 增量覆盖**：数据库只存差异，通过 `deepmerge` 深度合并，自定义优先级更高
+2. **custom-only 语言用英文打底**：不在内置列表中的语言，以英文内置短语为基底，再叠加自定义翻译
+3. **空值清除**：`cleanDeep` 清除空字符串，用户可用空值表示"恢复默认"
+4. **完整语言包输出**：`getPhrases` 返回的永远是完整可用的语言包，不会有缺失的 key
 
-2. **自定义短语 = 增量覆盖**：数据库只存差异部分，通过 `deepmerge` + `cleanDeep` 合并到内置短语上，自定义优先级更高
+### 两套 i18n 系统
+5. **两套 i18n 系统分离**：后端自用的全局 i18next（用 `@logto/phrases`，无自定义） vs 给前端体验端的 Phrase Library（用 `@logto/phrases-experience` + 自定义短语）
+6. **请求级 i18n 实例**：`koaI18next` 为每个请求 clone 一个 i18next 实例，避免异步请求间的语言状态互相污染
 
-3. **双路径注入**：SSR 保证首屏性能和无闪屏，API 支持运行时语言切换，前端优先使用 SSR 数据
+### 注入与前端
+7. **双路径注入**：SSR 保证首屏性能和无闪屏，API 支持运行时语言切换，前端优先使用 SSR 数据
+8. **后端合并替代前端 fallback**：后端已保证语言包完整性，前端 Experience 端不需要设置 `fallbackLng`
+9. **命名空间隔离**：`@logto/phrases-experience` 只有 `translation` 一个 namespace，Console 端通过 `experience` namespace 引入供预览
 
-4. **语言匹配多级 fallback**：精确匹配 → 基础语言匹配 → 内置语言兜底，同时考虑自定义语言和内置语言
-
-5. **缓存分层**：well-known 缓存减少数据库查询，upsert/delete 时主动失效
-
-6. **命名空间隔离**：`translation`、`errors`、`experience` 等独立 namespace，避免 Console 和 Experience 的短语冲突
-
-7. **请求级 i18n 实例**：`koaI18next` 为每个请求 clone 一个 i18next 实例，避免异步请求间的语言状态互相污染
+### 语言匹配
+10. **语言匹配与短语合是两步**：先选语言 tag（考虑自定义与内置），再在 getPhrases 内部决定用什么做基底
+11. **多级 fallback**：精确匹配 → 基础语言匹配 → 内置语言兜底，同时考虑自定义语言和内置语言
+12. **缓存分层**：well-known 缓存减少数据库查询，upsert/delete 时主动失效
