@@ -673,6 +673,90 @@ koaExperienceInteractionHooks 中间件
                 └─ sendWebhookRequest() → HTTP POST 到配置的 Webhook URL
 ```
 
+### 5.3.1 交互事件解析失败后的静默封禁路径（noop → 封禁不发通知）
+
+这是一个容易忽略的静默失败路径：当 `interactionEvent` 无法解析时，**封禁仍然发生，但 Lockout Webhook 不会被发送**，且没有任何错误提示。
+
+#### 完整调用链（7 步）
+
+```
+步骤 1: 请求进入 koa-experience-interaction-hooks 中间件
+  │  代码: [koa-experience-interaction-hooks.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/67-logto/packages/core/src/routes/experience/middleware/koa-experience-interaction-hooks.ts#L42-L51)
+  │
+  ▼
+步骤 2: interactionEventGuard.safeParse(interactionDetails.result ?? {})
+  │  Zod schema 校验: { interactionEvent: z.nativeEnum(InteractionEvent) }
+  │  失败场景:
+  │    - interactionDetails.result 为 null（会话过期）
+  │    - result 对象缺少 interactionEvent 字段
+  │    - interactionEvent 不是合法枚举值（SignIn/Register/ForgotPassword）
+  │
+  ▼ 校验失败 result.success = false
+步骤 3: 所有 hook 方法被替换为 noop（空函数）
+  │  ctx.appendExceptionHookContext = noop   // ← 关键！
+  │  ctx.appendDataHookContext = noop
+  │  ctx.assignReleaseOnSuccessInteractionHookResult = noop
+  │  ctx.assignReleaseAnywayInteractionHookResult = noop
+  │  然后 return next() 继续执行后续中间件和路由
+  │
+  ▼
+步骤 4: 路由处理（如密码验证）执行 withSentinel()
+  │  代码: [sentinel-guard.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/67-logto/packages/core/src/routes/experience/classes/libraries/sentinel-guard.ts#L28-L78)
+  │  用户输入错误密码 → verificationPromise 抛出错误
+  │  actionResult = Failed
+  │
+  ▼
+步骤 5: sentinel.reportActivity() → decide() → 达到阈值 → 返回 Blocked
+  │  sentinel_activities 表写入 decision='Blocked' 记录
+  │  🔴 风控逻辑完全正常执行，封禁是生效的
+  │
+  ▼ decision === SentinelDecision.Blocked
+步骤 6: 调用 ctx.appendExceptionHookContext('Identifier.Lockout', { type, value })
+  │  🔴 但此时这个方法是 noop！什么都不做
+  │  exceptionHookContextArray 仍然是空数组 []
+  │
+  ▼
+步骤 7: 抛出 RequestError({ code: 'session.verification_blocked_too_many_attempts' })
+  │  用户收到 HTTP 400 响应，知道自己被封禁了
+  │
+  ▼ 中间件 finally 块
+步骤 8: if (dataHookContext.exceptionHookContextArray.length > 0)
+  │  🔴 数组长度为 0，条件不成立
+  │  triggerExceptionHooks() 根本不会被调用
+  │
+  ▼
+最终结果:
+  ✅ 封禁生效（sentinel_activities 有 Blocked 记录）
+  ✅ 用户收到封禁错误响应
+  ❌ **没有任何 Identifier.Lockout Webhook 被发送**
+  ❌ 外部系统完全不知道该用户被封禁
+```
+
+#### 两种场景代码的精确对比
+
+| 步骤 | interactionEvent 正常 | interactionEvent 缺失（noop） |
+|------|----------------------|------------------------------|
+| ctx.appendExceptionHookContext 是 | `HookContextManager.appendExceptionHookContext.bind(dataHookContext)` | `noop`（`() => {}`） |
+| 调用后 exceptionHookContextArray | `[{ event: 'Identifier.Lockout', type, value }]` | `[]`（无变化） |
+| finally 条件判断 | `length > 0` → true | `length > 0` → false |
+| triggerExceptionHooks 调用 | ✅ 被调用 | ❌ 不被调用 |
+| HTTP 请求发送 | ✅ 发送到 webhook URL | ❌ 完全不发送 |
+| 用户封禁体验 | ✅ 正常封禁响应 | ✅ 正常封禁响应（无差异） |
+
+#### noop 函数的来源
+
+`noop` 来自 `@silverhand/essentials` 包，在 [koa-experience-interaction-hooks.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/67-logto/packages/core/src/routes/experience/middleware/koa-experience-interaction-hooks.ts#L2) 导入：
+
+```typescript
+import { conditionalString, noop, trySafe } from '@silverhand/essentials';
+```
+
+`noop` 的定义就是 `() => {}` — 一个什么都不做的空函数。
+
+> ⚠️ **运维/告警注意**：如果你的外部安全系统依赖 Lockout Webhook 来触发账号冻结或告警，必须额外监控 `sentinel_activities` 表中 `decision = 'Blocked'` 的记录，因为 interaction 会话过期的场景下封禁不会触发 Webhook。
+
+---
+
 ### 5.4 Hook 中间件触发流程
 
 Hook 的触发由 [koa-experience-interaction-hooks.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/67-logto/packages/core/src/routes/experience/middleware/koa-experience-interaction-hooks.ts#L81-L117) 中间件控制：
@@ -810,20 +894,31 @@ Webhook 请求特征：
 }
 ```
 
-各字段来源溯源：
+各字段来源溯源与边界说明：
 
-| 字段 | 来源 | 代码位置 |
-|------|------|----------|
-| `event` | 固定为 `Identifier.Lockout` | appendExceptionHookContext 调用时传入 |
-| `createdAt` | `new Date().toISOString()` | buildWebhooks 内部生成 |
-| `ip` | `ctx.ip`（Koa 请求 IP） | koa-experience-interaction-hooks metadata |
-| `userAgent` | `ctx.header['user-agent']` | koa-experience-interaction-hooks metadata |
-| `interactionEvent` | `interactionDetails.result.interactionEvent` | koa-experience-interaction-hooks metadata |
-| `applicationId` | `interactionDetails.params.client_id`（OIDC client_id） | koa-experience-interaction-hooks metadata |
-| `sessionId` | `interactionDetails.jti`（OIDC 交互 JTI） | koa-experience-interaction-hooks metadata |
-| `application` | `findApplicationById(applicationId)` 查询 applications 表 | buildWebhooks |
-| `type` | `identifier.type`（email/phone/username/UserId） | appendExceptionHookContext |
-| `value` | `identifier.value`（标识符明文值） | appendExceptionHookContext |
+| 字段 | 来源 | 代码位置 | 是否来自 sentinel_activities.payload | Experience API | User API | interactionEvent 缺失 |
+|------|------|----------|-----------------------------------|----------------|----------|----------------------|
+| `event` | 固定为 `Identifier.Lockout` | appendExceptionHookContext 调用时传入 | ❌ 否 | ✅ `'Identifier.Lockout'` | ✅ `'Identifier.Lockout'` | ❌ **无**（noop） |
+| `createdAt` | `new Date().toISOString()` | buildWebhooks 内部生成 | ❌ 否 | ✅ 有 | ✅ 有 | ❌ 无 |
+| `ip` | `ctx.ip`（Koa 请求 IP） | HookMetadata | ❌ 否 | ✅ 有 | ✅ 有 | ❌ 无 |
+| `userAgent` | `ctx.header['user-agent']` | HookMetadata | ❌ 否 | ✅ 有 | ✅ 有 | ❌ 无 |
+| `interactionEvent` | `interactionDetails.result.interactionEvent` | HookMetadata | ✅ **是**（但字段名不同，payload 里叫 `event`） | ✅ `SignIn/Register/ForgotPassword` | ❌ 无 | ❌ 无 |
+| `applicationId` | `interactionDetails.params.client_id`（OIDC client_id） | HookMetadata | ❌ 否 | ✅ 有 | ❌ **无**（ctx.auth.clientId 存在但未使用） | ❌ 无 |
+| `sessionId` | `interactionDetails.jti`（OIDC 交互 JTI） | HookMetadata | ❌ 否 | ✅ 有 | ❌ 无 | ❌ 无 |
+| `application` | `findApplicationById(applicationId)` 查询 applications 表 | buildWebhooks | ❌ 否 | ✅ `{id,type,name,description}` | ❌ 无（无 applicationId 所以不查） | ❌ 无 |
+| `type` | `identifier.type`（email/phone/username/UserId） | appendExceptionHookContext | ❌ 否 | ✅ 有 | ✅ 有（通常为 `UserId`） | ❌ 无 |
+| `value` | `identifier.value`（标识符明文值） | appendExceptionHookContext | ❌ 否 | ✅ 有 | ✅ 有（用户 ID） | ❌ 无 |
+| `verificationId` | 验证记录 ID | sentinel_activities.payload | ✅ 是（存数据库） | ❌ 不对外暴露 | ❌ 不对外暴露 | — |
+| `targetHash` | SHA256(标识符) | sentinel_activities 独立列 | ✅ 是（数据库索引用） | ❌ 不对外暴露 | ❌ 不对外暴露 | — |
+| `action` / `actionResult` | 行为类型/验证结果 | sentinel_activities 独立列 | ✅ 是（风控用） | ❌ 不对外暴露 | ❌ 不对外暴露 | — |
+
+#### 三种典型场景的 Lockout Webhook 对比
+
+| 场景 | payload 完整性 | 缺失字段 |
+|------|---------------|----------|
+| ✅ Experience 密码验证（推荐） | 完整 10 字段 | — |
+| ⚠️ User API 修改密码 | 仅 6 字段 | 无 `interactionEvent`, `applicationId`, `sessionId`, `application` |
+| ❌ interactionEvent 解析失败（noop） | **无 webhook 发送** | 完全不触发 |
 
 ### 5.9 解除封禁
 
