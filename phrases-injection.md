@@ -245,26 +245,71 @@ const mockEnCustomPhrase = {
 
 ## 四、对 i18next 资源的影响
 
-### 4.1 后端合并 vs 前端 fallback
+### 4.1 两个层级的 fallback 机制
 
-**关键设计**：后端已经保证了返回的语言包是**完整可用**的，前端不依赖 i18next 的 `fallbackLng` 机制。
+需要区分**两个层级的 fallback**，它们是独立的机制：
 
-原因：
-1. 内置语言 → 返回完整的内置短语（本身就是完整的）
-2. 内置语言 + 自定义 → 返回 deepmerge 后的完整语言包
-3. 自定义语言（custom-only）→ 以英文为基底 + 自定义覆盖，也是完整的
+| 层级 | 机制 | 位置 | 作用 |
+|------|------|------|------|
+| 1 | **资源兜底** | `getI18nResource()` 的 catch 块 | API 失败时用内置英文包 |
+| 2 | **语言选择 fallback** | i18next 的 `fallbackLng` 选项 | 语言没有资源时切换到 fallback 语言 |
 
-所以**每个 getPhrases 返回的语言包都是全量翻译**，没有"缺失的 key"需要 i18next 在运行时 fallback。
+> **关键修正**：之前对 Account 端的描述有误。Account 端和 Experience 端**都有内置英文兜底**，不是"英文资源也没加载进来"。
 
-### 4.2 三端的 i18next 配置对比
+### 4.2 资源兜底：getI18nResource 的 catch 块
 
-| 端 | 初始 resources | fallbackLng | 短语来源 |
-|----|---------------|-------------|---------|
-| **Experience** | `{ [lng]: phrases }` 一个语言 | **未设置** | SSR 优先，fallback 到 API |
-| **Account** | `{}`（空） | `'en'` | 纯 API 加载 |
-| **Console** | 所有语言全量加载 | 未显式设置 | 直接从 npm 包加载 |
+**Account 端和 Experience 端都有相同的资源兜底逻辑**：
 
-#### Experience 端
+**Experience 端**：[packages/experience/src/i18n/utils.ts#L40-L57](file:///d:/fz/0601-2/solo-dogfeeding/code/70-logto/packages/experience/src/i18n/utils.ts#L40-L57)
+```typescript
+import resource from '@logto/phrases-experience';  // ← 导入了完整的内置资源
+
+export const getI18nResource = async (language?: string) => {
+  try {
+    const { phrases, lng } = await getPhrases(language);
+    return { resources: { [lng]: phrases }, lng };
+  } catch {
+    // Fallback to build in en  ← 注释明确说明
+    return {
+      resources: { en: resource.en },  // ← 用内置英文包兜底
+      lng: 'en',
+    };
+  }
+};
+```
+
+**Account 端**：[packages/account/src/i18n/utils.ts#L68-L84](file:///d:/fz/0601-2/solo-dogfeeding/code/70-logto/packages/account/src/i18n/utils.ts#L68-L84)
+```typescript
+import resource, { type LocalePhrase } from '@logto/phrases-experience';  // ← 同样导入了
+
+export const getI18nResource = async (language?: string) => {
+  try {
+    const { phrases, lng } = await getPhrases(language);
+    return { resources: { [lng]: phrases }, lng };
+  } catch {
+    return {
+      resources: { en: resource.en },  // ← 同样用内置英文包兜底
+      lng: 'en',
+    };
+  }
+};
+```
+
+**兜底触发条件**：
+- `getPhrases()` 抛出异常（网络错误、API 失败等）
+- `getPhrases()` 内部 `throw new Error('lng not found')`（Content-Language header 缺失）
+
+**兜底结果**：返回完整的内置英文短语包 `resource.en`，保证至少能显示英文。
+
+### 4.3 三端的 i18next 配置对比
+
+| 端 | 初始 resources | fallbackLng | 短语来源 | 内置英文兜底 |
+|----|---------------|-------------|---------|-------------|
+| **Experience** | `{ [lng]: phrases }` 一个语言 | **未设置** | SSR 优先 → API → 内置英文 | ✅ 有（catch 块） |
+| **Account** | `{}`（空） | `'en'` | API → 内置英文 | ✅ 有（catch 块） |
+| **Console** | 所有语言全量加载 | 未显式设置 | 直接从 npm 包加载 | —（不需要） |
+
+#### Experience 端完整兜底路径
 
 **初始化**：[packages/experience/src/i18n/init.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/70-logto/packages/experience/src/i18n/init.ts#L10-L19)
 
@@ -272,40 +317,96 @@ const mockEnCustomPhrase = {
 const initI18n = async (initialLanguage?: string) => {
   const { resources, lng } = await getI18nResource(initialLanguage);
   const options: InitOptions = {
-    resources,    // { 'zh-CN': { translation: {...} } } — 只有一个语言
-    lng,          // 'zh-CN'
+    resources,    // 可能是后端返回的语言，也可能是内置英文
+    lng,
     interpolation: { escapeValue: false },
   };
   await i18next.init(options);
 };
 ```
 
+**getPhrases 内部的优先级**：[packages/experience/src/i18n/utils.ts#L12-L38](file:///d:/fz/0601-2/solo-dogfeeding/code/70-logto/packages/experience/src/i18n/utils.ts#L12-L38)
+```
+getPhrases(language?):
+  1. 检查 SSR 数据（logtoSsr），如果有且语言匹配 → 直接用
+  2. 否则请求 API /api/.well-known/phrases
+  3. API 失败 → catch 块返回内置英文 resource.en
+```
+
 **特点**：
 - 没有显式 `fallbackLng`
-- 初始只加载一个语言的资源
-- 但因为后端返回的语言包已经是完整的（英文打底），所以不会出现 key 缺失
+- 三级兜底：SSR → API → 内置英文
+- 后端返回的语言包已经是完整的（custom-only 语言也是英文打底），不会出现 key 缺失
 
-**语言切换时**：`changeLanguage()` 会重新请求 API 获取新语言包，然后通过 `addResourceBundle` 添加到 i18next。
+**语言切换时**：`changeLanguage()` 同样走 `getI18nResource()` → catch 块兜底到内置英文。
 
-#### Account 端
+#### Account 端完整兜底路径
 
-**初始化**：[packages/account/src/i18n/init.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/70-logto/packages/account/src/i18n/init.ts#L15-L22)
+**初始化（空壳）**：[packages/account/src/i18n/init.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/70-logto/packages/account/src/i18n/init.ts#L15-L22)
 
 ```typescript
 await i18next.init({
-  resources: {},       // 空！
-  fallbackLng: 'en',   // ← 有显式 fallback
+  resources: {},       // 空！不加载任何资源
+  fallbackLng: 'en',   // ← 语言选择 fallback
   interpolation: { escapeValue: false },
 });
 ```
 
-**特点**：
-- 初始 resources 是空的
-- 有 `fallbackLng: 'en'`
-- 实际翻译资源在 `PageContextProvider` 中通过 `changeLanguage()` 异步加载
-- `fallbackLng: 'en'` 是防御性配置——如果 API 加载失败，至少还能显示英文 key 名？不对，实际上英文资源也没加载进来
+**实际加载（PageContextProvider 中）**：[packages/account/src/Providers/PageContextProvider/index.tsx#L147-L152](file:///d:/fz/0601-2/solo-dogfeeding/code/70-logto/packages/account/src/Providers/PageContextProvider/index.tsx#L147-L152)
 
-> **注意**：Account 端虽然设置了 `fallbackLng: 'en'`，但 `resources` 初始是空的，英文资源也没有内置。这个 fallback 更多是 i18next 的默认配置，实际英文翻译同样需要通过 API 获取。
+```typescript
+await changeLanguage(
+  getPreferredLanguage({
+    languageSettings: settings.languageInfo,
+    uiLocales: getUiLocales(),
+  })
+);
+```
+
+**changeLanguage 流程**：[packages/account/src/i18n/utils.ts#L86-L94](file:///d:/fz/0601-2/solo-dogfeeding/code/70-logto/packages/account/src/i18n/utils.ts#L86-L94)
+```typescript
+export const changeLanguage = async (language?: string) => {
+  const { resources, lng } = await getI18nResource(language);  // ← 可能兜底到英文
+
+  // 把资源添加到 i18next
+  for (const [namespace, resource] of Object.entries(resources[lng] ?? {})) {
+    i18next.addResourceBundle(lng, namespace, resource);
+  }
+
+  await i18next.changeLanguage(lng);  // ← 切换语言
+};
+```
+
+**getPhrases 流程**（Account 版）：[packages/account/src/i18n/utils.ts#L49-L66](file:///d:/fz/0601-2/solo-dogfeeding/code/70-logto/packages/account/src/i18n/utils.ts#L49-L66)
+```
+getPhrases(language?):
+  1. 检测浏览器语言（localStorage / navigator）
+  2. 请求 API /api/.well-known/phrases
+  3. API 失败 → catch 块返回内置英文 resource.en
+```
+
+**特点**：
+- 初始化是"空壳"，resources 为空
+- `fallbackLng: 'en'` 是**语言选择 fallback**，不是资源兜底
+  - 作用：当调用 `i18next.changeLanguage('xx')` 但 'xx' 没有资源时，i18next 自动切到 'en'
+  - 注意：这是语言切换时的兜底，不是 API 失败时的资源兜底
+- API 失败时的资源兜底在 `getI18nResource` 的 catch 块
+- 时序：`initI18n()`（空） → `PageContextProvider` 加载设置 → `changeLanguage()` 实际加载短语
+
+### 4.4 fallbackLng 的真正作用
+
+`fallbackLng: 'en'` 在 Account 端的作用是**语言选择 fallback**，不是资源兜底。
+
+**场景**：
+1. 用户浏览器语言是 `'xx-XX'`（不存在的语言）
+2. `changeLanguage('xx-XX')` 被调用
+3. `getI18nResource('xx-XX')` 请求 API
+4. 后端语言匹配后可能返回 `'en'`（如果 'xx-XX' 匹配不上）
+5. 如果后端返回的 lng 和请求的不一致，或者 API 失败返回了英文
+6. 此时 `i18next.changeLanguage('xx-XX')` 会发现 'xx-XX' 没有资源
+7. `fallbackLng: 'en'` 生效，i18next 自动切到 'en'
+
+> **一句话总结**：`fallbackLng` 管"找不到这个语言怎么办"，catch 块管"API 挂了怎么办"。
 
 #### Console 端
 
@@ -314,8 +415,9 @@ await i18next.init({
 - 直接从 npm 包加载所有语言的所有资源
 - 包含 `translation`、`errors`（来自 `@logto/phrases`）和 `experience` 命名空间
 - 不依赖后端注入，没有自定义短语的概念
+- 不需要兜底，因为所有资源都内置了
 
-### 4.3 资源加载方式对比
+### 4.5 资源加载方式对比
 
 **Experience 端的资源加载**：
 
@@ -323,13 +425,14 @@ await i18next.init({
 i18next 实例
   └── 语言: 'zh-CN'
        └── namespace: translation
-            ├── input: { ... }   ← 内置中文 + 自定义覆盖（已合并）
+            ├── input: { ... }   ← 后端合并结果（内置 + 自定义）
             ├── action: { ... }
             ├── error: { ... }
             └── ...
 ```
 
 只有一个语言，但这个语言的 translation namespace 是完整的。
+如果 API 失败，这里的语言会变成 `'en'`，内容是内置英文包。
 
 **语言切换后**：
 ```
@@ -338,6 +441,20 @@ i18next 实例
   │    └── translation: { ... }
   └── 语言: 'en'
        └── translation: { ... }  ← 新增的语言包（也是完整的）
+```
+
+**Account 端的资源加载**（初始状态）：
+```
+i18next 实例
+  └── (空，无任何资源)
+```
+
+**加载后**：
+```
+i18next 实例
+  └── 语言: 'zh-CN' 或 'en'（API 失败时）
+       └── namespace: translation
+            └── ...
 ```
 
 **Console 端的资源加载**：
