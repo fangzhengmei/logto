@@ -171,7 +171,27 @@ async sendVerificationCode(payload?, options?: { skipDelivery?: boolean }) {
 
 ---
 
-## 三、Passcode 与 Captcha、Sentinel 的配合时序
+## 三、各类型验证码发送的 guardCaptcha 条件区分
+
+### 3.0 关键结论：guardCaptcha 条件只有一个判断维度
+
+所有验证码发送共用同一个路由处理函数，guardCaptcha 的触发条件**只看 `!identifiedUserId`，不看 `interactionEvent`，也不看验证码类型。
+
+```typescript
+// verification-code.ts L49-L52
+// Require captcha if the user is not identified.
+if (!ctx.experienceInteraction.identifiedUserId) {
+  await ctx.experienceInteraction.guardCaptcha();
+}
+```
+
+> **`identifiedUserId` 为 undefined**
+
+| 类型 | 路由 | 是否有 identifiedUserId? | guardCaptcha 触发? |
+|------|------|-------------------|-----------------|
+| 普通验证码（登录/注册/忘记密码） | `POST /experience/verification/verification-code` | 无，此时交互初始化时，用户还未 identify → **触发 |
+| MFA 绑定验证码（已识别用户绑定新邮箱/手机号） | 同上 | 有（已通过密码/验证码识别了用户 → **不触发** |
+| MFA 登录校验验证码 | `POST /experience/verification/mfa-verification-code` | 有（必须先识别用户，才能发 MFA 验证） → **不触发** |
 
 ### 3.1 验证码发送（sendCode）完整执行顺序
 
@@ -179,20 +199,31 @@ async sendVerificationCode(payload?, options?: { skipDelivery?: boolean }) {
 POST /experience/verification/verification-code
 Body: { identifier, interactionEvent }
         ↓
-① guardCaptcha()                                              ← 【Captcha 检查】
-  │  └─ !identifiedUserId && captchaPolicy.enabled → 抛 captcha_required
-  │     注意：ForgotPassword 也走这里，即使用户不存在也要先过 Captcha
+① if (!identifiedUserId) → guardCaptcha()                      ← 【Captcha 检查】
+  │  └─ identifiedUserId=undefined && captchaPolicy.enabled → captcha_required
+  │     覆盖场景：
+  │     ✅ SignIn 登录验证码
+  │     ✅ Register 注册验证码
+  │     ✅ ForgotPassword 忘记密码验证码
+  │     ❌ 已识别用户的 MFA 绑定验证码（identifiedUserId ≠ undefined → 跳过
         ↓
-② sendCode()
-  ├─ 2a. createVerificationRecord()                           ← 构建 CodeVerification 对象
-  ├─ 2b. Register + Email → guardEmailBlocklist()             ← 注册邮件黑名单
-  ├─ 2c. 计算 skipDelivery:
-  │       ForgotPassword && !hasUserWithIdentifier(queries, identifier)
-  ├─ 2d. codeVerification.sendVerificationCode(payload, { skipDelivery })
-  │     ├─ createPasscode(id, templateType, payload)          ← 【旧码失效：物理删除旧码，插入新码】
-  │     ├─ if (skipDelivery) return;                          ← 【跳过投递】
+② 判断验证码用途（L59-L65）
+  │   identifiedUserId 存在，且 email/phone 不在 signUp identifiers
+  │   → 则是 MFA 绑定验证码，TemplateType = BindMfa
+  │   → createNewCodeVerificationRecord(..., BindMfa)
+  │ 否则 → TemplateType = getTemplateTypeByEvent(interactionEvent)
+  │   → SignIn / Register / ForgotPassword 对应各自模板
+        ↓
+③ sendCode()
+  ├─ 3a. createVerificationRecord()                       ← 构建 CodeVerification 对象
+  ├─ 3b. Register + Email → guardEmailBlocklist()      ← 注册邮件黑名单
+  ├─ 3c. 计算 skipDelivery:
+  │     ForgotPassword && !hasUserWithIdentifier(queries, identifier)
+  ├─ 3d. codeVerification.sendVerificationCode(payload, { skipDelivery })
+  │     ├─ createPasscode(id, templateType, payload)      ← 【旧码失效：物理删除旧码，插入新码
+  │     ├─ if (skipDelivery) return;                  ← 【跳过投递】
   │     └─ sendPasscode() → 调用短信/邮件连接器发送
-  └─ 2e. setVerificationRecord() + save()                     ← 保存到交互会话
+  └─ 3e. setVerificationRecord() + save()             ← 保存到交互会话
         ↓
 返回 { verificationId }
 ```
@@ -200,10 +231,40 @@ Body: { identifier, interactionEvent }
 **配合关系**：
 | 检查 | 位置 | 触发时机 |
 |------|------|----------|
-| Captcha | ① | **最先执行**，sendCode 之前，所有 interactionEvent 都需要 |
-| 旧码失效 | 2d createPasscode | 创建新码时物理删除旧码，即使 skipDelivery 也执行 |
-| 邮件黑名单 | 2b | 仅 Register + Email |
-| skipDelivery | 2c-2d | 仅 ForgotPassword + 用户不存在 |
+| Captcha | ① | 仅当 `!identifiedUserId` 时执行，覆盖登录/注册/忘记密码的验证码；MFA 场景自动跳过 |
+| 旧码失效 | 3d createPasscode | 创建新码时物理删除旧码，即使 skipDelivery 也执行 |
+| 邮件黑名单 | 3b | 仅 Register + Email |
+| skipDelivery | 3c-3d | 仅 ForgotPassword + 用户不存在 |
+| BindMfa 模板 | ② | 已识别用户且标识不在 signUp identifiers 时，模板使用 BindMfa |
+
+### 3.2 MFA 登录校验验证码（无 guardCaptcha
+
+```
+POST /experience/verification/mfa-verification-code
+Body: { identifierType: Email | Phone }
+        ↓
+① 无 guardCaptcha 调用（整个路由处理函数L128-L148 直接调用 sendCode 前没有任何 Captcha 检查
+  │ 原因：
+  │   - MFA 路由要求必须先有 identifiedUserId 才能从用户 profile 拿邮箱/手机号
+  │   - 所以 identifiedUserId 一定存在，Captcha 已在识别用户的路径被 Captcha 守卫
+        ↓
+② getMfaIdentifier()
+  │   identifiedUserId=undefined → 抛 identifier_not_found 400
+  │   从 users 表查询用户 primaryEmail / primaryPhone 作为 identifier
+        ↓
+③ sendCode()
+  └─ createNewMfaCodeVerificationRecord(..., verified=false)
+  └─ TemplateType = MfaVerification
+        ↓
+返回 { verificationId }
+```
+
+**关键点**：
+- MFA 校验验证码的发送路由**完全没有 guardCaptcha 调用**
+- 因为 getMfaIdentifier() 中 identifiedUserId 检查，保证了用户必须已识别用户才能进入 MFA 路径
+- 识别用户的路径（密码/验证码登录）已经过了 Captcha 守卫（在 submit 时检查）或 skipCaptcha（社交/SSO/Passkey）
+- 所以 MFA 校验验证码不需要重复做 Captcha
+
 
 ### 3.2 验证码校验（verifyCode）完整执行顺序
 
