@@ -74,7 +74,7 @@ Logto 中存在两套相似但用途不同的令牌/验证码机制：
 
 通过 Management API 创建：`POST /one-time-tokens`
 
-路由定义在 [one-time-tokens.ts](file:///d:/fz/0601-2\solo-dogfeeding/code/68-logto/packages/core/src/routes/one-time-tokens.ts#L83-L119)。
+路由定义在 [one-time-tokens.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/core/src/routes/one-time-tokens.ts#L83-L119)。
 
 ### 2.2 创建步骤
 
@@ -367,7 +367,7 @@ Verification Record 存储在 `verification_records` 表中：
 
 以 One-Time Token 登录为例，完整流程如下：
 
-### 7.1 前置：令牌创建
+### 7.1 前置：令牌创建与魔法链接拼接
 
 ```
 Management API 调用
@@ -375,31 +375,71 @@ Management API 调用
   Body: { email, expiresIn?, context? }
   ↓
 生成 one_time_token 记录（status=Active）
+  返回 { id, token, email, status, expiresAt, context }
   ↓
-业务系统拼接魔法链接
-  https://<logto-domain>/experience?one_time_token=xxx&email=xxx
+业务系统拼接 OIDC 授权 URL（魔法链接）
+  https://<logto-domain>/oidc/auth?
+    client_id=<app-id>&
+    redirect_uri=<callback>&
+    response_type=code&
+    scope=openid+profile+email&
+    one_time_token=<token>&
+    login_hint=<email>
   ↓
-用户点击链接，跳转到登录页
+通过邮件将链接发送给用户
+  ↓
+用户点击魔法链接，请求 OIDC 授权端点
 ```
 
-### 7.2 第一步：创建交互会话
+### 7.2 第一步：OIDC 授权端点与 koa-consent-guard 网关
+
+用户点击魔法链接后，请求进入 OIDC 授权端点，经过 `koaConsentGuard` 中间件处理（详见第八章）：
 
 ```
-PUT /experience
-Body: { interactionEvent: 'SignIn' }
+GET /oidc/auth?one_time_token=xxx&login_hint=yyy&...
 ↓
-创建 ExperienceInteraction 实例
-  ├── interactionEvent = SignIn
-  ├── verificationRecords = []
-  ├── userId = undefined
-  └── profile = {}
-↓
-保存到 interaction storage（OIDC session）
+koa-consent-guard 中间件
+  ├── 提取 one_time_token + login_hint（需同时存在）
+  ├── 账户切换检测
+  │   └── 已有会话 + 邮箱不匹配 → 重定向 /switch-account
+  ├── checkOneTimeToken 预检查
+  │   ├── token_consumed + 当前用户匹配 → 放行 next()
+  │   └── 其他错误 → 重定向 /one-time-token?errorMessage=...
+  └── 预检查通过 → 重定向到 SPA
+      ctx.redirect(buildExperienceUrl(oneTimeToken, token, loginHint))
+      → /one-time-token?login_hint=<email>&one_time_token=<token>
 ```
 
-入口在 [index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/core/src/routes/experience/index.ts#L62-L96)。
+核心逻辑在 [koa-consent-guard.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/core/src/middleware/koa-consent-guard.ts)。
 
-### 7.3 第二步：验证 One-Time Token
+### 7.3 第二步：SPA 落地与交互会话创建
+
+```
+用户浏览器加载 /one-time-token 页面
+  ↓
+OneTimeToken/index.tsx 解析 URL 参数
+  ├── token = params.get('one_time_token')
+  ├── email = params.get('login_hint')
+  └── errorMessage = params.get('errorMessage')
+  ↓
+前置校验通过 → 触发 signInWithOneTimeToken
+  ↓
+1. initInteraction(InteractionEvent.SignIn)
+   PUT /experience
+   Body: { interactionEvent: 'SignIn' }
+   ↓
+   创建 ExperienceInteraction 实例
+     ├── interactionEvent = SignIn
+     ├── verificationRecords = []
+     ├── userId = undefined
+     └── profile = {}
+   ↓
+   保存到 interaction storage（OIDC session）
+```
+
+Experience API 入口在 [index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/core/src/routes/experience/index.ts#L62-L96)，前端落地页在 [OneTimeToken/index.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/experience/src/pages/OneTimeToken/index.tsx)。
+
+### 7.4 第三步：验证 One-Time Token
 
 ```
 POST /experience/verification/one-time-token/verify
@@ -428,7 +468,7 @@ verifyOneTimeToken(token, email)
 返回 { verificationId }
 ```
 
-### 7.4 第三步：识别用户
+### 7.5 第四步：识别用户
 
 ```
 POST /experience/identification
@@ -447,13 +487,13 @@ experienceInteraction.identifyUser(verificationId)
 保存 interaction
 ```
 
-### 7.5 第四步：提交交互
+### 7.6 第五步：提交交互（含注册兜底）
 
 ```
 POST /experience/submit
 ↓
 experienceInteraction.submit()
-  ├── guardCaptcha() 校验人机验证
+  ├── guardCaptcha() 校验人机验证（OneTimeToken 已跳过 CAPTCHA）
   ├── getIdentifiedUser() 确保用户已识别
   ├── guardMfaVerificationStatus() 校验 MFA（SignIn 时）
   ├── profile.validateAvailability() 校验 Profile 唯一性
@@ -465,53 +505,77 @@ experienceInteraction.submit()
       └── 触发 OIDC 登录，建立会话
 ↓
 返回重定向 URI 或直接完成登录
+
+———— 特殊分支：user.user_not_exist ————
+识别用户失败 → 注册兜底：
+  1. 条款同意校验（Manual 策略需弹窗确认）
+  2. updateInteractionEvent(Register)
+     PUT /experience/interaction-event
+  3. guardInteractionEvent(Register, hasVerifiedOneTimeToken=true)
+     → 即使 signInMode=SignIn 也允许注册
+  4. 重新 POST /experience/identification
+  5. 重新 POST /experience/submit → 完成注册并登录
 ```
 
-Submit 逻辑在 [experience-interaction.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/core/src/routes/experience/classes/experience-interaction.ts#L474)。
+Submit 逻辑在 [experience-interaction.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/core/src/routes/experience/classes/experience-interaction.ts#L474)，注册兜底特权在 [sign-in-experience-validator.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/core/src/routes/experience/classes/libraries/sign-in-experience-validator.ts#L103-L128)。
 
-### 7.6 流程图
+### 7.7 流程图
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     魔法链接登录流程                          │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  [令牌生成阶段]                                              │
-│  Management API → 创建 one_time_token → 拼接魔法链接         │
-│                                                             │
-│                         ↓ 用户点击                           │
-│                                                             │
-│  [交互创建阶段]                                              │
-│  PUT /experience → 创建 ExperienceInteraction               │
-│                                                             │
-│                         ↓                                    │
-│                                                             │
-│  [验证阶段]                                                  │
-│  POST /experience/verification/one-time-token/verify        │
-│    → 创建 OneTimeTokenVerification 记录                      │
-│    → 校验令牌有效性                                          │
-│    → 标记令牌为 Consumed                                     │
-│    → 设置 verified = true                                   │
-│                                                             │
-│                         ↓                                    │
-│                                                             │
-│  [用户识别阶段]                                              │
-│  POST /experience/identification                            │
-│    → verificationRecord.identifyUser()                      │
-│    → 按邮箱查找用户                                          │
-│    → 设置 interaction.userId                                │
-│                                                             │
-│                         ↓                                    │
-│                                                             │
-│  [提交阶段]                                                  │
-│  POST /experience/submit                                    │
-│    → MFA 校验（如果需要）                                    │
-│    → Profile 校验                                           │
-│    → 更新用户数据                                            │
-│    → 触发 OIDC 登录                                          │
-│    → 建立用户会话                                            │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                      魔法链接登录流程（修正版）                        │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  [令牌生成阶段]                                                      │
+│  POST /one-time-tokens (Management API)                             │
+│    → 创建 one_time_token 记录 (status=Active)                        │
+│    → 业务系统拼接 OIDC 授权 URL                                      │
+│    → https://<logto-domain>/oidc/auth?...                           │
+│          &one_time_token=<token>&login_hint=<email>                 │
+│    → 邮件发送给用户                                                   │
+│                                                                     │
+│                           ↓ 用户点击魔法链接                          │
+│                                                                     │
+│  [OIDC 授权网关阶段]                                                │
+│  GET /oidc/auth?one_time_token=xxx&login_hint=yyy                   │
+│    ↓                                                                 │
+│  koaConsentGuard 中间件                                              │
+│    ├── 已有会话+邮箱不匹配 → 重定向 /switch-account                   │
+│    ├── checkOneTimeToken 失败 → 重定向 /one-time-token?error=...    │
+│    │     └── token_consumed + 当前用户匹配 → 放行(next)              │
+│    └── 预检查通过 → 重定向到 SPA                                      │
+│           /one-time-token?login_hint=yyy&one_time_token=xxx        │
+│                                                                     │
+│                           ↓ SPA 加载                                 │
+│                                                                     │
+│  [交互创建与验证阶段]                                                │
+│  OneTimeToken 页面                                                   │
+│    ├── 参数解析 + 前置校验                                           │
+│    ├── initInteraction(SignIn) → PUT /experience                    │
+│    └── verifyOneTimeToken → /verification/one-time-token/verify     │
+│        → 创建 OneTimeTokenVerification 记录                         │
+│        → verifyOneTimeToken() → 标记 Consumed                        │
+│        → verified = true + 跳过 CAPTCHA                              │
+│                                                                     │
+│                           ↓                                          │
+│                                                                     │
+│  [识别与提交阶段]                                                    │
+│  POST /experience/identification { verificationId }                 │
+│    → 按邮箱 findUserByIdentifier()                                   │
+│    → 设置 interaction.userId                                        │
+│    ↓                                                                 │
+│  POST /experience/submit                                            │
+│    ├── 成功 → redirectTo → 完成登录 ✅                               │
+│    └── user.user_not_exist → 注册兜底 ↓                             │
+│                                                                     │
+│  [注册兜底分支]                                                      │
+│    ├── 条款同意确认（Manual 策略）                                   │
+│    ├── updateInteractionEvent(Register)                              │
+│    ├── guardInteractionEvent: 即使 signInMode=SignIn 也放行          │
+│    ├── POST /experience/identification                              │
+│    └── POST /experience/submit → 完成注册并登录 ✅                   │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -883,7 +947,7 @@ ctx.redirect(buildExperienceUrl(experience.routes.oneTimeToken, token, loginHint
 
 ## 九、核心文件索引
 
-### 8.1 One-Time Token 相关
+### 9.1 One-Time Token 后端
 
 | 文件 | 说明 |
 |------|------|
@@ -895,7 +959,7 @@ ctx.redirect(buildExperienceUrl(experience.routes.oneTimeToken, token, loginHint
 | [one-time-tokens.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/schemas/src/foundations/jsonb-types/one-time-tokens.ts) | 类型与状态枚举 |
 | [one-time-token-verification.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/schemas/src/types/verification-records/one-time-token-verification.ts) | Verification Record 数据类型 |
 
-### 8.2 Verification Code 相关
+### 9.2 Verification Code 相关
 
 | 文件 | 说明 |
 |------|------|
@@ -905,7 +969,7 @@ ctx.redirect(buildExperienceUrl(experience.routes.oneTimeToken, token, loginHint
 | [verification-code-helpers.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/core/src/routes/experience/verification-routes/verification-code-helpers.ts) | 发送/验证辅助函数 |
 | [code-verification.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/core/src/routes/experience/classes/verifications/code-verification.ts) | Verification Record 实现 |
 
-### 8.3 Verification Record 抽象层
+### 9.3 Verification Record 抽象层
 
 | 文件 | 说明 |
 |------|------|
@@ -915,25 +979,48 @@ ctx.redirect(buildExperienceUrl(experience.routes.oneTimeToken, token, loginHint
 | [verification-records.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/core/src/queries/verification-records.ts) | 数据库查询 |
 | [verification-type.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/schemas/src/types/verification-records/verification-type.ts) | 验证类型枚举 |
 
-### 8.4 Experience Interaction
+### 9.4 Experience Interaction
 
 | 文件 | 说明 |
 |------|------|
 | [experience-interaction.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/core/src/routes/experience/classes/experience-interaction.ts) | 交互会话核心类 |
 | [index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/core/src/routes/experience/index.ts) | Experience API 入口 |
 
+### 9.5 魔法链接入口与中间件
+
+| 文件 | 说明 |
+|------|------|
+| [koa-consent-guard.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/core/src/middleware/koa-consent-guard.ts) | 后端网关：令牌预检查、账户切换、错误重定向 |
+| [sign-in-experience-validator.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/core/src/routes/experience/classes/libraries/sign-in-experience-validator.ts) | 交互事件校验（含 OneTimeToken 注册特权） |
+| [oidc.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/schemas/src/consts/oidc.ts) | ExtraParamsKey 枚举定义 |
+| [experience.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/schemas/src/consts/experience.ts) | Experience 路由常量 |
+
+### 9.6 Experience SPA 前端
+
+| 文件 | 说明 |
+|------|------|
+| [OneTimeToken/index.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/experience/src/pages/OneTimeToken/index.tsx) | 魔法链接落地页 |
+| [Error.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/experience/src/pages/OneTimeToken/Error.tsx) | 魔法链接错误页 |
+| [SwitchAccount/index.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/experience/src/pages/SwitchAccount/index.tsx) | 账户切换页 |
+| [SignIn/index.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/experience/src/pages/SignIn/index.tsx) | 登录页（含 OneTimeToken 路由汇聚） |
+| [Register/index.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/experience/src/pages/Register/index.tsx) | 注册页（含 OneTimeToken 路由汇聚） |
+| [one-time-token.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/experience/src/apis/experience/one-time-token.ts) | signInWithOneTimeToken API |
+| [index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/experience/src/apis/experience/index.ts) | registerWithVerifiedIdentifier API |
+| [interaction.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/experience/src/apis/experience/interaction.ts) | 交互 API（init/identify/submit） |
+| [App.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/68-logto/packages/experience/src/App.tsx) | SPA 路由定义 |
+
 ---
 
-## 九、关键设计要点
+## 十、关键设计要点
 
-### 9.1 幂等性与安全性
+### 10.1 幂等性与安全性
 
 - **One-Time Token**：一次性使用，验证后立即标记为 Consumed
 - **Verification Code**：一次性使用，验证后立即 consume
 - **防重放**：已消费/已过期的令牌不能重复使用
 - **防暴力破解**：Sentinel 防护、验证码尝试次数限制
 
-### 9.2 分层架构
+### 10.2 分层架构
 
 ```
 ┌─────────────────────────┐
@@ -947,14 +1034,14 @@ ctx.redirect(buildExperienceUrl(experience.routes.oneTimeToken, token, loginHint
 └─────────────────────────┘
 ```
 
-### 9.3 状态隔离
+### 10.3 状态隔离
 
 - **One-Time Token**：独立的数据库表，Management API 管理
 - **Passcode**：独立的数据库表，passcode 库管理
 - **Verification Record**：统一存储在 verification_records 表，JSONB 格式
 - **Interaction**：存储在 OIDC session 中，短期有效
 
-### 9.4 扩展能力
+### 10.4 扩展能力
 
 One-Time Token 的 `context` 字段支持扩展上下文，目前支持：
 - `jitOrganizationIds`: 组织 JIT（Just-In-Time）开通
