@@ -840,6 +840,186 @@ async function buildWebhooks<Event extends HookEvent>({ contextArray, metadata }
 3. **合并策略**：使用 spread 运算符按顺序合并，`application` 对象包含 `{ id, type, name, description }` 四个字段
 4. **容错设计**：应用查询失败用 `trySafe` 包裹，不影响 webhook 发送（application 字段可能为 undefined）
 
+### 5.6.1 User API clientId 用途边界：只服务验证码邮件，不进入 hook 上下文
+
+**明确的分界设计**：User API（`/api/verifications/*`）的 `ctx.auth.clientId` 只用于**验证码邮件模板**，**完全不会传递给 hook 中间件**，因此 Lockout Webhook 中没有应用信息。
+
+#### 完整证据链
+
+**证据 1：clientId 从 OIDC access token 解析并注入 ctx.auth**
+
+在 [koa-oidc-auth.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/67-logto/packages/core/src/middleware/koa-auth/koa-oidc-auth.ts#L63-L89)：
+
+```typescript
+const accessToken = await tenant.provider.AccessToken.find(accessTokenValue);
+const { accountId, scopes, clientId, sessionUid } = accessToken;  // ✅ 从 token 解析 clientId
+
+ctx.auth = {
+  type: 'user',
+  id: accountId,
+  scopes,
+  clientId,          // ✅ 存入 ctx.auth.clientId
+  identityVerified,
+  sessionUid,
+};
+```
+
+`Auth` 类型定义在 [types.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/67-logto/packages/core/src/middleware/koa-auth/types.ts#L3-L16)：
+
+```typescript
+type Auth = {
+  type: 'user' | 'app';
+  id: string;
+  scopes: Set<string>;
+  identityVerified?: boolean;
+  clientId?: string;           // OIDC access token 的 Client ID
+  sessionUid?: string;         // OIDC 会话 uid
+};
+```
+
+**证据 2：clientId 仅在发送验证码邮件时被读取**
+
+在 User API 的 `/verifications/verification-code` 路由中（[index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/67-logto/packages/core/src/routes/verification/index.ts#L95-L119)）：
+
+```typescript
+async (ctx, next) => {
+  // 🔑 唯一一处读取 ctx.auth.clientId 的地方！
+  const { id: userId, clientId: applicationId } = ctx.auth;
+  const { identifier, templateType: inputTemplateType } = ctx.guard.body;
+
+  // ... 构建 codeVerification ...
+
+  // 仅用于邮件模板上下文
+  const emailContextPayload =
+    identifier.type === SignInIdentifier.Email
+      ? await libraries.passcodes.buildVerificationCodeContext({ user, applicationId }, ctx)
+      //                                                        ^^^^^^^^^^^
+      //                                                        只传给邮件模板！
+      : undefined;
+
+  await codeVerification.sendVerificationCode({
+    ...ctx.emailI18n,
+    ...emailContextPayload,
+  });
+  // ...
+}
+```
+
+`buildVerificationCodeContext` 中用 `applicationId` 查询**应用名称和品牌信息**（[passcode.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/67-logto/packages/core/src/libraries/passcode.ts#L176-L220)）：
+
+```typescript
+const buildVerificationCodeContext = async ({ applicationId, ... }) => {
+  const [application, applicationSignInExperience, ...] = await Promise.all([
+    applicationId
+      ? isBuiltInApplicationId(applicationId)
+        ? Promise.resolve(buildBuiltInApplicationDataForTenant('', applicationId))
+        : queries.applications.findApplicationById(applicationId)  // 🔴 查询应用详情
+      : undefined,
+    // ...
+  ]);
+
+  return {
+    ...conditional(application && {
+      application: buildApplicationContextInfo(application, applicationSignInExperience),
+      // 用于邮件模板显示 "您正在登录 XXX 应用"
+    }),
+    // ...
+  };
+};
+```
+
+**证据 3：koaManagementApiHooks 中间件完全不读取 ctx.auth.clientId**
+
+在 [koa-management-api-hooks.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/67-logto/packages/core/src/middleware/koa-management-api-hooks.ts#L25-L31) 中，创建 HookContextManager 时只传了两个字段：
+
+```typescript
+const {
+  header: { 'user-agent': userAgent },
+  ip,
+} = ctx;
+
+// ⚠️ 没有读取 ctx.auth.clientId！
+// ⚠️ 也没有读取 ctx.auth.sessionUid！
+// ⚠️ 也没有读取 interactionEvent！
+const hooksContextManager = new HookContextManager({ userAgent, ip });
+```
+
+对比 Experience API 的 `koaExperienceInteractionHooks`：
+
+```typescript
+const interactionApiMetadata = {
+  interactionEvent,                              // ✅
+  userAgent,
+  applicationId: conditionalString(interactionDetails.params.client_id),  // ✅
+  sessionId: interactionDetails.jti,             // ✅
+};
+const dataHookContext = new HookContextManager({
+  ...interactionApiMetadata,
+  ip,                                            // ✅
+});
+```
+
+#### 设计分界对照表
+
+| clientId 的用途 | Experience API | User API / Management API |
+|-----------------|----------------|---------------------------|
+| 注入 hook metadata（→ 进入 webhook payload） | ✅ `interactionDetails.params.client_id` | ❌ 不注入 |
+| 验证码邮件模板显示应用名称 | ✅ | ✅ `ctx.auth.clientId` |
+| 验证码短信模板显示应用名称 | ✅ | ✅ `ctx.auth.clientId` |
+| 触发 Webhook 时带 application 对象 | ✅ | ❌ |
+
+#### 两个中间件的 metadata 字段对比
+
+| HookMetadata 字段 | Experience API（koaExperienceInteractionHooks） | User/Management API（koaManagementApiHooks） |
+|-------------------|--------------------------------------------------|----------------------------------------------|
+| `ip` | ✅ | ✅ |
+| `userAgent` | ✅ | ✅ |
+| `interactionEvent` | ✅ `SignIn` / `Register` / `ForgotPassword` | ❌ 无（管理 API 无交互事件概念） |
+| `applicationId` | ✅ 来自 `interactionDetails.params.client_id` | ❌ 无（`ctx.auth.clientId` 存在但不传递） |
+| `sessionId` | ✅ 来自 `interactionDetails.jti` | ❌ 无（`ctx.auth.sessionUid` 存在但不传递） |
+
+#### User API 实际代码执行时序
+
+```
+请求: POST /api/verifications/verification-code
+中间件链:
+  1. koaOidcAuth
+     ├─ 解析 access token → ctx.auth = { id, scopes, clientId, sessionUid }
+     │                                      ^^^^^^^^  ^^^^^^^^^^
+     │                                      ✅ 存在    ✅ 存在
+     └─ 但后续中间件完全忽略这两个字段
+  │
+  2. koaEmailI18n
+  │
+  3. koaManagementApiHooks
+     └─ const hooksContextManager = new HookContextManager({ userAgent, ip })
+        └─ metadata = { userAgent, ip }
+           └─ ❌ 没有 clientId
+           └─ ❌ 没有 sessionUid
+           └─ ❌ 没有 interactionEvent
+  │
+  路由处理:
+    ├─ const { id: userId, clientId: applicationId } = ctx.auth
+    │   🔑 这里是唯一用到 clientId 的地方 → 传给 buildVerificationCodeContext()
+    │   用于邮件模板显示应用名称
+    │
+    └─ 发送验证码 → 后续用户验证验证码时走 withSentinel()
+       └─ 触发封禁时调用 ctx.appendExceptionHookContext()
+          └─ 存入 exceptionHookContextArray
+          └─ 但 metadata 中没有 applicationId
+  │
+  中间件 finally:
+    triggerExceptionHooks()
+      └─ buildWebhooks()
+         └─ metadata.applicationId = undefined
+            └─ 不会查询 applications 表
+            └─ payload 中没有 applicationId 和 application
+```
+
+> **设计意图解读**：Management API 的设计初衷是面向"管理后台"和"服务端集成"场景，这些场景不对应特定的用户交互事件和应用上下文。但 User API（用户自助账户中心）实际上是用户通过前端应用调用的，理论上应该携带应用信息。当前的实现把 User API 和 Management API 共用了同一个 hook 中间件，这是一个**边界设计上的简化**。
+
+---
+
 ### 5.7 sendWebhookRequest 发送 HTTP 请求
 
 在 [utils.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/67-logto/packages/core/src/libraries/hook/utils.ts#L32-L49) 中：
@@ -902,7 +1082,7 @@ Webhook 请求特征：
 | `createdAt` | `new Date().toISOString()` | buildWebhooks 内部生成 | ❌ 否 | ✅ 有 | ✅ 有 | ❌ 无 |
 | `ip` | `ctx.ip`（Koa 请求 IP） | HookMetadata | ❌ 否 | ✅ 有 | ✅ 有 | ❌ 无 |
 | `userAgent` | `ctx.header['user-agent']` | HookMetadata | ❌ 否 | ✅ 有 | ✅ 有 | ❌ 无 |
-| `interactionEvent` | `interactionDetails.result.interactionEvent` | HookMetadata | ✅ **是**（但字段名不同，payload 里叫 `event`） | ✅ `SignIn/Register/ForgotPassword` | ❌ 无 | ❌ 无 |
+| `interactionEvent` | `interactionDetails.result.interactionEvent` | HookMetadata | ❌ **否** | ✅ `SignIn/Register/ForgotPassword` | ❌ 无 | ❌ 无 |
 | `applicationId` | `interactionDetails.params.client_id`（OIDC client_id） | HookMetadata | ❌ 否 | ✅ 有 | ❌ **无**（ctx.auth.clientId 存在但未使用） | ❌ 无 |
 | `sessionId` | `interactionDetails.jti`（OIDC 交互 JTI） | HookMetadata | ❌ 否 | ✅ 有 | ❌ 无 | ❌ 无 |
 | `application` | `findApplicationById(applicationId)` 查询 applications 表 | buildWebhooks | ❌ 否 | ✅ `{id,type,name,description}` | ❌ 无（无 applicationId 所以不查） | ❌ 无 |
