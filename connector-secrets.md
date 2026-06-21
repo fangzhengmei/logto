@@ -11,41 +11,66 @@ Logto 的连接器（Connector）系统涉及两套不同职责的敏感信息�
 
 ## 快速导航：最容易混淆的对外 API 总览
 
-> ⚠️ 以下是代码中真实存在的完整 HTTP 路径，务必注意前缀、路径段、参数含义的细微差异。
+> ⚠️ 以下是代码中真实存在的**完整 HTTP 路径**（OpenAPI 展示的路径），务必注意前缀、路径段、参数含义的细微差异。
 
-### API 前缀
+### API 前缀层级：三段式路径组成
 
-| 前缀常量 | 实际值 | 说明 | 代码位置 |
-|---------|--------|------|---------|
-| `accountApiPrefix` | `/my-account` | 用户端（登录态用户自己操作自己的数据）的 API 前缀 | [constants.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/account/constants.ts#L1) |
-| Management API | `/api/users` 等 | 管理端（管理员操作用户数据）的 API | 各管理路由文件 |
+```
+全局前缀（全局挂载）
+    ↓
+用户/管理员二级前缀（router 内常量）
+    ↓
+业务相对路径
+```
 
-### 社交连接器：Token 存储 API（PUT 主动触发）
+| 层级 | 前缀/常量 | 实际值 | 挂载位置 | 代码参考 |
+|------|----------|--------|---------|---------|
+| 第 1 层（全局） | 全局 API 前缀 | `/api` | `app.use(mount('/api', initApis(...))) | [Tenant.ts#L162](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/tenants/Tenant.ts#L162) |
+| 第 2 层（用户端） | `accountApiPrefix` | `/my-account` | 账号路由内常量 | [constants.ts#L1](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/account/constants.ts#L1) |
+| 第 2 层（管理端） | — | `/api/users/...` | 管理路由直接写在 router 里 | 各管理路由文件 |
 
-| 方法 | 完整路径 | 说明 | 代码位置 |
-|------|---------|------|---------|
-| `POST` | `/my-account/identities` | 新增社交身份（顺便存储 Token） | [identities.ts#L107-L138](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/account/identities.ts#L107-L138) |
-| `PUT` | `/my-account/identities` | 替换已有社交身份（顺便存储/更新 Token） | [identities.ts#L140-L171](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/account/identities.ts#L140-L171) |
-| `DELETE` | `/my-account/identities/:target` | 删除社交身份（通过触发器级联删除 Token） | [identities.ts#L173-L206](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/account/identities.ts#L173-L206) |
-| `GET` | `/my-account/identities/:target/access-token` | 读取社交连接器 Token（自动刷新） | [third-party-tokens.ts#L47-L92](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/account/third-party-tokens.ts#L47-L92) |
+> 💡 **记忆口诀**：用户端完整路径 = `/api` + `/my-account` + 业务路径段
+>
+> 代码里写的 `${accountApiPrefix}/identities/...` = 对外就是 `/api/my-account/identities/...`
 
-### 企业 SSO 连接器：Token 存储 API（**无独立 API**，在交互流程中自动入库）
+### 社交连接器：Token 相关 API
 
-| 方法 | 完整路径 | 说明 | 代码位置 |
-|------|---------|------|---------|
-| `GET` | `/my-account/sso-identities/:connectorId/access-token` | 读取企业 SSO Token（自动刷新） | [third-party-tokens.ts#L133-L163](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/account/third-party-tokens.ts#L133-L163) |
-| `GET` | `/api/users/:userId/sso-identities/:ssoConnectorId?includeTokenSecret=true` | 管理员查询用户 SSO 身份及脱敏 Token | [enterprise-sso.ts#L29-L162](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/admin-user/enterprise-sso.ts#L29-L162) |
+| 方法 | 完整 OpenAPI 路径 | Router 内写法 | 说明 | 代码位置 |
+|------|------------------|-------------|------|---------|
+| `GET` | `/api/my-account/identities/:target/access-token | `${accountApiPrefix}/identities/:target/access-token` | 读取社交连接器 Token（自动刷新） | [third-party-tokens.ts#L102-L131](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/account/third-party-tokens.ts#L102-L131) |
+| `PUT` | `/api/my-account/identities/:target/access-token` | `${accountApiPrefix}/identities/:target/access-token` | **主动存储**社交 Token（传入 verificationRecordId） | [third-party-tokens.ts#L165-L242](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/account/third-party-tokens.ts#L165-L242) |
+| `POST` | `/api/my-account/identities` | `${accountApiPrefix}/identities` | 新增社交身份（**顺带**存储 Token） | [identities.ts#L107-L138](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/account/identities.ts#L107-L138) |
+| `PUT` | `/api/my-account/identities` | `${accountApiPrefix}/identities` | 替换已有社交身份（**顺带**存储/更新 Token） | [identities.ts#L140-L171](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/account/identities.ts#L140-L171) |
+| `DELETE` | `/api/my-account/identities/:target` | `${accountApiPrefix}/identities/:target` | 删除社交身份（级联删除 Token） | [identities.ts#L173-L206](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/account/identities.ts#L173-L206) |
 
-> 💡 **关键区别**：企业 SSO Token 没有独立的存储 API。企业 SSO Token 在以下两条**交互提交链路**中被自动写入数据库：
-> 1. 🔗 **新用户注册链路**：`ExperienceInteraction.createUser()` → `ProvisionLibrary.createUser()`
-> 2. 🔗 **现有用户登录链路**：`ExperienceInteraction.identifyUser()` → `ExperienceInteraction.submit()`
+> 🔑 **社交 Token 存储的 3 条 HTTP 入口：
+> 1. **独立存储 API：`PUT /api/my-account/identities/:target/access-token`（专门存 Token）
+> 2. **绑定身份顺带：`POST/PUT /api/my-account/identities`（绑定身份时顺便存）
+> 3. **交互自动入库：新用户注册 / 现有用户登录（交互提交流程内自动完成）
 
-### 社交 vs SSO：路径参数含义完全不同
+### 企业 SSO 连接器：Token 相关 API
 
-| 连接器类型 | GET Token 路径 | 参数名 | 参数含义 | 关联字段 |
-|-----------|---------------|--------|---------|---------|
-| 社交连接器 | `/my-account/identities/:target/access-token` | `:target` | 社交目标标识（如 `github`、`google`） | `secret_social_connector_relations.target` |
-| 企业 SSO | `/my-account/sso-identities/:connectorId/access-token` | `:connectorId` | SSO 连接器实例 ID（UUID 风格） | `secret_enterprise_sso_connector_relations.sso_connector_id` |
+| 方法 | 完整 OpenAPI 路径 | Router 内写法 | 说明 | 代码位置 |
+|------|------------------|-------------|------|---------|
+| `GET` | `/api/my-account/sso-identities/:connectorId/access-token | `${accountApiPrefix}/sso-identities/:connectorId/access-token` | 读取企业 SSO Token（自动刷新） | [third-party-tokens.ts#L133-L163](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/account/third-party-tokens.ts#L133-L163) |
+| `GET` | `/api/users/:userId/sso-identities/:ssoConnectorId?includeTokenSecret=true` | 管理路由直接写 | 管理员查询用户 SSO 身份及脱敏 Token | [enterprise-sso.ts#L29-L162](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/admin-user/enterprise-sso.ts#L29-L162) |
+
+> 💡 **关键区别**：企业 SSO Token **没有独立的存储 API**。企业 SSO Token 在以下两条**交互提交链路**中被自动写入数据库：
+> 1. 🔗 **新用户注册链路**：`POST /api/interaction/:id/create-user` → `ProvisionLibrary.createUser()`
+> 2. 🔗 **现有用户登录链路**：`POST /api/interaction/:id/identify` → `POST /api/interaction/:id/submit`
+
+### 社交 vs SSO：路径与参数含义完全不同
+
+| 连接器类型 | GET Token 完整路径 | 参数名 | 参数含义 | 关联字段 |
+|-----------|-------------------|--------|---------|---------|
+| 社交连接器 | `/api/my-account/identities/:target/access-token` | `:target` | 社交目标标识（如 `github`、`google`） | `secret_social_connector_relations.target` |
+| 企业 SSO | `/api/my-account/sso-identities/:connectorId/access-token` | `:connectorId` | SSO 连接器实例 ID（UUID 风格） | `secret_enterprise_sso_connector_relations.sso_connector_id` |
+
+> ⚠️ **三处差异，一处相同：
+> - 差异 1：路径段 `identities` vs `sso-identities`（差一个 `sso-`）
+> - 差异 2：参数名 `target` vs `connectorId`
+> - 差异 3：参数含义完全不同（目标标识 vs 连接器实例 ID）
+> - 相同：都经过 `/api/my-account/` 前缀
 
 ---
 
@@ -338,22 +363,30 @@ export const tokenSetMetadataGuard = z.object({
     ↓
 Token 暂存到 SocialVerification 实例的 encryptedTokenSet 字段
     ↓
-（社交连接器 Token 存储有 3 条入库链路，任选其一）
+（社交连接器 Token 存储有 4 条入库链路，任选其一）
     ↓
 ┌─────────────────────────────────────────────────────────────────────────┐
 │ 链路 1：新用户注册（自动完成）                                           │
-│   ExperienceInteraction.createUser()                                     │
+│   POST /api/interaction/:id/create-user                                 │
+│     → ExperienceInteraction.createUser()                                 │
 │     → getNewUserProfileFromVerificationRecord() → profile.data          │
 │     → ProvisionLibrary.createUser() → upsertSocialTokenSetSecret()      │
 ├─────────────────────────────────────────────────────────────────────────┤
 │ 链路 2：现有用户登录（自动完成）                                         │
-│   ExperienceInteraction.identifyUser()                                   │
+│   POST /api/interaction/:id/identify → POST /api/interaction/:id/submit│
+│     → ExperienceInteraction.identifyUser()                               │
 │     → identifyUserByVerificationRecord() → profile.unsafeSet()          │
 │     → ExperienceInteraction.submit() → upsertSocialTokenSetSecret()     │
 ├─────────────────────────────────────────────────────────────────────────┤
-│ 链路 3：用户个人中心主动绑定/替换身份                                     │
-│   POST /my-account/identities（新增）                                    │
-│   PUT  /my-account/identities（替换）                                    │
+│ 链路 3：个人中心独立存储 API（主动触发）                                 │
+│   PUT /api/my-account/identities/:target/access-token                   │
+│     → 传入 verificationRecordId                                         │
+│     → buildVerificationRecordByIdAndType()                               │
+│     → upsertSocialTokenSetSecret()                                      │
+├─────────────────────────────────────────────────────────────────────────┤
+│ 链路 4：个人中心绑定身份时顺带存储                                       │
+│   POST /api/my-account/identities（新增）                                │
+│   PUT  /api/my-account/identities（替换）                                │
 │     → linkSocialIdentityCore()                                           │
 │       → newVerificationRecord.getTokenSetSecret()                       │
 │       → upsertSocialTokenSetSecret()                                    │
@@ -378,10 +411,10 @@ Token 暂存到 SocialVerification 实例的 encryptedTokenSet 字段
 - `upsertSocialTokenSetSecret`（数据库层，含删除逻辑）：[secret.ts#L40-L73](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/queries/secret.ts#L40-L73)
 - `encryptAndSerializeTokenResponse`：[secret-encryption.ts#L179-L192](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/utils/secret-encryption.ts#L179-L192)
 
-#### 流程二：用户读取第三方 Access Token
+#### 流程二：用户读取社交连接器 Access Token
 
 ```
-用户请求：GET /my-account/identities/:target/access-token
+用户请求：GET /api/my-account/identities/:target/access-token
     ↓
 [thirdPartyTokensRoutes]
     ↓
@@ -551,7 +584,7 @@ Token 暂存到 EnterpriseSsoVerification.encryptedTokenSet 字段
 ```
 管理员请求：GET /api/users/:userId/sso-identities/:ssoConnectorId?includeTokenSecret=true
     或
-用户请求：GET /my-account/sso-identities/:connectorId/access-token
+用户请求：GET /api/my-account/sso-identities/:connectorId/access-token
     ↓
 [enterprise-sso.ts / third-party-tokens.ts]
     ↓
@@ -608,7 +641,7 @@ queries.secrets.findEnterpriseSsoTokenSetSecretByUserIdAndConnectorId(userId, co
 | 查询入口（按用户查找） | `findSocialTokenSetSecretByUserIdAndTarget(userId, target)` | `findEnterpriseSsoTokenSetSecretByUserIdAndConnectorId(userId, connectorId)` | ❌ 独立查询 |
 | 查询条件（WHERE 子句） | `user_id = ? AND target = ?` | `user_id = ? AND sso_connector_id = ?` | ❌ 不同 |
 | **Upsert 旧记录删除条件** | `user_id = ? AND target = ?`（按 userId + target） | `user_id = ? AND issuer = ?`（⚠️ 仅按 userId + issuer，不区分 ssoConnectorId） | ❌ 不同 |
-| 用户读取 Token 路由 | `GET /api/account/identities/:target/access-token` | `GET /api/account/sso-identities/:connectorId/access-token` | ❌ 不同路径和参数 |
+| 用户读取 Token 路由 | `GET /api/my-account/identities/:target/access-token` | `GET /api/my-account/sso-identities/:connectorId/access-token` | ❌ 不同路径和参数 |
 
 ---
 
@@ -638,11 +671,12 @@ queries.secrets.findEnterpriseSsoTokenSetSecretByUserIdAndConnectorId(userId, co
 | **加密算法** | AES-256-GCM 信封加密（共用） | AES-256-GCM 信封加密（共用） |
 | **Token 结构** | `{access_token, refresh_token?, id_token?}`（共用） | 相同结构（共用） |
 | **支持协议** | OAuth 2.0 / OIDC | **仅 OIDC**（SAML 不支持 Token 存储） |
-| **Token 存储触发** | 3 条链路：① 新用户注册（自动）② 现有用户登录（自动）③ 个人中心绑定身份（POST/PUT `/my-account/identities`） | 2 条链路：① 新用户注册（自动）② 现有用户登录（自动） **（无独立 API）** |
+| **Token 存储触发** | 4 条链路：① 新用户注册（自动）② 现有用户登录（自动）③ `PUT /api/my-account/identities/:target/access-token` 独立 API ④ `POST/PUT /api/my-account/identities` 绑定身份顺带 | 2 条链路：① 新用户注册（自动）② 现有用户登录（自动） **（无独立存储 API）** |
+| **用户读取 Token API** | `GET /api/my-account/identities/:target/access-token`（参数 `:target` = 社交目标） | `GET /api/my-account/sso-identities/:connectorId/access-token`（参数 `:connectorId` = SSO 连接器实例 ID） |
 | **Token 刷新入口** | `socials.refreshTokenSetSecret()` | `ssoConnectors.refreshTokenSetSecret()`（独立实现，逻辑相同） |
 | **Refresh Token 保留** | 保留原 refresh_token（共用策略） | 相同策略（共用） |
 | **级联删除** | 连接器/身份删除时删除 secret | 数据库触发器自动删除关联 secret |
-| **管理员查询 API** | `/users/:userId/all-identities?includeTokenSecret=true` | `/users/:userId/sso-identities/:ssoConnectorId?includeTokenSecret=true` |
+| **管理员查询 API** | `GET /api/users/:userId/all-identities?includeTokenSecret=true` | `GET /api/users/:userId/sso-identities/:ssoConnectorId?includeTokenSecret=true` |
 
 ---
 
@@ -679,14 +713,16 @@ queries.secrets.findEnterpriseSsoTokenSetSecretByUserIdAndConnectorId(userId, co
 
 5. **SAML 企业 SSO 不支持 Token 存储**：即使 `enable_token_storage=true`，SAML 类型的企业 SSO 连接器也会跳过 Token 存储逻辑（`connectorInstance instanceof OidcConnector` 校验不通过）。
 
-6. **⚠️ 用户端 API 前缀不是 `/api/account/`，而是 `/my-account/`**：
-   - `accountApiPrefix` 常量值为 `/my-account`，定义在 `packages/core/src/routes/account/constants.ts`
-   - 所有用户自服务的 Token、身份、个人资料 API 都以 `/my-account/` 开头
-   - `/api/users/...` 开头的是管理员（Management API）路径
-   - 文档中遇到 `/my-account/...` 路径时不要误以为写错了，它和 `/api/users/...` 是两套完全不同的入口
+6. **⚠️ 用户端 API 是三段式路径：`/api` + `/my-account` + 业务路径**：
+   - 第 1 层：全局 API 前缀 `/api`，在 [Tenant.ts#L162](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/tenants/Tenant.ts#L162) 中通过 `app.use(mount('/api', initApis(...)))` 挂载
+   - 第 2 层：`accountApiPrefix` 常量值为 `/my-account`，定义在 [constants.ts#L1](file:///d:/fz/0601-2/solo-dogfeeding/code/66-logto/packages/core/src/routes/account/constants.ts#L1)
+   - 第 3 层：业务相对路径（如 `/identities/:target/access-token`）
+   - **完整 OpenAPI 路径 = `/api` + `/my-account` + 业务路径**，例如 `/api/my-account/identities/:target/access-token`
+   - 代码里写的 `${accountApiPrefix}/identities/...` 是 router 内的相对路径，不是对外完整路径
+   - `/api/users/...` 开头的是管理员（Management API）路径，不要跟用户端路径混淆
 
 7. **社交 vs SSO Token 入库链路数量不同**：
-   - 社交连接器：**3 条入库链路**（① 新用户注册自动 ② 现有用户登录自动 ③ 个人中心 POST/PUT `/my-account/identities` 绑定/替换身份时顺带）
+   - 社交连接器：**4 条入库链路**（① 新用户注册自动 ② 现有用户登录自动 ③ `PUT /api/my-account/identities/:target/access-token 独立存储 API ④ `POST/PUT /api/my-account/identities` 绑定身份时顺带）
    - 企业 SSO 连接器：**2 条入库链路**（① 新用户注册自动 ② 现有用户登录自动），**没有独立的存储 API**，只能在交互提交流程中自动完成
 
 8. **⚠️ 所有入库链路必经 profile.data**：无论社交还是 SSO，`enterpriseSsoConnectorTokenSetSecret` / `socialConnectorTokenSetSecret` 都必须先写入 `ExperienceInteraction.profile.data`，才能在后续的 `ProvisionLibrary.createUser()`、`ExperienceInteraction.submit()` 或 `linkSocialIdentityCore()` 中被读取并入库。如果 profile 中没有这个字段，Token 就不会被存储。
@@ -702,9 +738,9 @@ queries.secrets.findEnterpriseSsoTokenSetSecretByUserIdAndConnectorId(userId, co
 13. **⚠️ 企业 SSO upsert 删除条件较粗**：`upsertEnterpriseSsoTokenSetSecret` 删除旧记录时只按 `userId + issuer` 删除，不区分 `ssoConnectorId`。这意味着如果同一用户通过同一 issuer（如同一 Azure AD 租户）的不同 SSO 连接器登录，后登录的会覆盖先登录的 Token。
 
 14. **社交与企业 SSO Token 读取路由完全独立，路径段和参数含义都不同**：
-    - 社交连接器：`GET /my-account/identities/:target/access-token`，参数 `:target` 是社交目标标识（如 `github`、`google`），关联 `secret_social_connector_relations.target`
-    - 企业 SSO 连接器：`GET /my-account/sso-identities/:connectorId/access-token`，路径段是 `/sso-identities/`，参数 `:connectorId` 是 SSO 连接器实例 ID（UUID 风格），关联 `secret_enterprise_sso_connector_relations.sso_connector_id`
-    - 两者路径前缀 `/my-account/identities` vs `/my-account/sso-identities` 差一个 `sso-`，参数含义完全不同，不能混用
+    - 社交连接器：`GET /api/my-account/identities/:target/access-token`，参数 `:target` 是社交目标标识（如 `github`、`google`），关联 `secret_social_connector_relations.target`
+    - 企业 SSO 连接器：`GET /api/my-account/sso-identities/:connectorId/access-token`，路径段是 `/sso-identities/`，参数 `:connectorId` 是 SSO 连接器实例 ID（UUID 风格），关联 `secret_enterprise_sso_connector_relations.sso_connector_id`
+    - 两者完整路径 `/api/my-account/identities/...` vs `/api/my-account/sso-identities/...` 差一个 `sso-`，参数含义完全不同，不能混用
 
 15. **查询必须包含 `type = 'FederatedTokenSet'` 条件**：两个 `find*` 查询函数都会显式加上 `secrets.type = 'FederatedTokenSet'` 过滤条件，确保只查询 Token 类型的 secret，不与其他类型的 secret 混淆。
 
