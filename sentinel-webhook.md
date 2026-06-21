@@ -383,6 +383,57 @@ async reportActivity(activity: ActivityReport): Promise<SentinelDecisionTuple> {
 
 无论决策结果如何，活动记录都会被持久化到 `sentinel_activities` 表。
 
+### 3.6 字段边界：风控活动 payload vs 锁定通知 payload
+
+这是最容易混淆的地方：**Sentinel 有两套完全独立的 payload 数据，用途和去向完全不同**。
+
+#### 3.6.1 sentinel_activities.payload（内部风控数据，不发给外部）
+
+存储在数据库表 [sentinel_activities.sql](file:///d:/fz/0601-2/solo-dogfeeding/code/67-logto/packages/schemas/tables/sentinel_activities.sql#L18) 的 `payload jsonb` 列，类型为 `SentinelActivityPayload = Record<string, unknown>`（[sentinel.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/67-logto/packages/schemas/src/foundations/jsonb-types/sentinel.ts#L48-L51)）。
+
+典型内容（来自 `withSentinel` 调用）：
+
+```typescript
+// 仅存数据库，不会出现在 webhook payload 中
+payload: {
+  event: 'SignIn',              // 交互事件
+  verificationId: 'ver_xxx',    // 验证记录 ID
+}
+```
+
+用途：仅供风控决策和审计追溯使用，**永远不会发送给外部 webhook 接收方**。
+
+#### 3.6.2 Identifier.Lockout 通知 payload（发给外部系统）
+
+在 `buildWebhooks()` 中组装，是真正通过 HTTP POST 发给外部系统的数据。来源分三部分：
+
+| 数据来源 | 包含字段 | 代码位置 |
+|----------|----------|----------|
+| `HookMetadata`（中间件初始化） | `interactionEvent`, `applicationId`, `sessionId`, `ip`, `userAgent` | [context-manager.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/67-logto/packages/core/src/libraries/hook/context-manager.ts#L23-L26) |
+| `HookContext`（业务代码登记） | `type`, `value`（标识符明文） | [context-manager.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/67-logto/packages/core/src/libraries/hook/context-manager.ts#L28-L32) |
+| `buildWebhooks` 额外查询 | `application: { id, type, name, description }` | [index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/67-logto/packages/core/src/libraries/hook/index.ts#L265-L270) |
+| `buildWebhooks` 通用字段 | `event`, `createdAt` | [index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/67-logto/packages/core/src/libraries/hook/index.ts#L278-L279) |
+
+#### 3.6.3 字段边界对比表
+
+| 字段 | 存在于 sentinel_activities.payload | 存在于 Identifier.Lockout webhook payload | 说明 |
+|------|-----------------------------------|--------------------------------------------|------|
+| `event` | ✅ 可能有（payload.event） | ✅ 有（根级别 event = 'Identifier.Lockout'） | **注意**：webhook 的 `event` 是 `'Identifier.Lockout'`，不是风控 payload 里的交互事件 |
+| `verificationId` | ✅ | ❌ **没有** | 只存数据库，不对外暴露 |
+| `interactionEvent` | ❌ | ✅ | 来自 HookMetadata，不是来自风控 payload |
+| `applicationId` | ❌ | ✅ | 来自 OIDC 会话 client_id |
+| `application` | ❌ | ✅ | buildWebhooks 时额外查询 |
+| `sessionId` | ❌ | ✅ | 来自 OIDC 交互 jti |
+| `ip` | ❌ | ✅ | 来自请求上下文 |
+| `userAgent` | ❌ | ✅ | 来自请求头 |
+| `type` / `value` | ❌ | ✅ | 来自 appendExceptionHookContext 时传入的 identifier 明文 |
+| `createdAt` | ❌ | ✅ | buildWebhooks 时生成 |
+| `targetHash` | ✅（独立列） | ❌ | 仅数据库索引使用 |
+| `action` / `actionResult` | ✅（独立列） | ❌ | 仅风控判断使用 |
+| `decision` / `decisionExpiresAt` | ✅（独立列） | ❌ | 仅风控判断使用 |
+
+> **关键结论**：`sentinel_activities.payload` 和 `Identifier.Lockout` webhook payload **没有任何重叠字段**，是两套完全独立的数据体系。风控活动的内部细节（如 verificationId）不会泄露给外部系统。
+
 ---
 
 ## 四、阶段二：风险判断（Risk Decision）
